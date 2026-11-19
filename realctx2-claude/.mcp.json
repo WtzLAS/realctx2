@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "realctx2": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/realctx2-mcp.cjs"]
+    }
+  }
+}

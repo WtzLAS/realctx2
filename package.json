@@ -1,0 +1,47 @@
+{
+  "name": "realctx2",
+  "version": "0.6.0",
+  "description": "Context and memory management for agent harnesses (pi, Claude Code)",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22.5" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "realctx2-worker": "./bin/realctx2-worker.js",
+    "realctx2-hook": "./realctx2-claude/bin/realctx2-hook.cjs",
+    "realctx2-mcp": "./bin/realctx2-mcp.js"
+  },
+  "files": ["dist", "bin", "realctx2-claude", "scripts", "docs", "README.md"],
+  "keywords": ["pi-package", "pi-extension", "memory", "context"],
+  "pi": { "extensions": ["./dist/index.js"] },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/gen-skills.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "prepare": "node scripts/prepare.mjs"
+  },
+  "dependencies": {
+    "loro-crdt": "^1.14.1",
+    "picomatch": "^4.0.2"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-ai": { "optional": true },
+    "@earendil-works/pi-agent-core": { "optional": true },
+    "@earendil-works/pi-tui": { "optional": true }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@types/node": "^22.19.0",
+    "@types/picomatch": "^4.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.0"
+  }
+}

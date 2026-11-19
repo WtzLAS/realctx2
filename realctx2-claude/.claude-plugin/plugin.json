@@ -1,0 +1,8 @@
+{
+  "name": "realctx2",
+  "displayName": "realctx2",
+  "version": "0.6.0",
+  "description": "Context and memory manager: intent tracking, consolidated turns, long-term memory with path-anchored rules. Shares its stores with the pi extension of the same name.",
+  "license": "MIT",
+  "keywords": ["memory", "context", "compaction"]
+}
