@@ -81,6 +81,11 @@ describe("aux session plumbing (§9.3)", () => {
     expect(roleSettings(cfg, "pi", t("reverify", { tools: "none" })).tools).toBe("none");
     expect(roleSettings(cfg, "pi", t("palim", { budget: { timeoutMs: 30_000, thinking: "low" } }))).toMatchObject({ thinking: "low", timeoutMs: 30_000 });
     expect(roleSettings(cfg, "claudeCode", t("evo.operator"))).toMatchObject({ tools: "read-only", maxTurns: 6 });
+    // emulated decisions run without thinking unless the role is configured otherwise
+    expect(roleSettings(cfg, "pi", t("decision.emulate"))).toMatchObject({ tools: "none", thinking: "off", maxTurns: 1 });
+    expect(roleSettings(cfg, "claudeCode", t("decision.emulate")).thinking).toBe("off");
+    const slow = testConfig({ providers: { aux: { claudeCode: { roles: { "decision.emulate": { thinking: "low" } } } } } });
+    expect(roleSettings(slow, "claudeCode", t("decision.emulate")).thinking).toBe("low");
   });
 
   it("limits concurrency and marks the async context of an aux session", async () => {

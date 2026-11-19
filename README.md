@@ -126,9 +126,12 @@ Things the document leaves open, and places where the harnesses or a real run fo
 different choice.
 
 **Decisions without a decision model (§9.1.4).** The document gives an emulated decision the
-call site's timeout, which is 1.5 s for Janus and the proactive gate. A real model needs 5 to
-10 s for that call, so every emulated Janus answer timed out. Now:
+call site's timeout, which is 1.5 s for Janus and the proactive gate, and runs it with thinking
+`low` (§9.3.4). With a small model that call took 5 to 10 s, so every emulated Janus answer
+timed out. Now:
 
+- `decision.emulate` runs with thinking off by default. The same call then took 1.5 to 2.3 s.
+  `providers.aux.<harness>.roles["decision.emulate"].thinking` changes it.
 - `providers.aux.emulateTimeoutMs` (default 20 s) is the floor for an emulated decision. `0`
   restores the call site's timeout.
 - No commit point waits for an emulated answer. Janus at a user message and at settle, and the
@@ -136,8 +139,8 @@ call site's timeout, which is 1.5 s for Janus and the proactive gate. A real mod
   commit point. Late proactive cards arrive as their own guidance message.
 - One Janus request is in flight at a time, and a plan made before another intent was kindled
   cannot kindle again.
-- The cost: with emulation an intent's guidance lands one or two rounds after the work began, so
-  those first rounds stay in the enclosing region and Precip covers less.
+- The cost: with emulation an intent's guidance lands a round after the work began, so that
+  round stays in the enclosing region and Precip covers less.
 
 **Context engine**
 
@@ -154,6 +157,11 @@ call site's timeout, which is 1.5 s for Janus and the proactive gate. A real mod
 
 **Memory**
 
+- An unpinned `remember` starts in the short-term layer, at v₀ = 0.8, and is promoted by the
+  rules of §6.5.2. §6.3 puts it in the long-term layer, where it would be demoted by the first
+  hygiene pass: with no use and no related purpose its importance is 0.3 × recency, which is
+  under the demotion threshold of 0.3 from the first moment. Pinned memories, which is
+  everything `/realctx2 remember` writes, still start long-term at full strength.
 - Seed activation in retrieval is the fused rank score scaled by relative raw relevance;
   reciprocal ranks alone are nearly flat.
 - Stop words are dropped from full-text queries. Without embeddings, conflict candidates need a
@@ -211,18 +219,6 @@ call site's timeout, which is 1.5 s for Janus and the proactive gate. A real mod
 
 - `prepare` builds only when TypeScript is installed, so an install without dev dependencies
   does not fail. Such an install needs a `dist/` that was built beforehand.
-
-## Open questions about the design
-
-- **Unpinned explicit memories are demoted at once.** §6.3 puts an unpinned `remember` into the
-  long-term layer. §6.5.2 demotes a long-term node when I < 0.3, and a node with no use and no
-  related purpose has I = 0.3 × recency, which is below 0.3 from the first moment. So the first
-  hygiene pass moves such a memory to the short-term layer. This is implemented as written.
-  Pinned memories (everything `/realctx2 remember` writes) are not affected.
-- **Emulated decisions are slow.** `decision.emulate` runs with thinking `low` as §9.3.4 says,
-  and took 5 to 10 s per request with a small model. Setting
-  `providers.aux.<harness>.roles["decision.emulate"].thinking` to `off` should shorten that; it
-  was not measured.
 
 ## Environment variables
 

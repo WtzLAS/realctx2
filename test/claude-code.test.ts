@@ -227,7 +227,7 @@ describe("the engine host for Claude Code (§4.6)", () => {
     // a tool call over MCP reaches the session's memory
     const res = await r.mcp("tools/call", { name: "remember", arguments: { text: "Deployments happen on Tuesdays.", scope: "personal", urgency: "passive" } });
     expect(res.isError).toBe(false);
-    expect(res.content[0].text).toMatch(/^Remembered as \[m:[0-9a-z]{8}\] \(personal · long-term · fact · urgency passive\)\.$/);
+    expect(res.content[0].text).toMatch(/^Remembered as \[m:[0-9a-z]{8}\] \(personal · short-term · fact · urgency passive\)\.$/);
     expect((await r.mcp("tools/call", { name: "nope", arguments: {} })).error.message).toBe("Unknown tool: nope");
     await r.close();
     expect(registrations(runDir(r.layout.claudeCodeDir))).toEqual([]);

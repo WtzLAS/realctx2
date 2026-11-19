@@ -25,7 +25,8 @@ export const ROLE_DEFAULTS: Record<AuxRole, RoleSettings> = {
   "evo.operator": { tools: "read-only", thinking: "medium", maxTurns: 6, timeoutMs: 120_000 },
   "ingest.slicer": { tools: "read-only", thinking: "high", maxTurns: 12, timeoutMs: 300_000 },
   reverify: { tools: "read-only", thinking: "medium", maxTurns: 10, timeoutMs: 180_000 },
-  "decision.emulate": { tools: "none", thinking: "low", maxTurns: 1, timeoutMs: 10_000 },
+  // thinking off: it stands in for a decision model on every step, and thinking made each answer take 5 to 10 s
+  "decision.emulate": { tools: "none", thinking: "off", maxTurns: 1, timeoutMs: 10_000 },
 };
 
 /** Roles that only structure input they were handed never get tools, whatever the configuration says. */

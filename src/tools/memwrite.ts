@@ -50,7 +50,6 @@ export async function remember(env: ToolEnv, input: RememberInput, signal?: Abor
     text: input.text,
     kind: input.kind,
     origin: "explicit",
-    layer: "long",
     scope: input.scope,
     urgency: input.urgency,
     urgencyBy: input.urgency ? input.by : undefined,

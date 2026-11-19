@@ -697,7 +697,7 @@ describe("memory in the loop", () => {
     while (gates.length) await release();
     const b2 = await s.round("thinking", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
     const late = b2.messages.find((m) => m.content.startsWith("[intent] Memory that may help"))!;
-    expect(late.content).toMatch(new RegExp(`^\\[intent\\] Memory that may help with "Fix the TokenCache refresh race":\\n\\[m:${card}\\] personal · long-term · as of 2026-11-20\\nTokenCache\\.refresh must be single-flight`));
+    expect(late.content).toMatch(new RegExp(`^\\[intent\\] Memory that may help with "Fix the TokenCache refresh race":\\n\\[m:${card}\\] personal · short-term · as of 2026-11-20\\nTokenCache\\.refresh must be single-flight`));
     expect(late.content).not.toContain(seen);
     expect(s.engine.state.deliveries.filter((d) => d.channel === "proactive").map((d) => d.id)).toEqual([`m:${card}`]);
     // delivered once
@@ -714,7 +714,7 @@ describe("memory in the loop", () => {
     s.decision.on("write.route", (_e, qs) => Object.fromEntries(qs.map((q): [string, number | Record<string, number>] => [q.name, q.name.startsWith("scope.") ? { project_personal: 0.9 } : q.name.startsWith("urgency.") ? { caption: 0.9 } : 0.01])));
     plan.push({ kindle: "Fix the TokenCache refresh race" });
     const b = await s.user("the token cache refresh races, please fix");
-    expect(b.messages[0]!.content).toContain(`Memory that may help:\n[m:${card}] personal · long-term · as of 2026-11-20`);
+    expect(b.messages[0]!.content).toContain(`Memory that may help:\n[m:${card}] personal · short-term · as of 2026-11-20`);
     expect(s.engine.state.deliveries.map((d) => [d.id, d.channel])).toEqual([[`m:${card}`, "proactive"]]);
     // the purpose is remembered for importance and for EvoDisco's query cache
     expect(mem.graph.handle("personal").index!.purposes().map((p) => p.text)).toEqual(["Fix the TokenCache refresh race\nbecause Fix the TokenCache refresh race"]);

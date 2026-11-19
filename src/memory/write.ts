@@ -388,7 +388,10 @@ export class MemoryWriter {
     const c = p.c;
     const pinned = c.pin === true || c.origin === "instructions";
     const explicit = c.origin === "explicit";
-    const layer: Layer = c.layer ?? (pinned || explicit ? "long" : "short");
+    // Only pinned memories start in the long-term layer. Everything else, an explicit `remember`
+    // included, starts short-term and is promoted when it earns it (§6.5.2). An explicit memory
+    // that started long-term would sit at I = 0.3 × recency, under θ_demote from its first moment.
+    const layer: Layer = c.layer ?? (pinned ? "long" : "short");
     const v0 = c.strength ?? (pinned ? V0.pinned : explicit ? V0.explicit : V0.normal);
     return {
       id,

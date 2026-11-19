@@ -122,7 +122,7 @@ describe("retrieval core (§6.4.3)", () => {
     expect(pair).toEqual(expect.arrayContaining([a, b]));
     // cards show the markers
     const card = renderCard(g.get(a!)!, g, w.paths);
-    expect(card).toMatch(new RegExp(`^\\[m:${a}\\] personal · long-term · as of 2026-11-20`));
+    expect(card).toMatch(new RegExp(`^\\[m:${a}\\] personal · short-term · as of 2026-11-20`));
     expect(card).toContain(`⚠ conflicts with [m:${b}]`);
     expect(renderCard(g.get(oldPort!)!, g, w.paths, { history: true })).toContain(`⟂ superseded by [m:${newPort}] on 2026-11-20`);
     expect(renderCard(g.get(oldPort!)!, g, w.paths)).not.toContain("⟂");

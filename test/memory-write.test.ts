@@ -153,8 +153,9 @@ describe("write path (§6.3)", () => {
     expect(w.decision.sites()).toEqual([]); // nothing left to ask
     const n = w.graph.get(r!.id!)!.node;
     expect(r).toMatchObject({ scope: "shared", urgency: "immediate" });
-    expect(n).toMatchObject({ layer: "long", pinned: false, urgencyBy: "agent", severity: "must" });
-    expect(strengthAt(n, w.clock())).toBeCloseTo(0.8); // unpinned explicit memories start at 0.8
+    // unpinned explicit memories start in the short-term layer, at 0.8, and have to earn the long-term one
+    expect(n).toMatchObject({ layer: "short", pinned: false, urgencyBy: "agent", severity: "must" });
+    expect(strengthAt(n, w.clock())).toBeCloseTo(0.8);
     expect(n.triggers).toEqual({ on: ["command"], commands: ["prisma migrate reset*", "pnpm prisma migrate reset*"] });
     expect(n.anchors.map((a) => `${a.kind}:${a.role}`).sort()).toEqual(["file:applies", "glob:applies"]);
     // `immediate` needs a trigger: without one it is capped at hint

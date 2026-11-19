@@ -124,6 +124,30 @@ describe("importance, Memory Worth and retention", () => {
 });
 
 describe("hygiene and the forgetting pass (§6.5.2, §6.5.4)", () => {
+  it("starts a remembered memory short-term, leaves it there until it earns the long-term layer", async () => {
+    const w = world({ cwd: initRepo() });
+    const [r] = await new MemoryWriter(w).write([{ text: "The staging database runs Postgres 16.", origin: "explicit", scope: "personal", urgency: "passive" }]);
+    const cur = () => w.graph.get(r!.id!)!.node;
+    expect(cur()).toMatchObject({ layer: "short", pinned: false, origin: "explicit" });
+    // the first hygiene passes move nothing: no demotion seconds after the write, no promotion without use
+    const life = new Lifecycle(w);
+    expect(life.hygiene("personal")).toMatchObject({ promoted: [], demoted: [] });
+    w.now.t += 2 * DAY;
+    expect(life.hygiene("personal")).toMatchObject({ promoted: [], demoted: [] });
+    expect(cur().layer).toBe("short");
+    expect(cur().strength.events.filter((e) => e.kind === "layer")).toEqual([]);
+    // attributed use in three sessions, mostly with good outcomes: the fast track promotes it
+    for (const [name, by] of [["used", 3], ["usedSuccess", 3], ["useSessions", 3]] as const) w.graph.sd("personal").incCounter(cur().id, name, by);
+    w.graph.commit("personal");
+    expect(life.hygiene("personal").promoted).toEqual([cur().id]);
+    expect(cur().layer).toBe("long");
+    expect(cur().strength.events.at(-1)).toMatchObject({ kind: "layer", layer: "long" });
+    // a pinned memory is long-term from the start
+    const [p] = await new MemoryWriter(w).write([{ text: "Always answer in British English.", kind: "preference", origin: "explicit", scope: "personal", urgency: "hint", pin: true }]);
+    expect(w.graph.get(p!.id!)!.node).toMatchObject({ layer: "long", pinned: true });
+    w.close();
+  });
+
   it("promotes, demotes with hysteresis, and fast-tracks proven memories", () => {
     const w = world({ cwd: initRepo() });
     const old = new Date(w.now.t - 60 * DAY).toISOString();

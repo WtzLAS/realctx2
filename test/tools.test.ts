@@ -125,9 +125,9 @@ describe("agent tools (§8.1)", () => {
     const res = await r.s.tool(r.tools.remember!, { text: "Never edit src/db/schema.ts by hand; change the Prisma model and regenerate.", kind: "rule", severity: "must", scope: "personal", urgency: "immediate", paths: ["src/db/schema.ts"] });
     expect(res.isError).toBe(false);
     const id = idOf(res.text);
-    expect(res.text).toBe(`Remembered as [m:${id}] (personal · long-term · rule MUST · urgency immediate).\nAnchored at src/db/schema.ts.`);
+    expect(res.text).toBe(`Remembered as [m:${id}] (personal · short-term · rule MUST · urgency immediate).\nAnchored at src/db/schema.ts.`);
     const n = r.host.memory!.graph.get(id)!;
-    expect(n).toMatchObject({ scope: "personal", node: { layer: "long", kind: "rule", severity: "must", urgency: "immediate", urgencyBy: "agent", origin: "explicit", pinned: false, provenance: { sessionId: "sess-tools" } } });
+    expect(n).toMatchObject({ scope: "personal", node: { layer: "short", kind: "rule", severity: "must", urgency: "immediate", urgencyBy: "agent", origin: "explicit", pinned: false, provenance: { sessionId: "sess-tools" } } });
     expect(n.node.anchors.map((a) => [a.kind, a.role])).toEqual([["file", "applies"]]);
     expect(r.decision.sites()).not.toContain("write.route"); // nothing left for the decision model to choose
     // without scope and urgency, the decision model chooses both
@@ -148,12 +148,12 @@ describe("agent tools (§8.1)", () => {
     const rule = idOf((await r.s.tool(r.tools.remember!, { text: "Auth code must not log tokens.", kind: "rule", severity: "must", scope: "personal", urgency: "caption", paths: ["src/auth/"] })).text);
     await r.s.round("the refresh race shows up under load", [{ name: "bash", args: { command: "pnpm test auth" }, output: "FAIL tokenCache refresh race: expected 1 fetch, got 2" }]);
     const res = await r.s.tool(r.tools.search!, { query: "token cache refresh race" });
-    expect(res.text).toMatch(new RegExp(`^Memory:\\n\\[m:${fact}\\] personal · long-term · as of 2026-11-20 · src/auth/tokenCache.ts\\nTokenCache.refresh must be single-flight`));
+    expect(res.text).toMatch(new RegExp(`^Memory:\\n\\[m:${fact}\\] personal · short-term · as of 2026-11-20 · src/auth/tokenCache.ts\\nTokenCache.refresh must be single-flight`));
     expect(res.text).toContain("Turns (this session):\n[r:");
     expect(res.text).toContain("tool bash · 2026-11-20");
     expect(res.text).toMatch(/  ↑ \[r:[0-9a-z]{8}\] assistant: the refresh race shows up under load/);
     const d = res.details as { memory: Array<{ id: string; score: number }>; turns: Array<{ id: string }>; deliveries: Array<{ id: string; channel: string; kind: string }> };
-    expect(d.memory[0]).toMatchObject({ id: `m:${fact}`, scope: "personal", layer: "long", urgency: "hint" });
+    expect(d.memory[0]).toMatchObject({ id: `m:${fact}`, scope: "personal", layer: "short", urgency: "hint" });
     expect(d.deliveries.map((x) => [x.id.slice(0, 2), x.channel, x.kind])).toEqual(expect.arrayContaining([["m:", "search", "card"], ["r:", "search", "found"]]));
     // the ledger has them, with the tool result's entry
     const ledger = r.s.engine.state.deliveries.filter((x) => x.channel === "search");
@@ -215,7 +215,7 @@ describe("agent tools (§8.1)", () => {
     // memory
     const m = idOf((await r.tools.remember!.execute({ text: "TokenCache.refresh must be single-flight.", scope: "personal", urgency: "hint" }, {})).text);
     const rm = await r.s.tool(r.tools.recall!, { id: `[m:${m}]` });
-    expect(rm.text).toBe(`[m:${m}] personal · long-term · as of 2026-11-20\nTokenCache.refresh must be single-flight.`);
+    expect(rm.text).toBe(`[m:${m}] personal · short-term · as of 2026-11-20\nTokenCache.refresh must be single-flight.`);
     expect(r.s.engine.state.deliveries.at(-1)).toMatchObject({ id: `m:${m}`, channel: "recall", kind: "card", full: true });
     r.host.memory!.accounting.flush(r.host.memory!.graph, r.host.cfg);
     expect(r.host.memory!.graph.get(m)!.node.counters.expanded).toBe(1);
@@ -266,7 +266,7 @@ describe("agent tools (§8.1)", () => {
     const cur = idOf(next.text);
     const res = await r.s.tool(r.tools.inspect!, { id: cur });
     const lines = res.text.split("\n");
-    expect(lines[0]).toBe(`[m:${cur}] personal · long-term · fact · urgency caption (set by agent)`);
+    expect(lines[0]).toBe(`[m:${cur}] personal · short-term · fact · urgency caption (set by agent)`);
     expect(lines[1]).toBe("Title: CI runs on Node 22 since the November upgrade");
     expect(lines[2]).toBe("created 2026-11-21 · as of 2026-11-21 · origin explicit");
     expect(res.text).toContain("Anchors:\n- about src/** (subtree, live)");
