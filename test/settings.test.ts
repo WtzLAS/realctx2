@@ -16,7 +16,13 @@ import {
   resolveApiKeyInfo,
   saveConfig,
 } from "../src/core/config.ts";
-import { type EndpointFetchLike, testEndpoint } from "../src/providers/test-endpoint.ts";
+import {
+  type EndpointFetchLike,
+  type EndpointModelsResult,
+  fetchEndpointModels,
+  modelsUrlFor,
+  testEndpoint,
+} from "../src/providers/test-endpoint.ts";
 import { Host } from "../src/core/host.ts";
 import {
   AUX_ROLES,
@@ -1050,5 +1056,272 @@ describe("live endpoint testing (testEndpoint) & settings Test buttons", () => {
     // Editing a setting on Dense endpoint clears its cached test result
     sendKeys(comp, [TAB, ENTER, "x", ENTER]); // edit URL
     expect(renderText(comp)).not.toContain("✓ OK · 45ms (1024 dims)");
+  });
+});
+
+describe("endpoint /v1/models discovery & Model ID picker", () => {
+  it("derives /v1/models URLs and parses OpenAI/array/models payloads with auth and error diagnostics", async () => {
+    expect(modelsUrlFor("http://127.0.0.1:8891/v1/systemone")).toBe("http://127.0.0.1:8891/v1/models");
+    expect(modelsUrlFor("http://127.0.0.1:8890/v1/embeddings")).toBe("http://127.0.0.1:8890/v1/models");
+    expect(modelsUrlFor("https://proxy.example.com/openai/v1/embeddings?foo=1")).toBe("https://proxy.example.com/openai/v1/models");
+    expect(modelsUrlFor("https://proxy.example.com/openai/v1")).toBe("https://proxy.example.com/openai/v1/models");
+    expect(modelsUrlFor("http://127.0.0.1:8890/pooling")).toBe("http://127.0.0.1:8890/v1/models");
+    expect(modelsUrlFor("not-a-url")).toBeNull();
+    expect(modelsUrlFor("ftp://example.com/v1/embeddings")).toBeNull();
+
+    const seen: Array<{ url: string; method: string; auth?: string }> = [];
+    const mockFetch: EndpointFetchLike = async (url, init) => {
+      seen.push({ url, method: init.method, auth: init.headers.authorization ?? init.headers.Authorization });
+      if (url.includes(":8891/v1/models")) {
+        if (init.headers.authorization !== "Bearer secret-decider") {
+          return { ok: false, status: 401, text: async () => "unauthorized", json: async () => ({}) };
+        }
+        return {
+          ok: true,
+          status: 200,
+          text: async () => "",
+          json: async () => ({
+            object: "list",
+            data: [
+              { id: "pplx-decider-v1.3", owned_by: "perplexity" },
+              { id: "pplx-decider-v1.3", owned_by: "perplexity" }, // duplicate
+              { id: "jev-latest", name: "Jev Latest", owned_by: "typesafe" },
+            ],
+          }),
+        };
+      }
+      if (url.includes(":8890/v1/models")) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => "",
+          json: async () => ({ models: [{ id: "perplexity-ai/pplx-embed-v2-late-9b" }, "lightonai/GTE-ModernColBERT-v1"] }),
+        };
+      }
+      if (url.includes("no-models.test/v1/models")) {
+        return { ok: false, status: 404, text: async () => "not found", json: async () => ({}) };
+      }
+      if (url.includes("bad-json.test/v1/models")) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => "<html>ok</html>",
+          json: async () => {
+            throw new SyntaxError("Unexpected token <");
+          },
+        };
+      }
+      throw new Error("ECONNREFUSED");
+    };
+
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    // Disabled endpoint
+    const disabled = await fetchEndpointModels("decision", cfg, { fetch: mockFetch });
+    expect(disabled.ok).toBe(false);
+    expect(disabled.error).toContain("disabled");
+
+    // Missing URL
+    cfg.providers.decision = { format: "systemone", url: "", model: "" };
+    const noUrl = await fetchEndpointModels("decision", cfg, { fetch: mockFetch });
+    expect(noUrl.ok).toBe(false);
+    expect(noUrl.error).toContain("Set Endpoint URL");
+
+    // 401 without auth
+    cfg.providers.decision.url = "http://127.0.0.1:8891/v1/systemone";
+    const unauth = await fetchEndpointModels("decision", cfg, { fetch: mockFetch });
+    expect(unauth.ok).toBe(false);
+    expect(unauth.status).toBe(401);
+    expect(unauth.error).toContain("DECIDER_API_KEY");
+
+    // 200 with auth & deduplication
+    cfg.providers.decision.apiKey = "secret-decider";
+    const decModels = await fetchEndpointModels("decision", cfg, { fetch: mockFetch });
+    expect(decModels.ok).toBe(true);
+    expect(decModels.url).toBe("http://127.0.0.1:8891/v1/models");
+    expect(decModels.models).toEqual([
+      { id: "pplx-decider-v1.3", ownedBy: "perplexity", description: undefined },
+      { id: "jev-latest", ownedBy: "typesafe", description: "Jev Latest" },
+    ]);
+
+    // Alternative `{ models: [...] }` payload on vLLM `/pooling` endpoint
+    cfg.providers.embedding.late = { url: "http://127.0.0.1:8890/pooling", model: "", kind: "multivector" };
+    const lateModels = await fetchEndpointModels("late", cfg, { fetch: mockFetch });
+    expect(lateModels.ok).toBe(true);
+    expect(lateModels.url).toBe("http://127.0.0.1:8890/v1/models");
+    expect(lateModels.models.map((m) => m.id)).toEqual([
+      "perplexity-ai/pplx-embed-v2-late-9b",
+      "lightonai/GTE-ModernColBERT-v1",
+    ]);
+
+    // 404 unsupported /v1/models
+    cfg.providers.embedding.dense = { url: "https://no-models.test/v1/embeddings", model: "", kind: "dense" };
+    const notSupported = await fetchEndpointModels("dense", cfg, { fetch: mockFetch });
+    expect(notSupported.ok).toBe(false);
+    expect(notSupported.status).toBe(404);
+    expect(notSupported.error).toContain("/v1/models is not available");
+
+    // Invalid JSON
+    cfg.providers.embedding.dense.url = "https://bad-json.test/v1/embeddings";
+    const badJson = await fetchEndpointModels("dense", cfg, { fetch: mockFetch });
+    expect(badJson.ok).toBe(false);
+    expect(badJson.error).toContain("Invalid JSON");
+
+    // Network error
+    cfg.providers.embedding.dense.url = "http://127.0.0.1:1/v1/embeddings";
+    const netErr = await fetchEndpointModels("dense", cfg, { fetch: mockFetch });
+    expect(netErr.ok).toBe(false);
+    expect(netErr.error).toContain("ECONNREFUSED");
+    expect(seen.every((s) => s.method === "GET")).toBe(true);
+  });
+
+  it("retrieves /v1/models in Model ID picker, lets user filter/select, supports manual backup, caching, retry, and abort", async () => {
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.providers.decision = {
+      format: "systemone",
+      url: "http://127.0.0.1:8891/v1/systemone",
+      model: "",
+    };
+    cfg.providers.embedding.late = {
+      url: "http://127.0.0.1:8890/v1/embeddings",
+      model: "existing-manual-model",
+      kind: "multivector",
+    };
+    cfg.providers.embedding.dense = {
+      url: "",
+      model: "",
+      kind: "dense",
+    };
+
+    const fetchCalls: Array<{ endpoint: string; aborted: boolean }> = [];
+    let pendingResolve!: (res: EndpointModelsResult) => void;
+    let saved = structuredClone(cfg);
+    let renders = 0;
+
+    const comp = new Realctx2SettingsComponent({
+      config: saved,
+      configPath: "/tmp/config.json",
+      initialCategory: "providers",
+      onSave: (next) => {
+        saved = next;
+      },
+      onFetchModels: (endpoint, _c, signal) => {
+        const entry = { endpoint, aborted: false };
+        signal.addEventListener("abort", () => {
+          entry.aborted = true;
+        });
+        fetchCalls.push(entry);
+        return new Promise<EndpointModelsResult>((r) => {
+          pendingResolve = r;
+        });
+      },
+      onClose: () => undefined,
+      theme: plainTheme,
+      tui: { requestRender: () => { renders++; } },
+    });
+
+    // 1. Open Decision endpoint -> jump to Connection section -> Model ID (index 2: format, url, model)
+    sendKeys(comp, [ENTER, TAB, DOWN, DOWN, ENTER]);
+    expect(fetchCalls.map((c) => c.endpoint)).toEqual(["decision"]);
+    const loadingView = renderText(comp);
+    expect(loadingView).toContain("Fetching models from http://127.0.0.1:8891/v1/models");
+    expect(loadingView).toContain("Enter model ID manually…");
+
+    // Resolve /v1/models -> models appear and user selects second model with DOWN + ENTER
+    pendingResolve({
+      endpoint: "decision",
+      ok: true,
+      url: "http://127.0.0.1:8891/v1/models",
+      models: [
+        { id: "pplx-decider-v1.3", ownedBy: "perplexity" },
+        { id: "perplexity/pplx-decider-latest", ownedBy: "perplexity" },
+      ],
+      authSummary: "none",
+      latencyMs: 14,
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(renders).toBeGreaterThan(0);
+    const loadedView = renderText(comp);
+    expect(loadedView).toContain("✓ 2 models from http://127.0.0.1:8891/v1/models");
+    expect(loadedView).toContain("pplx-decider-v1.3");
+    expect(loadedView).toContain("perplexity/pplx-decider-latest");
+    expect(loadedView).toContain("Enter model ID manually…");
+
+    sendKeys(comp, [DOWN, ENTER]);
+    expect(saved.providers.decision?.model).toBe("perplexity/pplx-decider-latest");
+
+    // 2. Re-open Model ID -> uses cached /v1/models immediately (no extra fetch!) and marks current model
+    sendKeys(comp, [ENTER]);
+    expect(fetchCalls).toHaveLength(1);
+    const cachedView = renderText(comp);
+    expect(cachedView).toContain("✓ perplexity/pplx-decider-latest");
+
+    // Filter models by typing "v1.3" and press Enter -> selects pplx-decider-v1.3
+    for (const ch of "v1.3") comp.handleInput(ch);
+    sendKeys(comp, [ENTER]);
+    expect(saved.providers.decision?.model).toBe("pplx-decider-v1.3");
+
+    // 3. Re-open Model ID, type a custom model not in /v1/models -> shows `Use "custom-decider-x"` backup and commits it
+    sendKeys(comp, [ENTER]);
+    for (const ch of "custom-decider-x") comp.handleInput(ch);
+    expect(renderText(comp)).toContain('Use "custom-decider-x"');
+    sendKeys(comp, [ENTER]);
+    expect(saved.providers.decision?.model).toBe("custom-decider-x");
+
+    // 4. Re-open Model ID -> Ctrl+R triggers fresh fetch; Esc aborts in-flight fetch
+    sendKeys(comp, [ENTER, "\x12"]); // Ctrl+R
+    expect(fetchCalls).toHaveLength(2);
+    expect(fetchCalls[1]!.aborted).toBe(false);
+    sendKeys(comp, [ESC]);
+    expect(fetchCalls[1]!.aborted).toBe(true);
+
+    // 5. Editing Endpoint URL invalidates the cached /v1/models list
+    sendKeys(comp, [UP, ENTER, "\x15"]); // move up to Endpoint URL, open, clear
+    for (const ch of "http://127.0.0.1:9999/v1/systemone") comp.handleInput(ch);
+    sendKeys(comp, [ENTER, DOWN, ENTER]); // save URL, move to Model ID, open
+    expect(fetchCalls).toHaveLength(3);
+    expect(renderText(comp)).toContain("http://127.0.0.1:9999/v1/models");
+    sendKeys(comp, [ESC]); // abort & close modal
+
+    // 6. Late-interaction endpoint: /v1/models returns 404 -> falls back gracefully to manual backup + retry
+    sendKeys(comp, [ESC, DOWN, ENTER]); // back to Providers -> Late-interaction endpoint
+    sendKeys(comp, [TAB, DOWN, ENTER]); // Connection -> url -> Model ID
+    expect(fetchCalls).toHaveLength(4);
+    expect(fetchCalls[3]!.endpoint).toBe("late");
+    pendingResolve({
+      endpoint: "late",
+      ok: false,
+      url: "http://127.0.0.1:8890/v1/models",
+      status: 404,
+      models: [],
+      error: "HTTP 404 — /v1/models is not available on this endpoint",
+      authSummary: "none",
+      latencyMs: 5,
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    const errView = renderText(comp);
+    expect(errView).toContain("⚠ /v1/models unavailable");
+    expect(errView).toContain("Enter model ID manually…");
+    expect(errView).toContain("↻ Retry /v1/models");
+
+    // Pressing Enter on highlighted `Enter model ID manually…` opens manual text editor prefilled with existing value
+    sendKeys(comp, [ENTER]);
+    const manualModal = renderText(comp);
+    expect(manualModal).toContain("existing-manual-model");
+    expect(manualModal).toContain("Enter to save · Esc to cancel");
+    sendKeys(comp, ["\x15"]);
+    for (const ch of "manual-colbert-v2") comp.handleInput(ch);
+    sendKeys(comp, [ENTER]);
+    expect(saved.providers.embedding.late?.model).toBe("manual-colbert-v2");
+
+    // 7. Dense endpoint with blank URL -> does NOT call /v1/models, informs user, allows manual input
+    sendKeys(comp, [ESC, DOWN, ENTER]); // back to Providers -> Dense endpoint
+    sendKeys(comp, [TAB, DOWN, ENTER]); // Connection -> url -> Model ID
+    expect(fetchCalls).toHaveLength(4); // no network call made!
+    const noUrlView = renderText(comp);
+    expect(noUrlView).toContain("Set Endpoint URL first to retrieve models from /v1/models");
+    expect(noUrlView).toContain("Enter model ID manually…");
+    for (const ch of "text-embedding-3-large") comp.handleInput(ch);
+    sendKeys(comp, [ENTER]);
+    expect(saved.providers.embedding.dense?.model).toBe("text-embedding-3-large");
   });
 });

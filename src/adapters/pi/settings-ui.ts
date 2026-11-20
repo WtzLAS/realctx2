@@ -37,7 +37,15 @@ import {
   type StringListSetting,
   type StringMapSetting,
 } from "../../core/settings-schema.ts";
-import { type EndpointKind, type EndpointTestResult, testEndpoint } from "../../providers/test-endpoint.ts";
+import {
+  type EndpointKind,
+  type EndpointModelInfo,
+  type EndpointModelsResult,
+  type EndpointTestResult,
+  fetchEndpointModels,
+  modelsUrlFor,
+  testEndpoint,
+} from "../../providers/test-endpoint.ts";
 
 export interface SettingsTheme {
   fg(color: "accent" | "border" | "borderMuted" | "success" | "error" | "warning" | "muted" | "dim" | "text", text: string): string;
@@ -69,6 +77,8 @@ export interface Realctx2SettingsOptions {
   onSave: (next: Config) => void;
   /** Optional custom endpoint tester (defaults to live HTTP probe via testEndpoint). */
   onTestEndpoint?: (endpoint: EndpointKind, cfg: Config, signal: AbortSignal) => Promise<EndpointTestResult>;
+  /** Optional custom `/v1/models` fetcher for endpoint Model ID pickers (defaults to fetchEndpointModels). */
+  onFetchModels?: (endpoint: EndpointKind, cfg: Config, signal: AbortSignal) => Promise<EndpointModelsResult>;
   /** Called when the user closes the settings screen. */
   onClose: () => void;
   theme: SettingsTheme;
@@ -120,10 +130,23 @@ type ActiveModal =
       entry: ScalarSetting;
       input: Input;
       selected: number;
+    }
+  | {
+      kind: "endpoint-model";
+      endpoint: EndpointKind;
+      entry: ScalarSetting;
+      input: Input;
+      selected: number;
+      status: "loading" | "ready" | "error" | "no-url";
+      url?: string;
+      models: EndpointModelInfo[];
+      error?: string;
+      abort?: AbortController;
     };
 
 const CUSTOM_MODEL_SENTINEL = "__realctx2_custom_model__";
 const INHERIT_MODEL_SENTINEL = "__realctx2_inherit_model__";
+const REFRESH_MODELS_SENTINEL = "__realctx2_refresh_models__";
 
 export class Realctx2SettingsComponent implements Component, Focusable {
   readonly capturesViewportInput = true;
@@ -136,6 +159,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
   private readonly availableModels: ModelChoice[];
   private readonly onSave: (next: Config) => void;
   private readonly onTestEndpoint?: (endpoint: EndpointKind, cfg: Config, signal: AbortSignal) => Promise<EndpointTestResult>;
+  private readonly onFetchModels?: (endpoint: EndpointKind, cfg: Config, signal: AbortSignal) => Promise<EndpointModelsResult>;
   private readonly onClose: () => void;
   private readonly theme: SettingsTheme;
   private readonly tui?: Pick<TUI, "requestRender"> & { terminal?: { rows?: number } };
@@ -144,6 +168,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
   private modal: ActiveModal | null = null;
   private flash: { text: string; tone: "success" | "warning" | "error" | "muted" } | null = null;
   private endpointTests: Partial<Record<EndpointKind, { status: "running"; abort: AbortController } | { status: "done"; result: EndpointTestResult }>> = {};
+  private endpointModelsCache: Partial<Record<EndpointKind, { fingerprint: string; result: EndpointModelsResult }>> = {};
   private lastViewportRowOffset = 0;
   private lastVisibleSelectableIndices: Array<{ rowY: number; index: number }> = [];
 
@@ -156,6 +181,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
     this.availableModels = opts.availableModels ?? [];
     this.onSave = opts.onSave;
     this.onTestEndpoint = opts.onTestEndpoint;
+    this.onFetchModels = opts.onFetchModels;
     this.onClose = opts.onClose;
     this.theme = opts.theme;
     this.tui = opts.tui;
@@ -184,7 +210,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
 
   private syncInputFocus(): void {
     const top = this.topView();
-    if (this.modal && (this.modal.kind === "text" || this.modal.kind === "model")) {
+    if (this.modal && (this.modal.kind === "text" || this.modal.kind === "model" || this.modal.kind === "endpoint-model")) {
       this.modal.input.focused = this._focused;
       if (top.kind === "search" || top.kind === "home") top.input.focused = false;
     } else if (top.kind === "search" || top.kind === "home") {
@@ -223,11 +249,27 @@ export class Realctx2SettingsComponent implements Component, Focusable {
       const cur = this.endpointTests[ep];
       if (cur?.status === "running") cur.abort.abort();
     }
+    if (this.modal?.kind === "endpoint-model") {
+      this.modal.abort?.abort();
+      this.modal.abort = undefined;
+    }
   }
 
   private close(): void {
     this.abortAllTests();
     this.onClose();
+  }
+
+  private endpointConnectionFingerprint(endpoint: EndpointKind, cfg: Config): string {
+    const ep = endpoint === "decision" ? cfg.providers.decision : cfg.providers.embedding[endpoint];
+    if (!ep) return "disabled";
+    return JSON.stringify({
+      url: ep.url ?? "",
+      apiKey: ep.apiKey ?? "",
+      apiKeyEnv: ep.apiKeyEnv ?? "",
+      apiKeyFile: ep.apiKeyFile ?? "",
+      headers: ep.headers ?? null,
+    });
   }
 
   private invalidateEndpointTests(prev: Config, next: Config): void {
@@ -239,6 +281,11 @@ export class Realctx2SettingsComponent implements Component, Focusable {
     }
     if (JSON.stringify(prev.providers.embedding.dense) !== JSON.stringify(next.providers.embedding.dense)) {
       this.clearEndpointTest("dense");
+    }
+    for (const ep of ["decision", "late", "dense"] as const) {
+      if (this.endpointConnectionFingerprint(ep, prev) !== this.endpointConnectionFingerprint(ep, next)) {
+        delete this.endpointModelsCache[ep];
+      }
     }
   }
 
@@ -264,6 +311,24 @@ export class Realctx2SettingsComponent implements Component, Focusable {
           const cur = this.endpointTests[endpoint];
           if (!cur || cur.status !== "running" || cur.abort !== abort) return;
           this.endpointTests[endpoint] = { status: "done", result };
+          if (result.availableModels?.length) {
+            const fp = this.endpointConnectionFingerprint(endpoint, snapshot);
+            const existing = this.endpointModelsCache[endpoint];
+            if (!existing || existing.fingerprint !== fp) {
+              const epCfg = endpoint === "decision" ? snapshot.providers.decision : snapshot.providers.embedding[endpoint];
+              this.endpointModelsCache[endpoint] = {
+                fingerprint: fp,
+                result: {
+                  endpoint,
+                  ok: true,
+                  url: epCfg?.url ? (modelsUrlFor(epCfg.url) ?? undefined) : undefined,
+                  models: result.availableModels.map((id) => ({ id })),
+                  authSummary: result.authSummary,
+                  latencyMs: 0,
+                },
+              };
+            }
+          }
           this.flash = {
             text: result.ok ? `✓ ${label}: ${result.summary}` : `✗ ${label}: ${result.summary}`,
             tone: result.ok ? "success" : "error",
@@ -915,11 +980,183 @@ export class Realctx2SettingsComponent implements Component, Focusable {
       this.openEnumModal(entry);
       return;
     }
+    if (entry.endpointModels) {
+      this.openEndpointModelModal(entry, entry.endpointModels);
+      return;
+    }
     if (entry.modelPicker && this.availableModels.length > 0) {
       this.openModelModal(entry);
       return;
     }
     this.openTextModal(entry);
+  }
+
+  private openEndpointModelModal(entry: ScalarSetting, endpoint: EndpointKind): void {
+    const input = new Input({ prompt: "Filter / Model ID: ", placeholder: "Filter models or type a custom model ID..." });
+    const ep = endpoint === "decision" ? this.cfg.providers.decision : this.cfg.providers.embedding[endpoint];
+    const url = ep?.url ? modelsUrlFor(ep.url) : null;
+    const cur = getSettingValue(this.cfg, entry);
+    const curStr = typeof cur === "string" ? cur.trim() : "";
+
+    if (!url) {
+      this.modal = {
+        kind: "endpoint-model",
+        endpoint,
+        entry,
+        input,
+        selected: 0,
+        status: "no-url",
+        models: [],
+        error: ep?.url?.trim()
+          ? `Invalid Endpoint URL "${ep.url.trim()}" — fix Endpoint URL or enter model ID manually.`
+          : "Set Endpoint URL first to retrieve models from /v1/models.",
+      };
+      return;
+    }
+
+    const fp = this.endpointConnectionFingerprint(endpoint, this.cfg);
+    const cached = this.endpointModelsCache[endpoint];
+    if (cached && cached.fingerprint === fp && cached.result.ok && cached.result.models.length > 0) {
+      const models = cached.result.models;
+      const curIdx = curStr ? models.findIndex((m) => m.id === curStr) : -1;
+      this.modal = {
+        kind: "endpoint-model",
+        endpoint,
+        entry,
+        input,
+        selected: curIdx >= 0 ? curIdx : 0,
+        status: "ready",
+        url: cached.result.url ?? url,
+        models,
+      };
+      return;
+    }
+
+    const modal: Extract<ActiveModal, { kind: "endpoint-model" }> = {
+      kind: "endpoint-model",
+      endpoint,
+      entry,
+      input,
+      selected: 0,
+      status: "loading",
+      url,
+      models: [],
+    };
+    this.modal = modal;
+    this.startEndpointModelsFetch(modal);
+  }
+
+  private startEndpointModelsFetch(modal: Extract<ActiveModal, { kind: "endpoint-model" }>): void {
+    modal.abort?.abort();
+    const abort = new AbortController();
+    modal.abort = abort;
+    modal.status = "loading";
+    modal.error = undefined;
+
+    const snapshot = structuredClone(this.cfg);
+    const fp = this.endpointConnectionFingerprint(modal.endpoint, snapshot);
+    const runner = this.onFetchModels ?? ((ep: EndpointKind, c: Config, sig: AbortSignal) => fetchEndpointModels(ep, c, { signal: sig }));
+    let runPromise: Promise<EndpointModelsResult>;
+    try {
+      runPromise = Promise.resolve(runner(modal.endpoint, snapshot, abort.signal));
+    } catch (e) {
+      runPromise = Promise.reject(e);
+    }
+
+    void runPromise.then(
+      (res) => {
+        if (this.modal !== modal || modal.abort !== abort) return;
+        modal.abort = undefined;
+        modal.url = res.url ?? modal.url;
+        if (res.ok) {
+          modal.status = "ready";
+          modal.models = res.models;
+          modal.error = res.models.length === 0 ? "Endpoint returned no models from /v1/models." : undefined;
+          if (res.models.length > 0) {
+            this.endpointModelsCache[modal.endpoint] = { fingerprint: fp, result: res };
+          }
+          const q = modal.input.getValue().trim();
+          if (!q) {
+            const cur = getSettingValue(this.cfg, modal.entry);
+            const curStr = typeof cur === "string" ? cur.trim() : "";
+            const curIdx = curStr ? res.models.findIndex((m) => m.id === curStr) : -1;
+            modal.selected = curIdx >= 0 ? curIdx : 0;
+          } else {
+            modal.selected = 0;
+          }
+        } else {
+          modal.status = "error";
+          modal.models = [];
+          modal.error = res.error ?? "Could not fetch /v1/models.";
+          modal.selected = 0;
+        }
+        this.tui?.requestRender();
+      },
+      (e: unknown) => {
+        if (this.modal !== modal || modal.abort !== abort) return;
+        modal.abort = undefined;
+        modal.status = "error";
+        modal.models = [];
+        modal.error = String((e as Error)?.message ?? e) || "Could not fetch /v1/models.";
+        modal.selected = 0;
+        this.tui?.requestRender();
+      },
+    );
+  }
+
+  private endpointModelChoices(
+    modal: Extract<ActiveModal, { kind: "endpoint-model" }>,
+  ): Array<{ kind: "model" | "use-typed" | "manual" | "refresh"; value: string; label: string; description?: string; current?: boolean }> {
+    const curVal = getSettingValue(this.cfg, modal.entry);
+    const curStr = typeof curVal === "string" ? curVal.trim() : "";
+    const q = modal.input.getValue().trim();
+
+    const modelChoices = modal.models.map((m) => ({
+      kind: "model" as const,
+      value: m.id,
+      label: m.id,
+      description: m.description ?? (m.ownedBy ? `owned by ${m.ownedBy}` : undefined),
+      current: m.id === curStr,
+    }));
+    const matched = q ? fuzzyFilter(modelChoices, q, (m) => `${m.label} ${m.description ?? ""}`) : modelChoices;
+
+    const out: Array<{ kind: "model" | "use-typed" | "manual" | "refresh"; value: string; label: string; description?: string; current?: boolean }> = [...matched];
+
+    if (q) {
+      if (!matched.some((m) => m.value === q)) {
+        out.push({
+          kind: "use-typed",
+          value: q,
+          label: `Use "${q}"`,
+          description: "Set this custom model ID manually",
+        });
+      }
+      out.push({
+        kind: "manual",
+        value: CUSTOM_MODEL_SENTINEL,
+        label: "Enter model ID manually…",
+        description: curStr ? `Open manual text editor (current: ${curStr})` : "Open manual text editor",
+      });
+      return out;
+    }
+
+    out.push({
+      kind: "manual",
+      value: CUSTOM_MODEL_SENTINEL,
+      label: "Enter model ID manually…",
+      description: curStr ? `Type a custom model ID instead (current: ${curStr})` : "Type a custom model ID instead of picking from /v1/models",
+    });
+
+    if (modal.status === "error" || (modal.status === "ready" && modal.url)) {
+      out.push({
+        kind: "refresh",
+        value: REFRESH_MODELS_SENTINEL,
+        label: modal.status === "error" ? "↻ Retry /v1/models" : "↻ Refresh /v1/models",
+        description: modal.url ? `Re-fetch model list from ${modal.url}` : "Re-fetch model list from /v1/models",
+      });
+    }
+
+    return out;
   }
 
   private openEnumModal(entry: ScalarSetting): void {
@@ -1036,6 +1273,50 @@ export class Realctx2SettingsComponent implements Component, Focusable {
         const next = setSettingValue(this.cfg, m.entry, chosen.value);
         this.commitConfig(next, `${m.entry.label} = ${chosen.label}`);
         this.modal = null;
+      }
+      return;
+    }
+
+    if (m.kind === "endpoint-model") {
+      const choices = this.endpointModelChoices(m);
+      const n = choices.length;
+      if (m.selected >= n) m.selected = Math.max(0, n - 1);
+      if (this.isCancel(data)) {
+        m.abort?.abort();
+        m.abort = undefined;
+        this.modal = null;
+        return;
+      }
+      if (this.isUp(data, false)) {
+        if (n) m.selected = (m.selected - 1 + n) % n;
+      } else if (this.isDown(data, false)) {
+        if (n) m.selected = (m.selected + 1) % n;
+      } else if (this.isPageUp(data)) {
+        if (n) m.selected = Math.max(0, m.selected - Math.max(1, Math.floor(this.maxListRows() / 2)));
+      } else if (this.isPageDown(data)) {
+        if (n) m.selected = Math.min(n - 1, m.selected + Math.max(1, Math.floor(this.maxListRows() / 2)));
+      } else if (matchesKey(data, Key.ctrl("r"))) {
+        if (m.status !== "no-url") this.startEndpointModelsFetch(m);
+      } else if (this.isConfirm(data)) {
+        const chosen = choices[m.selected];
+        if (!chosen) return;
+        if (chosen.kind === "refresh") {
+          this.startEndpointModelsFetch(m);
+          return;
+        }
+        m.abort?.abort();
+        m.abort = undefined;
+        if (chosen.kind === "manual") {
+          this.modal = null;
+          this.openTextModal(m.entry);
+          return;
+        }
+        const next = setSettingValue(this.cfg, m.entry, chosen.value);
+        this.commitConfig(next, `${m.entry.label} = ${chosen.value}`);
+        this.modal = null;
+      } else {
+        m.input.handleInput(data);
+        m.selected = 0;
       }
       return;
     }
@@ -1699,6 +1980,61 @@ export class Realctx2SettingsComponent implements Component, Focusable {
       );
       lines.push("");
       lines.push(truncateToWidth(t.fg("dim", "  ↑↓ select · Enter apply · Esc cancel"), width));
+      return lines;
+    }
+
+    if (modal.kind === "endpoint-model") {
+      const lines: string[] = [
+        "",
+        truncateToWidth(`  ${t.bold(t.fg("text", modal.entry.label))}  ${t.fg("dim", modal.entry.path)}`, width),
+      ];
+      if (modal.status === "loading") {
+        lines.push(truncateToWidth(`  ${t.fg("warning", `⟳ Fetching models from ${modal.url ?? "/v1/models"}…`)}`, width));
+      } else if (modal.status === "ready" && modal.models.length > 0) {
+        const countLabel = `${modal.models.length} model${modal.models.length === 1 ? "" : "s"}`;
+        lines.push(truncateToWidth(`  ${t.fg("success", `✓ ${countLabel}`)} ${t.fg("dim", `from ${modal.url ?? "/v1/models"}`)}`, width));
+      } else if (modal.status === "no-url") {
+        lines.push(truncateToWidth(`  ${t.fg("muted", `ℹ ${modal.error ?? "Set Endpoint URL first to retrieve models from /v1/models."}`)}`, width));
+      } else if (modal.status === "ready") {
+        lines.push(truncateToWidth(`  ${t.fg("warning", `ℹ ${modal.error ?? "No models returned by /v1/models."}`)}`, width));
+      } else {
+        lines.push(truncateToWidth(`  ${t.fg("warning", `⚠ /v1/models unavailable: ${modal.error ?? "request failed"}`)}`, width));
+      }
+      lines.push("");
+
+      for (const l of modal.input.render(Math.max(20, width - 4))) {
+        lines.push(`  ${l}`);
+      }
+      lines.push("");
+
+      const choices = this.endpointModelChoices(modal);
+      const maxVis = Math.max(6, this.maxListRows() - 4);
+      const selIdx = Math.min(modal.selected, Math.max(0, choices.length - 1));
+      const start = Math.max(0, Math.min(selIdx - Math.floor(maxVis / 2), choices.length - maxVis));
+      const end = Math.min(choices.length, start + maxVis);
+      for (let i = start; i < end; i++) {
+        const c = choices[i]!;
+        const sel = i === selIdx;
+        const cursor = sel ? t.fg("accent", "▸ ") : "  ";
+        const check = c.current ? t.fg("success", "✓ ") : "  ";
+        const lbl = sel
+          ? t.bold(t.fg("accent", c.label))
+          : c.kind === "manual" || c.kind === "refresh"
+            ? t.fg("muted", c.label)
+            : t.fg("text", c.label);
+        const desc = c.description ? t.fg("dim", `  ${c.description}`) : "";
+        lines.push(truncateToWidth(`  ${cursor}${check}${lbl}${desc}`, width));
+      }
+      if (choices.length > maxVis) {
+        lines.push(t.fg("dim", `  (${selIdx + 1}/${choices.length})`));
+      }
+      lines.push("");
+      lines.push(...this.renderDescriptionBox(this.renderSettingMeta(modal.entry), modal.entry.description, width));
+      lines.push("");
+      const hintParts = ["Type to filter or enter custom ID", "↑↓ select", "Enter apply"];
+      if (modal.status !== "no-url") hintParts.push("Ctrl+R refresh");
+      hintParts.push("Esc cancel");
+      lines.push(truncateToWidth(t.fg("dim", `  ${hintParts.join(" · ")}`), width));
       return lines;
     }
 

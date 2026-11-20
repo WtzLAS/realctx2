@@ -17,6 +17,23 @@ import { DenseEmbeddingClient, MultiVectorEmbeddingClient } from "./embedding.ts
 
 export type EndpointKind = "decision" | "late" | "dense";
 
+export interface EndpointModelInfo {
+  id: string;
+  ownedBy?: string;
+  description?: string;
+}
+
+export interface EndpointModelsResult {
+  endpoint: EndpointKind;
+  ok: boolean;
+  url?: string;
+  models: EndpointModelInfo[];
+  status?: number;
+  error?: string;
+  authSummary: string;
+  latencyMs: number;
+}
+
 export interface EndpointTestResult {
   endpoint: EndpointKind;
   ok: boolean;
@@ -79,12 +96,15 @@ function validateUrl(raw: string | undefined): string | null {
   return null;
 }
 
-function modelsUrlFor(endpointUrl: string): string | null {
+export function modelsUrlFor(endpointUrl: string): string | null {
   try {
-    const u = new URL(endpointUrl);
+    const u = new URL(endpointUrl.trim());
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
     const v1Idx = u.pathname.indexOf("/v1/");
     if (v1Idx >= 0) {
       u.pathname = `${u.pathname.slice(0, v1Idx)}/v1/models`;
+    } else if (u.pathname === "/v1" || u.pathname.endsWith("/v1")) {
+      u.pathname = `${u.pathname}/models`;
     } else {
       u.pathname = "/v1/models";
     }
@@ -93,6 +113,168 @@ function modelsUrlFor(endpointUrl: string): string | null {
     return u.toString();
   } catch {
     return null;
+  }
+}
+
+function parseModelsPayload(body: unknown): EndpointModelInfo[] | null {
+  let rawList: unknown[] | null = null;
+  if (Array.isArray(body)) {
+    rawList = body;
+  } else if (body && typeof body === "object") {
+    const rec = body as { data?: unknown; models?: unknown };
+    if (Array.isArray(rec.data)) rawList = rec.data;
+    else if (Array.isArray(rec.models)) rawList = rec.models;
+  }
+  if (!rawList) return null;
+
+  const seen = new Set<string>();
+  const models: EndpointModelInfo[] = [];
+  for (const item of rawList) {
+    if (typeof item === "string") {
+      const id = item.trim();
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        models.push({ id });
+      }
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    const rec = item as { id?: unknown; name?: unknown; owned_by?: unknown; description?: unknown };
+    const id = typeof rec.id === "string" ? rec.id.trim() : typeof rec.name === "string" ? rec.name.trim() : "";
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const ownedBy = typeof rec.owned_by === "string" && rec.owned_by.trim() ? rec.owned_by.trim() : undefined;
+    const descCandidate =
+      typeof rec.description === "string" && rec.description.trim()
+        ? rec.description.trim()
+        : typeof rec.name === "string" && rec.name.trim() && rec.name.trim() !== id
+          ? rec.name.trim()
+          : undefined;
+    models.push({ id, ownedBy, description: descCandidate });
+  }
+  return models;
+}
+
+export async function fetchEndpointModels(
+  kind: EndpointKind,
+  cfg: Config,
+  opts: EndpointTestOptions = {},
+): Promise<EndpointModelsResult> {
+  const ep = kind === "decision" ? cfg.providers.decision : cfg.providers.embedding[kind];
+  const { summary: authSummary, info } = describeEndpointAuth(ep);
+  if (!ep) {
+    return {
+      endpoint: kind,
+      ok: false,
+      models: [],
+      error: "Endpoint is disabled.",
+      authSummary,
+      latencyMs: 0,
+    };
+  }
+  const urlErr = validateUrl(ep.url);
+  if (urlErr) {
+    return {
+      endpoint: kind,
+      ok: false,
+      models: [],
+      error: ep.url?.trim() ? urlErr : "Set Endpoint URL first to retrieve models from /v1/models.",
+      authSummary,
+      latencyMs: 0,
+    };
+  }
+  const url = modelsUrlFor(ep.url);
+  if (!url) {
+    return {
+      endpoint: kind,
+      ok: false,
+      models: [],
+      error: `Could not derive /v1/models URL from "${ep.url}".`,
+      authSummary,
+      latencyMs: 0,
+    };
+  }
+
+  const fetchImpl = (opts.fetch ?? globalThis.fetch) as unknown as EndpointFetchLike;
+  const started = Date.now();
+  try {
+    const timeout = AbortSignal.timeout(opts.timeoutMs ?? 5000);
+    const combined = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
+    const headers = buildAuthHeaders(ep, {});
+    const res = await fetchImpl(url, { method: "GET", headers, signal: combined });
+    const latencyMs = Date.now() - started;
+    if (!res.ok) {
+      let error: string;
+      if (res.status === 401 || res.status === 403) {
+        error = `HTTP ${res.status} — ${authFailureHint(kind, authSummary, info)}`;
+      } else if (res.status === 404 || res.status === 405 || res.status === 501) {
+        error = `HTTP ${res.status} — /v1/models is not available on this endpoint`;
+      } else {
+        error = `HTTP ${res.status} from /v1/models`;
+      }
+      return {
+        endpoint: kind,
+        ok: false,
+        url,
+        status: res.status,
+        models: [],
+        error,
+        authSummary,
+        latencyMs,
+      };
+    }
+
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      return {
+        endpoint: kind,
+        ok: false,
+        url,
+        status: res.status,
+        models: [],
+        error: "Invalid JSON response from /v1/models.",
+        authSummary,
+        latencyMs,
+      };
+    }
+
+    const models = parseModelsPayload(body);
+    if (!models) {
+      return {
+        endpoint: kind,
+        ok: false,
+        url,
+        status: res.status,
+        models: [],
+        error: "Unexpected /v1/models response shape (expected { data: [...] }).",
+        authSummary,
+        latencyMs,
+      };
+    }
+
+    return {
+      endpoint: kind,
+      ok: true,
+      url,
+      status: res.status,
+      models,
+      authSummary,
+      latencyMs,
+    };
+  } catch (e) {
+    const latencyMs = Date.now() - started;
+    const message = String((e as Error)?.message ?? e);
+    return {
+      endpoint: kind,
+      ok: false,
+      url,
+      models: [],
+      error: shortErrorSummary(undefined, message),
+      authSummary,
+      latencyMs,
+    };
   }
 }
 
@@ -110,12 +292,8 @@ async function discoverModels(
     const headers = buildAuthHeaders(authFields, {});
     const res = await fetchImpl(url, { method: "GET", headers, signal: combined });
     if (!res.ok) return undefined;
-    const body = (await res.json()) as { data?: unknown };
-    if (!Array.isArray(body?.data)) return undefined;
-    const ids = body.data
-      .map((item) => (item && typeof item === "object" && typeof (item as { id?: unknown }).id === "string" ? (item as { id: string }).id : null))
-      .filter((id): id is string => Boolean(id));
-    return ids.length ? [...new Set(ids)] : undefined;
+    const models = parseModelsPayload(await res.json());
+    return models?.length ? models.map((m) => m.id) : undefined;
   } catch {
     return undefined;
   }

@@ -41,6 +41,8 @@ export interface ScalarSetting {
   restart?: boolean;
   /** True when pi's model registry picker should be offered for this field. */
   modelPicker?: boolean;
+  /** Endpoint kind whose `/v1/models` list should be fetched for interactive model selection. */
+  endpointModels?: EndpointKind;
   /** True when the string holds an environment variable name whose presence should be shown live. */
   envVar?: boolean;
   /** True when the string holds a path to a secret/env file whose readability should be shown live. */
@@ -498,9 +500,10 @@ export function buildDecisionEndpointScreen(cfg: Config, ctx?: SettingsDisplayCo
             kind: "string",
             path: "providers.decision.model",
             label: "Model ID",
-            description: "Model identifier sent to the decision endpoint (for example pplx-decider-v1.3 or jev-latest).",
+            description: "Model identifier sent to the decision endpoint (for example pplx-decider-v1.3 or jev-latest). Retrieved from /v1/models when available, with manual input as fallback.",
             placeholder: "pplx-decider-v1.3",
             defaultValue: "",
+            endpointModels: "decision",
           },
           {
             kind: "optional-string",
@@ -659,11 +662,12 @@ export function buildEmbeddingEndpointScreen(kind: "late" | "dense", cfg: Config
             label: "Model ID",
             description:
               kind === "late"
-                ? "Multi-vector model identifier requested from the server (e.g. perplexity-ai/pplx-embed-v2-late-9b or lightonai/GTE-ModernColBERT-v1)."
-                : "Embedding model identifier requested from the server (e.g. text-embedding-3-small).",
+                ? "Multi-vector model identifier requested from the server (e.g. perplexity-ai/pplx-embed-v2-late-9b or lightonai/GTE-ModernColBERT-v1). Retrieved from /v1/models when available, with manual input as fallback."
+                : "Embedding model identifier requested from the server (e.g. text-embedding-3-small). Retrieved from /v1/models when available, with manual input as fallback.",
             placeholder: kind === "late" ? "perplexity-ai/pplx-embed-v2-late-9b" : "text-embedding-3-small",
             restart: true,
             defaultValue: "",
+            endpointModels: kind,
           },
           {
             kind: "enum",
