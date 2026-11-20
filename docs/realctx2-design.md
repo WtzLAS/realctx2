@@ -1,6 +1,6 @@
 # realctx2: Context and Memory Management for Agent Harnesses
 
-**Design document · Draft v0.6 · 2026-11-20**
+**Design document · Draft v0.7 · 2026-11-20**
 
 Owner: laserrks · Harnesses (v1): [pi](https://docs.pi.dev/latest/extensions) (primary) and Claude Code (best-effort) · Language: TypeScript · Storage: [Loro](https://loro.dev) CRDT
 
@@ -14,16 +14,15 @@ Owner: laserrks · Harnesses (v1): [pi](https://docs.pi.dev/latest/extensions) (
 >
 > Where the papers leave a gap, this document fills it and labels the value **realctx2 default** (tables use the source tag `ours`). Paper-sourced values are tagged **H** (Hippocam), **E** (EvoDisco), **F** (FadeMem), **SF** (Selective Forgetting) or **Q** (QEMem).
 
-**Changes in v0.6** (from a v0.5 design review; earlier changes are in Appendix A)
+**Changes in v0.7** (from the first implementation and runs against pi 1.5.2 and Claude Code 2.1.326; earlier changes are in Appendix A)
 
-- **Aligned with pi 1.5.2.** `systemPromptOptions` is applied on every `before_agent_start` with cached strings (§4.2); `session_before_compact` returns a realctx2 compaction instead of cancelling overflow recovery (§5.4.5); nested tool calls (`parentToolCallId`) and `structuredContent` are handled cleanly (§4.2); the custom decision HTTP endpoint is also registered via `pi.registerProvider()` (`type: "classifier"`) so `codemode` scripts and other extensions can call it (§9.1.2).
-- **No hot-loop aux stalls.** Transcript-only aux roles (`janus.scribe`, `precip`, `palim`, `qemem.planner`, `write.merge`, `decision.emulate`) run as single-turn, tool-free calls; Precip and Palim generation decouples from synchronous intent state transitions (§3.3, §4.4, §9.3).
-- **Read-only aux sessions.** Tool-using aux roles get read-only tools only (`read`, `grep`, `find`, `ls`, plus realctx2's read tools), with no `edit`/`write` and `bash` opt-in per role (§9.3.2).
-- **Complete Palim cost check.** Pre-fold estimation includes aux generation cost `C_fold`, and cold-cache deferred folds apply via `context` on the cold request before persisting at `turn_end` (§5.4.2).
-- **CRDT and git-hygiene fixes.** `anchors`, `evidence` and `strength.events` move to keyed `LoroMap`s; violation counters are monotonic per urgency level rather than reset (§6.10.4, §7.3); read-only counter deltas stay in `pending-shared.loro` instead of dirtying a clean git working tree (§7.5); shared `purge` is restricted to explicit user `/realctx2 forget --purge` (§6.5.6, §7.10).
-- **Lifecycle, scoring and calibration fixes.** Floored retrieval strength (`0.2 + 0.8·v(t)`), high-MW demotion protection, explicit no-decay for pinned nodes, compliance credit for preventive rules, cross-scope mutation guard for Global, inverse-probability weighting in calibration refits, and MUVERA FDE sizing/eviction (§6.3–6.7, §9.2).
-- **Pragmatic EvoDisco rollout.** v1 ships with the decision-model teacher and semantic check by default while logging `(s, a, U)`; the MLP policy is opt-in, with centered rewards and unbiased randomized A/B graduation (§6.6).
-- **Simpler rule trust and Claude Code sync.** "Project rules" trust relies on `ctx.isProjectTrusted()` + `origin === "instructions"` rather than historical git blobs (which broke shallow clones and rule edits, §7.12), and Claude Code auto-syncs `claudeMdExcludes` on `SessionStart` (§4.6.2).
+- **Decisions without a decision model work in practice.** Emulated answers took 5–10 s against a 1.5 s timeout, so none arrived. `decision.emulate` now runs without thinking, has a timeout floor, and no commit point waits for it: Janus's answer and proactive cards apply at the next commit point (§5.2.1, §6.4.1, §9.1.4, §9.3.4).
+- **Remembered memories start short-term.** An unpinned `remember` goes to SML and earns LML by the usual rules; in LML the first hygiene pass demoted it (§6.3).
+- **Read-only sessions keep the shared store clean.** Path reconciliation writes nothing for unchanged paths, and keeps the checkout's last reconciled commit in the local index (§6.8.2–6.8.3); the shared journal records whether it holds counter-only changes, so the worker doesn't flush them (§7.5).
+- **pi details.** Tools register in `session_start` and are re-checked at the first `before_agent_start` (§4.1, §8.1.3); records decided in `before_agent_start` travel in the guidance message's `details` (§4.2, §5.1); the compaction record is written in `session_compact` (§4.2, §5.4.5); summaries and `!` runs can't be edited (§4.3). `aux.pi.extensions` is dropped.
+- **Claude Code details.** Plugin tool names are `mcp__plugin_realctx2_realctx2__…`; one generated skill per command; the socket registry; the post-compaction injection split under the 10,000-character hook limit; trust, dialogs and the oversize guard's scope (§4.6).
+- **Context engine.** Precip may consolidate inside the working tail (§4.3, §5.3.2); the innermost climb level's stability and the climb clock on closure (§5.4.2); `C_fold` at the aux model's prices (§5.4.2); commit and test commands match path-anchored rules (§6.8.5); turns are indexed at shutdown (§5.6).
+- **Memory and storage details.** Seed activation and stop words in retrieval (§6.4.3); a lexical floor for conflict candidates (§6.3.2); the repository root as glob `**` (§6.8.1); re-ingest of unchanged sections (§6.9.2); `rules edit` patches in place (§6.9.3); tombstone fields and purge scrubbing (§7.3, §7.10); flush timing (§7.5); the worker's session clean-up (§4.6.6, §6.6.8); packaging (§4.1).
 
 ## Contents
 
@@ -321,7 +320,10 @@ sequenceDiagram
 
 - realctx2 ships as a pi package. Its `package.json` declares `"pi": { "extensions": ["./dist/index.js"] }`.
 - **Install it globally**, either in `~/.pi/agent/extensions/realctx2/` or through `settings.json` → `packages`. The plugin must reach the global and personal stores in every project. Project-local extensions also load only after the project is trusted.
-- The factory registers handlers, tools and the command only. Following pi's rule, it starts no processes, timers or watchers. Those start in `session_start` and stop in an idempotent `session_shutdown`.
+- The factory registers handlers and the command only. Following pi's rule, it starts no processes, timers or watchers. Those start in `session_start` and stop in an idempotent `session_shutdown`.
+- **Tools are registered in `session_start`**, not in the factory: pi's tool list can't be read while extensions load, so the name check (§8.1.3) can't run there. The check runs again at the first `before_agent_start`, once every extension has registered its tools.
+- **Tool parameters are plain JSON Schema.** realctx2 doesn't depend on `typebox`; the same definitions serve pi and the Claude Code MCP server.
+- **Build.** `dist/` is built by `npm run build`, which also generates the Claude Code skills (§4.6.1). The `prepare` script builds only when TypeScript is installed, so an install without dev dependencies (pi installs git sources with `--omit=dev`) doesn't fail; such an install needs a `dist/` built beforehand.
 
 ```ts
 // src/adapters/pi/index.ts (signatures abbreviated)
@@ -331,7 +333,7 @@ import { piAdapter } from "./adapter";
 
 export default async function realctx2(pi: ExtensionAPI) {
   const engine = createEngine(piAdapter(pi));
-  pi.on("session_start",          (e, ctx) => engine.onSessionStart(e, ctx));
+  pi.on("session_start",          (e, ctx) => engine.onSessionStart(e, ctx));    // also registers the tools
   pi.on("input",                  (e, ctx) => engine.onInput(e, ctx));           // aborts idle maintenance
   pi.on("before_agent_start",     (e, ctx) => engine.onUserTurn(e, ctx));        // -> { message }
   pi.on("context",                (e, ctx) => engine.onContext(e, ctx));         // cold-cache & emergency path
@@ -341,11 +343,11 @@ export default async function realctx2(pi: ExtensionAPI) {
   pi.on("turn_end",               (e, ctx) => engine.onTurnEnd(e, ctx));         // -> { entries: [...e.entries, ...] }
   pi.on("agent_before_settle",    (e, ctx) => engine.onSettle(e, ctx));          // -> { entries: [...e.entries, ...] }
   pi.on("agent_settled",          (e, ctx) => engine.onSettled(e, ctx));         // starts idle maintenance timer
-  pi.on("session_before_compact", (e, ctx) => engine.onBeforeCompact(e, ctx));   // -> { compaction } | { cancel }
+  pi.on("session_before_compact", (e, ctx) => engine.onBeforeCompact(e, ctx));   // -> { compaction }
+  pi.on("session_compact",        (e, ctx) => engine.onCompacted(e, ctx));       // records the compaction
   pi.on("session_tree",           (e, ctx) => engine.rebuild(ctx));
   pi.on("model_select",           (e, ctx) => engine.onModelSelect(e, ctx));
   pi.on("session_shutdown",       (e, ctx) => engine.onShutdown(e, ctx));
-  registerChecked(pi, engine.tools());   // skips and reports any name another source already uses (§8.1.3)
   pi.registerCommand("realctx2", engine.command());
 }
 ```
@@ -354,9 +356,9 @@ export default async function realctx2(pi: ExtensionAPI) {
 
 | pi event | realctx2 action |
 |---|---|
-| `session_start` | <ol><li>Load the config and resolve the project key (§6.1).</li><li>Register the configured custom decision endpoint as a pi classifier provider (`pi.registerProvider("realctx2-decision", …)`) backed by realctx2's HTTP adapter, so `codemode` scripts and other extensions can also use it (§9.1.2).</li><li>Open the scope stores. The shared store opens only if `ctx.isProjectTrusted()`.</li><li>Rebuild the intent stack, consolidation map and ledger from the active branch's `custom` entries.</li><li>Hash-check instruction sources (§6.9.3) and reconcile uncertain paths (§6.8.3).</li><li>Check tool names against every other tool (§8.1.3).</li><li>Start provider health checks, including the shape check of each embedding model (§9.2).</li></ol> |
+| `session_start` | <ol><li>Load the config and resolve the project key (§6.1).</li><li>Register the configured custom decision endpoint as a pi classifier provider (`pi.registerProvider("realctx2-decision", …)`) backed by realctx2's HTTP adapter, so `codemode` scripts and other extensions can also use it (§9.1.2).</li><li>Open the scope stores. The shared store opens only if `ctx.isProjectTrusted()`.</li><li>Rebuild the intent stack, consolidation map and ledger from the active branch's `custom` entries.</li><li>Hash-check instruction sources (§6.9.3) and reconcile uncertain paths (§6.8.3).</li><li>Register the tools, skipping and reporting any name another source already uses (§8.1.3).</li><li>Start provider health checks, including the shape check of each embedding model (§9.2).</li></ol> |
 | `input` | Abort any running idle-time maintenance step (§6.6.8). |
-| `before_agent_start` | <ol><li>Apply the cached realctx2 system-prompt section and "Project rules" section to `systemPromptOptions.sections`, and filter ingested files out of `systemPromptOptions.contextFiles` (§6.9.5). Applied on **every** `before_agent_start` (since pi rebuilds `systemPromptOptions` from base inputs each run); because the strings only change when rules change, pi's section differ emits no patch and preserves the prompt cache.</li><li>When `event.messageType === "user"`, run Janus on the new user message, including paths it mentions (§6.8.5), and return a guidance `message` (customType `realctx2.guidance`) plus proactive cards on kindle. Extension-triggered custom runs (`messageType === "custom"`) skip user-turn Janus.</li></ol> |
+| `before_agent_start` | <ol><li>Apply the cached realctx2 system-prompt section and "Project rules" section to `systemPromptOptions.sections`, and filter ingested files out of `systemPromptOptions.contextFiles` (§6.9.5). Applied on **every** `before_agent_start` (since pi rebuilds `systemPromptOptions` from base inputs each run); because the strings only change when rules change, pi's section differ emits no patch and preserves the prompt cache.</li><li>When `event.messageType === "user"`, run Janus on the new user message, including paths it mentions (§6.8.5), and return a guidance `message` (customType `realctx2.guidance`) plus proactive cards on kindle. Extension-triggered custom runs (`messageType === "custom"`) skip user-turn Janus.</li><li>On the first `before_agent_start`, check tool names again, now that every extension has registered its tools (§8.1.3).</li></ol> `before_agent_start` can return a message but no entries, so the `custom` records decided here (intent kindles and closures, deliveries) travel in the guidance message's `details.records`. Session state is rebuilt from `custom` entries and from these records alike (§5.1). |
 | `tool_call` | Wrapped in a fail-open `try/catch` (pi's `tool_call` is fail-closed on uncaught errors). Extract paths and commands from the call and run the pre-edit gate for `immediate` memories on `edit`, `write` and `bash` (§6.10.3), including nested calls (`parentToolCallId`). On the turn's first top-level call (no `parentToolCallId`), start Janus in the background (§5.2.1). |
 | `tool_result` | <ul><li>Record deliveries from `search`, `recall` and `inspect` (top-level calls only; nested calls with `parentToolCallId` do not create transcript entries).</li><li>For top-level calls, append path memories for the paths touched (§6.8.5) and apply the oversize guard (§5.4.6), always forwarding `structuredContent: event.structuredContent` when patching `content` so structured tool outputs aren't dropped. Nested calls (`parentToolCallId`, e.g., inside `codemode`) skip `[paths]` text injection so programmatic callers aren't corrupted.</li><li>Apply moves and deletions confirmed by a successful command (§6.8.3).</li></ul> |
 | `user_bash` | Track moves and deletions in commands the user runs (§6.8.3). |
@@ -364,7 +366,8 @@ export default async function realctx2(pi: ExtensionAPI) {
 | `agent_before_settle` | Closure-only Janus (no new kindles) and commit any already-ready async edits, preserving `...event.entries`. Newly closed intents emit their `realctx2.intent` closure synchronously and queue Precip consolidation to run during idle time (committing at the next `turn_end`), so the user's prompt cursor never blocks on an aux call. Controlled by `context.settleConsolidation`, default on. |
 | `agent_settled` (plus an idle timer) | Run queued post-settle Precip and start model-dependent maintenance in the background (§6.6.8). Aborted on the next `input`. |
 | `context` | Normally returns nothing, which keeps pi's cache-friendly path. Used in two cases: (1) an emergency request above capacity before a commit point, and (2) applying a cost-deferred Palim fold on the first request after a cold-cache gap (§5.4.2), since the cache is already cold. In both cases the edits are persisted at the next `turn_end`. |
-| `session_before_compact` | `session_before_compact` cannot persist `context_edit` entries, and returning `{ cancel: true }` on `reason === "overflow"` suppresses pi's overflow retry. Instead, return a realctx2 `compaction` payload (`summary`, `firstKeptEntryId` at the working tail, `tokensBefore`) and record a `compaction` `ConsolidationRecord` via `pi.appendEntry` (§5.4.5). |
+| `session_before_compact` | `session_before_compact` cannot persist `context_edit` entries, and returning `{ cancel: true }` on `reason === "overflow"` suppresses pi's overflow retry. Instead, return a realctx2 `compaction` payload (`summary`, `firstKeptEntryId` at the working tail, `tokensBefore`) (§5.4.5). |
+| `session_compact` | Record the `compaction` `ConsolidationRecord` via `pi.appendEntry`, anchored at the compaction entry pi just wrote. The entry's ID doesn't exist yet in `session_before_compact`. |
 | `session_tree`, `session_start` (fork or resume) | Rebuild state from the new active branch. All realctx2 session state is branch-relative. |
 | `model_select` | Recompute W from the new model's context window. |
 | `session_shutdown` | <ol><li>Flush per-session counter aggregates.</li><li>Write pending changes as update files (§7.5), including shared ones, without review.</li><li>Queue model-dependent work that hasn't run yet (§6.6.8).</li><li>Spawn the model-free worker, detached.</li></ol> |
@@ -377,6 +380,7 @@ pi provides exactly the primitive Hippocam's REPLACE needs:
 - `replacement: null` omits the target from model context.
 - The latest edit per target on the active branch wins.
 - Edits are branch-relative: navigating to a point before an edit shows the original again.
+- Only `user`, `assistant`, `toolResult` and `custom_message` entries can be edited. Compaction and branch summaries and `!` shell runs can't: a span may contain them, and the replacement leaves them in place.
 
 **REPLACE(span S, message m)**
 
@@ -404,7 +408,7 @@ pi provides exactly the primitive Hippocam's REPLACE needs:
 **Invariants** checked on the projected message list before every commit:
 
 1. S contains only complete rounds. Every tool call's result is inside S, and vice versa.
-2. S does not intersect the working tail, except in pressure step 3, where only unfinished rounds stay protected.
+2. A Palim span does not intersect the working tail, except in pressure step 3, where only unfinished rounds stay protected. A Precip span may: a closed intent's region is consolidated whole, and only invariant 3 limits it.
 3. S never contains the latest round. Its assistant message may carry reasoning blocks that the provider needs back unmodified in a tool-use loop.
 4. The projected list is valid for the provider. If the anchor choice would create invalid consecutive same-role messages for a strict-alternation provider, the adapter picks an alternate anchor *inside S* (never mutating entries outside S, which would break `ConsolidationRecord.children`), or relies on pi's provider serializer to coalesce consecutive same-role turns.
 
@@ -458,6 +462,8 @@ pi is realctx2's primary harness. Claude Code is supported **best-effort** (deci
 - Every hook fails open. On an error or a timeout it prints nothing, and Claude Code carries on.
 - When something can't be done reliably through hooks, the adapter takes the simplest safe behavior and says so in `status`. It doesn't build workarounds.
 - Claude Code tests are smoke tests (§12.1), not parity tests.
+- **Trust.** Claude Code asks the user to trust a folder before it runs there, so the project is treated as trusted (shared store and project config load) unless `REALCTX2_UNTRUSTED=1`.
+- **Commands have no dialogs.** Skills run commands without a UI: confirmations take `--yes` (for example `/realctx2:ingest --yes`), and `rules edit` prints the rule's form instead of opening an editor; editing needs pi.
 
 #### 4.6.1 Packaging
 
@@ -468,14 +474,18 @@ realctx2-claude/
 ├── .claude-plugin/plugin.json       # name: "realctx2"
 ├── .mcp.json                        # realctx2 MCP server (stdio): agent tools + engine host
 ├── hooks/hooks.json                 # each event → bin/realctx2-hook <event>
-├── skills/realctx2/SKILL.md         # /realctx2:… commands (ingest, review, forget, paths, …)
+├── skills/<command>/SKILL.md        # one skill per command: /realctx2:status, /realctx2:ingest, …
+├── skills/realctx2/SKILL.md         # /realctx2:realctx2: the list, or a command by name
 └── bin/realctx2-hook                # small client that forwards hook input to the server
 ```
 
 - **The MCP server hosts the engine for the session.** It is a long-lived process that:
   - holds the Loro documents, the SQLite index and the session state;
-  - exposes the five agent tools (§8.1), which Claude sees as `mcp__realctx2__search` and so on.
-- **Hooks are thin.** Each hook is a command that forwards the event's JSON to the server over a local socket under `${CLAUDE_PLUGIN_DATA}`, and prints the server's answer.
+  - exposes the five agent tools (§8.1). Claude Code names a plugin's MCP tools `mcp__plugin_<plugin>_<server>__<tool>`, so Claude sees `mcp__plugin_realctx2_realctx2__search` and so on. The server learns the exact prefix from the first hook that names one of its tools.
+- **The plugin directory is part of the npm package** and loads the package's `dist/` (next to it, through `REALCTX2_PACKAGE`, or from the global modules).
+- **Skills are generated** from the command table (§10) at build time, one per command, so each command has its own `/realctx2:<command>` with an argument hint. A skill runs `realctx2-hook command <name>` and passes its arguments on stdin, so quotes and shell characters need no escaping. Only commands that only read may be invoked by the model on its own.
+- **Hooks are thin.** Each hook is a command that forwards the event's JSON to the server over a local socket and prints the server's answer.
+  - The socket lives under `${CLAUDE_PLUGIN_DATA}` (or the temp directory when that path is too long for a Unix socket). Each server registers its socket, PID and parent PIDs in `~/.pi/agent/realctx2/claude-code/run/`; a hook finds its server by session ID, else by a shared ancestor process (the same Claude Code process).
   - Every hook has a timeout.
   - On failure, a hook prints nothing, so Claude Code continues normally.
 - **Same stores as pi.** The stores are `~/.pi/agent/realctx2/…` and `<repo>/.pi/realctx2/`, exactly as for pi, so pi and Claude Code on one machine share memory.
@@ -486,10 +496,10 @@ realctx2-claude/
 | Claude Code hook | realctx2 action |
 |---|---|
 | `SessionStart` (`startup`, `resume`, `clear`, `fork`) | Open the stores, and load or create the session state (§4.6.6). Inject the realctx2 prompt section, "Project rules" and the open intents via `additionalContext`. If the loaded shared store contains ingested `sources` entries, ensure `claudeMdExcludes` in `.claude/settings.local.json` covers them (so teammates who pull after someone else ran `/realctx2 ingest` don't double-load reappearing files). Return `watchPaths` for the anchored files, so `FileChanged` can track them. On the first session after install, turn off auto memory; on a project's first session, queue its auto-memory import (§4.6.5). |
-| `SessionStart` (`compact`) | Re-inject the consolidated state (§4.6.3). This is where consolidation takes effect in Claude Code. |
+| `SessionStart` (`compact`) | Re-inject the consolidated state (§4.6.3). This is where consolidation takes effect in Claude Code. Claude Code caps each hook's `additionalContext` at 10,000 characters, so `hooks.json` registers four `SessionStart` handlers: the first injects the prompt section as on any start, and three more, matched on `compact`, each carry one part of the consolidated state. |
 | `UserPromptSubmit` | Janus (full), including paths mentioned in the prompt (§6.8.5). Guidance and proactive cards go out via `additionalContext`. |
 | `PreToolUse` | Extract paths and commands. Run the pre-edit gate for `immediate` memories (`permissionDecision: "deny"` once, with the memories as the reason; §6.10.3). On the first call of a batch in the main thread, start Janus in the background (§5.2.1). Also inside subagents (§4.6.7). |
-| `PostToolUse` | <ul><li>Path memories via `additionalContext`, which Claude Code places next to the tool result.</li><li>Delivery ledger.</li><li>Move tracking for `Bash` commands.</li><li>Oversize guard via `updatedToolOutput`.</li></ul> Also inside subagents (§4.6.7). |
+| `PostToolUse` | <ul><li>Path memories via `additionalContext`, which Claude Code places next to the tool result.</li><li>Delivery ledger.</li><li>Move tracking for `Bash` commands.</li><li>Oversize guard via `updatedToolOutput`. The replacement has to match the tool's output shape, so the guard rewrites `Bash` output and plain-string outputs only; for other tools Claude Code's own output limits apply.</li></ul> Also inside subagents (§4.6.7). |
 | `PostToolBatch` | Main thread only. Apply the Janus answer started at `PreToolUse` (§5.2.1). Shadow Precip and attribution for intents that closed. |
 | `SubagentStart`, `SubagentStop` | Mark which events belong to a subagent, so Janus, Precip and attribution leave them out (§4.6.7). |
 | `Stop` | Closure-only Janus, shadow Precip, attribution. Side effects only: context returned from `Stop` would make Claude keep going. |
@@ -507,7 +517,7 @@ Claude Code doesn't let a plugin edit earlier messages, so consolidation runs in
 - **Unchanged:** Janus, guidance, path memories and memory tools work exactly as in pi, because they only append.
 - **Shadow Precip.** When an intent closes, Precip writes the consolidated memory, its `t:` ID and the episode candidate, just as in pi. The transcript keeps the raw messages.
 - **Shadow Palim.** There is no in-place fold. Palim's knowledge items are produced incrementally, for harvest and for the post-compaction injection.
-- **At compaction**, `SessionStart` (`compact`) injects the realctx2 state, within a budget of 8,000 tokens:
+- **At compaction**, `SessionStart` (`compact`) injects the realctx2 state, within a budget of 8,000 tokens, split into parts under Claude Code's 10,000-character limit (§4.6.2):
   1. the open intents, with their conditions;
   2. the consolidated memories of closed intents, newest first, with their `t:` IDs;
   3. Palim's knowledge items.
@@ -563,7 +573,7 @@ Claude Code has no session entries like pi's (§5.1), so realctx2 keeps each ses
   | `compact` | The same state, with the consolidated state injected again (§4.6.3) |
 
 - **When state is missing,** for example after a crash before a write, realctx2 starts fresh. `recall` on an old `t:` ID explains that it isn't available, and `search` still finds the raw turns.
-- **Clean-up.** The log is local and bounded by its session. The worker deletes logs whose transcripts are gone.
+- **Clean-up.** The log is local and bounded by its session. The worker deletes logs whose transcripts are gone, once the session has ended or is a day old (a running session's transcript may not exist yet).
 
 #### 4.6.7 Subagents (best-effort)
 
@@ -584,6 +594,7 @@ The session state is S = (entries on the active branch, intent stack 𝓘, conso
 
 - Every realctx2 session record is a pi `custom` entry: `realctx2.intent`, `realctx2.consolidation`, `realctx2.delivery`, `realctx2.attribution` and `realctx2.stats`.
 - `custom` entries never reach the model. They are branch-relative and survive restarts.
+- Records decided in `before_agent_start`, which can't return entries, travel in the guidance message's `details.records` instead (§4.2). They are just as branch-relative.
 - In-memory structures are rebuilt from these records on `session_start` and `session_tree`.
 
 ```ts
@@ -621,6 +632,7 @@ interface Intent {
 - **What it costs.** A closure that only shows in the tool results, such as a test that now passes, is seen one step later, when the next run's evidence includes those results. A late closure only delays consolidation (§5.2.7). Kindles usually show in the assistant's own message ("now I'll look at …"), so they are rarely late.
 - **What it saves.** The decision model's latency leaves the critical path on every step except user messages.
 - **Claude Code.** The same moments are `UserPromptSubmit`; the first `PreToolUse` of a batch, with the answer applied at `PostToolBatch`; and `Stop` (§4.6.2).
+- **Without a decision model** (§9.1.4), answers take seconds, so no moment waits for them. A user message and settle wait at most `janus.lateWaitMs`, like `turn_end`, and an answer that misses its moment applies at the next commit point. One Janus request is in flight at a time: while it runs, later steps don't start another. A plan applied late can't kindle an intent if another intent was kindled since its evidence was taken.
 
 #### 5.2.2 Evidence
 
@@ -686,7 +698,7 @@ Proactive memory cards (§6.4.1) are attached only when an intent is kindled.
 #### 5.2.7 Failures and cost
 
 - **Decision timeout or error.** The default timeout is 1,500 ms. On timeout or error, treat the answer as `continue` with no closures. That is safe: a missed closure only delays consolidation, and pressure control still bounds the window.
-- **No decision model configured.** Use aux-emulated decisions (§9.1.4) with a stricter τ_close of 0.9.
+- **No decision model configured.** Use aux-emulated decisions (§9.1.4) with a stricter τ_close of 0.9. They apply one step late (§5.2.1), so an intent's guidance lands a round after its work began; that round stays in the enclosing region, and Precip covers less of the work.
 - **Cost:**
   - One decision request per step, with 2–8K input tokens, mostly cache-stable.
   - One small aux call per kindle.
@@ -702,7 +714,7 @@ Proactive memory cards (§6.4.1) are attached only when an intent is kindled.
 #### 5.3.2 Input
 
 - The closed region's entries *as currently projected*: nested consolidations appear as their consolidated text, with their `t:` IDs.
-- The latest round is excluded (invariant 3). It is folded into the parent region later.
+- The latest round is excluded (invariant 3). It is folded into the parent region later. The working tail is not excluded: the region is consolidated whole, even when part of it is still in the tail (§4.3, invariant 2).
 - The **telos chain**: labels of the enclosing open intents.
 - The intent record and its outcome.
 - The delivery ledger entries for the region.
@@ -765,7 +777,7 @@ Ordinary folds start with the root prefix and climb into the open intents slowly
 G_j is intent i_j's guidance message. The **body** of C_j is the rest of its region (§5.1).
 
 - **Frontier f.** The deepest level that ordinary folds may touch, with 0 ≤ f ≤ d. It starts at 0 (the root region) when a session starts and after a `new_root`.
-- **Stable level.** A level is stable when its body has had no new entries for `climb.stableRounds` rounds (default 8). A parent region stops growing while its child intent runs. It grows again when the child closes and the child's Precip consolidation lands in it.
+- **Stable level.** A level is stable when its body has had no new entries for `climb.stableRounds` rounds (default 8). A parent region stops growing while its child intent runs. It grows again when the child closes and the child's Precip consolidation lands in it. The innermost level grows every round, so it counts as stable once its intent has been open for `climb.stableRounds` rounds.
 - **Climbing.** At most once every `climb.roundsPerLevel` rounds (default 8), if level f + 1 is stable, f rises by one.
 - **Faster when the window fills** (decided). While the predicted occupancy P (§5.4.3) is above `climb.fastOccupancy` · W (default 0.5), both round counts are divided by `climb.fastFactor` (default 2).
 - **Cost check** (decided in v0.5, refined in v0.6). Below `climb.fastOccupancy`, every ordinary fold, the root level included, must pay for itself. A fold removes Δ tokens from every later request, costs `C_fold` in aux LLM tokens to generate, and forces the provider to re-cache the S tokens that come after the fold point:
@@ -773,12 +785,12 @@ G_j is intent i_j's guidance message. The **body** of C_j is the rest of its reg
   fold only if  Δ̂ · p_read · R̂  ≥  S · (p_write − p_read) + C_fold
 
   - `Δ̂` is the pre-fold estimated saving (default `0.65 · spanTokens`), checked **before** invoking the aux LLM so failing folds spend nothing; after generation, the fold still must save at least `Δ_min`.
-  - `p_read` and `p_write` are the main model's cache-read and cache-write prices per token (from pi's model metadata; fallback ratios 0.1 and 1.25 of input price). `C_fold` is the estimated aux-call cost (`spanTokens · p_aux_in + estOutTokens · p_aux_out`), expressed in the same units.
+  - `p_read` and `p_write` are the main model's cache-read and cache-write prices per token (from pi's model metadata; fallback ratios 0.1 and 1.25 of input price). `C_fold` is the estimated aux-call cost (`spanTokens · p_aux_in + estOutTokens · p_aux_out`), expressed in the same units, at the prices of the model Palim runs on; when the harness doesn't know them, the main model's input and output prices.
   - R̂ is the expected number of further requests in the session: the median remaining length of this project's recent sessions, at least 10, or 20 without history.
   - For example, at p_read = 0.1 and p_write = 1.25 (before `C_fold`), a fold saving 16K tokens ahead of a 60K-token suffix pays off only after about 43 more requests; at p_read = 0.05, after about 90. Outer levels have the longest suffixes, so they fail the check most often.
 - **Cold cache.** Once the provider's cache has expired (no request for `context.cacheTtlSeconds`, default 300), re-caching `S` costs nothing extra, so the check reduces to `Δ̂ · (p_write + p_read · (R̂ − 1)) ≥ C_fold`. Folds that are due and pass this check are applied on the first request after such a gap via the `context` hook (replaying the prompt breaks no warm cache when the cache is already cold) and persisted as `context_edit` entries at the next `turn_end`.
 - **Above `climb.fastOccupancy`** the climb speeds up as decided in v0.4, with no cost check: by then the window's size matters more than cache cost.
-- **Falling back.** When the intent at level k closes, its Precip consolidation lands in level k − 1, so f ← max(0, min(f, k − 2)): the changed level has to become stable again before folds reach it. A kindle changes no existing body, so it leaves f alone.
+- **Falling back.** When the intent at level k closes, its Precip consolidation lands in level k − 1, so f ← max(0, min(f, k − 2)): the changed level has to become stable again before folds reach it. A closure also restarts the climb's clock, so the next step up waits `climb.roundsPerLevel` rounds again. A kindle changes no existing body, so it leaves f alone.
 - **A level j ≤ f is folded when:**
   - **size:** at levels below the innermost, the unfolded part of the body holds at least E_min consolidated messages and T_min tokens. At the innermost level, the part before the working tail must hold at least `climb.innermostMinTokens` (default 2 · T_min). With no open intent, the root region is the only level, and the first rule applies;
   - **no closure expected:** Janus's latest `close.<id>` answer for the intent gives P(closed) below `climb.skipCloseProb` (default 0.5). An intent about to close is consolidated whole by Precip anyway.
@@ -846,7 +858,7 @@ Knowledge:
   - `summary` = a ripple over everything before the working tail (incorporating manual `/compact` instructions when provided);
   - `firstKeptEntryId` = the first entry of the working tail;
   - `tokensBefore` = `preparation.tokensBefore`;
-  - a `ConsolidationRecord` of kind `compaction` is written via `pi.appendEntry`, so recall still works (raw entries remain in the file).
+  - a `ConsolidationRecord` of kind `compaction` is written via `pi.appendEntry` in `session_compact`, anchored at the compaction entry pi wrote, so recall still works (raw entries remain in the file).
 - **Still above capacity after all of this:** report capacity exhaustion to the user (`ctx.ui.notify`) before the request goes out, as Hippocam does. Never truncate silently.
 
 #### 5.4.6 Oversized tool-result guard (ours)
@@ -959,7 +971,7 @@ rules only:  complied += P(complied) ;  violated += P(violated)
 - **The turn index.** Consolidated turns and raw turns are indexed for `search` (§8.1): BM25 over their text, plus vectors from the configured embedding models (§9.2). Raw entries are indexed in chunks of up to 512 tokens. Everything is kept on this machine only.
 - **Earlier sessions.** `search` with `where: "project"` also covers this project's earlier sessions that started with realctx2 enabled (decided: no backfill of older sessions).
   - Each such session is registered at its start in `projects/<projectKey>/sessions.json`.
-  - Its transcript is indexed as it runs: pi session files under `~/.pi/agent/sessions/`, or Claude Code's `transcript_path`.
+  - Its transcript is indexed as it runs (pi session files under `~/.pi/agent/sessions/`, or Claude Code's `transcript_path`), and once more at shutdown, so a session that ends before its last round completes is searchable too.
   - Hits carry `[r:…]` or `[t:…]` IDs that `recall` accepts.
 - **Recall is a delivery.** It is recorded in the ledger and attributed like any memory (§5.5).
 
@@ -1176,7 +1188,7 @@ centrality(v) = log(1 + Σ_{active e ∋ v} w_e · κ(layer(src_e), layer(dst_e)
 | Precip memory + sidecar | `episode` | SML | An intent closes |
 | Palim knowledge items | `fact` or `procedure` (with `evaluation`) | SML | A fold commits; end-of-session harvest |
 | Instruction files (`/realctx2 ingest`) | `rule`, `procedure`, `fact`, `preference` | LML, pinned | Ingest (§6.9); the files are then deleted |
-| `remember`, called by the agent | any | LML, not pinned unless the user asked (`pin: true`) | Explicit request |
+| `remember`, called by the agent | any | SML, not pinned unless the user asked (`pin: true`, then LML) | Explicit request |
 | `/realctx2 remember`, typed by the user | any | LML, pinned | Explicit request |
 | Claude Code auto-memory notes (§4.6.5) | any | SML, not pinned | A project's first realctx2 session |
 | EvoDisco operators | `concept`, `procedure`, children | Placement rules (§6.6.2) | Maintenance |
@@ -1217,7 +1229,7 @@ centrality(v) = log(1 + Σ_{active e ∋ v} w_e · κ(layer(src_e), layer(dst_e)
 7. **Embed** with the configured models (§9.2). Vectors are cached by content hash, model, d and role settings.
 8. **De-duplicate.** If an active node of the same kind in the target scope has similarity ≥ 0.92 (SF; symmetric MaxSim with late interaction) — or a `dormant` node matches by exact `contentHash` or high-confidence FTS hit (§6.5.4) — merge into it instead of creating a new node: revive it if dormant, add the evidence, record a reinforcement event, and update `lastAccessAt`.
 9. **Resolve conflicts** (FadeMem's four classes, judged by the decision model):
-   - **Candidates:** up to 5 nodes in visible scopes with similarity ≥ θ_sim = 0.75 (ours).
+   - **Candidates:** up to 5 nodes in visible scopes with similarity ≥ θ_sim = 0.75 (ours). Without an embedding model, similarity falls back to lexical overlap, and a candidate also needs a character-trigram Jaccard of at least 0.2, so unrelated memories that share common words aren't sent to the decision model.
    - **Questions per pair j:**
      - `rel.<j>`: choice of `compatible` · `contradictory` · `subsumes` · `subsumed` · `unrelated`;
      - `newer.<j>`: binary, "Does the new memory describe the current state and replace the old one?"
@@ -1235,7 +1247,7 @@ centrality(v) = log(1 + Σ_{active e ∋ v} w_e · κ(layer(src_e), layer(dst_e)
 10. **Insert.**
     - Normal memories go to SML with v₀ = 0.6 (ours; F leaves it open).
     - Pinned memories go to LML with v₀ = 1.0.
-    - Unpinned explicit memories (`remember`) go to LML with v₀ = 0.8 (ours), and decay and get forgotten like any other memory.
+    - Unpinned explicit memories (`remember`) go to SML with v₀ = 0.8 (ours), and decay and get forgotten like any other memory. They move to LML by the rules of §6.5.2 once they earn it. (Starting them in LML doesn't work: with no use and no related purpose yet, their importance is 0.3 · recency, under θ_demote from the first moment, so the first hygiene pass would demote them.)
     - `createdTurn` = the scope's turn counter.
 11. **Link.**
     - `derived-from` to the episode node of the same intent.
@@ -1256,6 +1268,8 @@ centrality(v) = log(1 + Σ_{active e ∋ v} w_e · κ(layer(src_e), layer(dst_e)
    - Otherwise inject the cards with P ≥ 0.6, at most 5 cards and 1,200 tokens.
    - Cards are rendered without an LLM (§6.4.5) and recorded as deliveries. `immediate` and `hint` memories get full cards; `caption` memories get one line each.
 
+**Without a decision model** (§9.1.4), the gate's emulated answer takes seconds. The kindle doesn't wait for it: the guidance goes out without cards, and the cards follow at the next commit point as their own guidance message (`[intent] Memory that may help with "…":`), if the intent is still open. Cards that became visible in the meantime, for example through a path delivery, are left out.
+
 This gate targets MemUse's finding that 71–99% of delivered entries were irrelevant. It is also why proactive cards are offered only at intent boundaries, when the agent can act on them.
 
 #### 6.4.2 `search` quick mode (default)
@@ -1267,7 +1281,8 @@ This gate targets MemUse's finding that 71–99% of delivered entries were irrel
 #### 6.4.3 Retrieval core
 
 1. **Candidate generation** per query and visible scope: semantic search with the active embedding model (§9.2.1), which is late interaction if set and dense otherwise, with a floor of 0.75 (SF, or its calibrated equivalent); plus BM25 (SQLite FTS5). The two are fused with reciprocal-rank fusion (Q; k = 60, ours).
-2. **Seeds:** the top 5 (SF).
+   - The BM25 query ORs the query's terms and drops stop words (unless nothing else is left), so a question phrased in full sentences still matches.
+2. **Seeds:** the top 5 (SF). A seed's starting activation is its fused score relative to the best seed's, scaled by its raw relevance relative to the best candidate's (semantic similarity or BM25 score, whichever ratio is higher). Reciprocal ranks alone are nearly flat (1/61, 1/62, …), so without the scaling a weak fifth seed would spread almost as much activation as a strong first one.
 3. **Spreading activation** (E): propagate from the seeds for up to 2 hops (SF), multiplying by w_e · κ_act and by a hop decay of 0.5 (ours). Cap at 15 nodes per query (SF).
 4. **Score:** activation × (0.2 + 0.8 · v(t)) × (0.5 + MW) × (1 − 0.5 · irrelevanceRate) × scopeWeight × pathBoost. Flooring strength at 0.2 ensures high-value or pinned memories that haven't been touched recently remain retrievable instead of vanishing behind fresh low-value notes.
    - scopeWeight is 1.0 for personal and shared, 0.8 for global (ours).
@@ -1578,7 +1593,7 @@ Model calls must use the harness's own model access and login (decided). So main
 
 | Kind | Where it runs | When | Work |
 |---|---|---|---|
-| **Model-free** | A detached Node process: `realctx2-worker --project <key>` | At session end; on `/realctx2 maintain` | Path reconciliation, forgetting pass, strength folding, shared flush, compaction, index rebuild, dropping turn-index rows and session logs whose session files are gone, embedding backlogs (the embedding endpoints are the user's own, not harness model access; §9.2.5) |
+| **Model-free** | A detached Node process: `realctx2-worker --project <key>` | At session end; on `/realctx2 maintain` | Path reconciliation, forgetting pass, strength folding, shared flush, compaction, index rebuild, dropping turn-index rows and session logs whose session files are gone (only for sessions that have ended or started over a day ago, since a harness writes a session file only once there is something to save), embedding backlogs (the embedding endpoints are the user's own, not harness model access; §9.2.5) |
 | **Model-dependent** | Inside the session process: the pi extension, or the Claude Code plugin's MCP server | After 2 idle minutes (pi: `agent_settled` plus a timer; Claude Code: the server's idle timer); on `/realctx2 maintain` | Idle harvest, re-verification (§6.8.6), re-slicing changed imported files (§6.9.1), the auto-memory import (§4.6.5), conflict re-checks, fusion, EvoDisco attempts with semantic checks and the teacher, policy update |
 
 - **Yielding to the user.** Model-dependent work runs in small steps and is aborted as soon as the user acts (pi `input`, Claude Code `UserPromptSubmit`). An aborted step is retried later.
@@ -1669,13 +1684,15 @@ interface PathAnchor {
 | `symbol` | A declaration inside a file | Best effort | Facts about one function or class |
 
 - Project scopes use all four kinds. The Global scope uses only `glob`, since it has no repository.
+- **The repository root** is the glob anchor `**`, not a `subtree` anchor: the root has no tree node of its own, and it never moves.
 - **Harvested memories get anchors automatically.** The repo paths in a memory's action signature become `file` anchors with role `about`, so anchor coverage grows from ordinary work.
 
 #### 6.8.2 Path registry
 
 Each project scope's document keeps a `LoroTree` (§7.3). It mirrors only the paths that anchors use, plus their ancestor directories.
 
-- **Tree node data:** `{ name, kind: "dir" | "file", status: "live" | "absent" | "deleted", blob?, fingerprint?, lastSeen: { commit?, at } }`.
+- **Tree node data:** `{ name, kind: "dir" | "file", status: "live" | "absent" | "deleted", blob?, fingerprint?, lastSeen: { commit?, at } }`. `lastSeen.commit` is the commit at which the path's content was last recorded, so it changes only when something about the path changes.
+- **Per checkout,** the commit at which reconciliation last ran is kept in the local index, not in the document (§7.6). It decides which paths are uncertain at the next session start. Keeping it out of the document means a session that finds nothing changed writes nothing, so pulling teammates' commits never makes a read-only session dirty the shared store.
 - **Anchors reference tree node IDs.** A rename or move is a single tree move, and every anchor on that node or below it follows. The display path is computed by walking up the tree.
 - **Normalization:** paths are repo-relative and POSIX-style. Symlinks resolve to their target inside the repo; targets outside the repo are not anchored.
 - **Separate trees per scope.** Shared and personal scopes keep their own trees, so personal paths (for example an ignored `.env.local`) never reach the shared store.
@@ -1694,9 +1711,9 @@ Reconciliation runs at `session_start` (checking only paths whose status is unce
 
 | Situation | Detected by | Action |
 |---|---|---|
-| Path exists, same content | `stat` + blob hash | Nothing |
+| Path exists, same content | `stat` + blob hash | Nothing, not even `lastSeen` |
 | Path exists, content changed | Blob hash differs | Update `blob`. `about` cards show "⚠ file changed since this note". |
-| Missing: renamed in a commit | `git diff -M --name-status <lastSeen.commit> HEAD` | Move the tree node |
+| Missing: renamed in a commit | `git diff -M --name-status <lastSeen.commit> HEAD`, and from the checkout's last reconciled commit | Move the tree node |
 | Missing: renamed, not yet committed | `git status --porcelain=v2 -M`. Otherwise an untracked file with the same blob hash, or ≥ 80% fingerprint similarity. | Move the tree node |
 | Directory mostly moved | ≥ 60% of its tracked children moved under one new parent | Move the directory node instead of each file |
 | Missing, no match found | — | Status `absent` |
@@ -1750,6 +1767,7 @@ packages/api/src/db/schema.ts
 - **Order and precedence.** Entries run from the root down to the file. A deeper rule that conflicts with a shallower one is marked as overriding it, using a `contradicts` edge found at ingest.
 - **No repeats.** A memory isn't delivered again while its earlier delivery is still visible in context. Once Precip or Palim has consolidated that delivery away, the next touch delivers it again.
 - **Budget** (§6.10.2): at most 600 tokens per tool result and 1,500 per turn. Overflow ends with "+N more: search(path: …)".
+- **Commit and test commands** (`git commit`, `pnpm test`, …) name no paths, but rules such as "run the linter before committing changes under `packages/api`" are anchored at paths. Such a command is matched as if it touched the paths edited in the current intent (at most 12), so path-anchored rules that trigger on it are delivered and can gate it.
 - **Compliance and escalation.** Precip's attribution request checks whether rules were followed, including rules that weren't shown. Repeated violations raise a memory's urgency (§6.10.4).
 - **Attribution.** Path deliveries are deliveries: they go into the ledger and are attributed like any other memory.
 
@@ -1866,7 +1884,7 @@ Imported lines keep the imported file as their source. **Imported files are neve
 
    Auto-memory notes (§4.6.5) go through the same pipeline but are stored differently: as unpinned SML nodes with `origin: "auto-memory"`, in the scope the decision model chose.
 
-   The scope's `sources` map keeps each file's hash and section-to-item mapping (§7.3), so re-ingesting a file that reappears can be matched against what is already there.
+   The scope's `sources` map keeps each file's hash and section-to-item mapping (§7.3), so re-ingesting a file that reappears can be matched against what is already there. A section whose hash matches is unchanged and isn't sliced again, even if the user retired some of its items since: retiring a rule is a decision about the rule, and re-ingesting the same text doesn't undo it.
 5. **Reconcile with existing memory.**
    - A learned memory that duplicates an item is merged into the item, keeping its provenance and use counters.
    - A learned memory that contradicts an item is flagged. The instruction wins in delivery until the user reviews it.
@@ -1885,7 +1903,7 @@ Imported lines keep the imported file as their source. **Imported files are neve
 Memory is now the source of truth for rules.
 
 - **`/realctx2 rules [path]`** lists the rules in force at a path, from the root down, with their source files.
-- **`/realctx2 rules edit <id>`** opens a rule in the editor: text, severity, urgency, anchors and triggers. An edit is an ordinary memory write, so it reaches teammates at the next flush.
+- **`/realctx2 rules edit <id>`** opens a rule in the editor: text, severity, urgency, anchors and triggers. The edit patches the rule in place: same ID, same use counters, the text verified as of now. It doesn't write a superseding memory, because a correction by the user is not a new fact about the world. It reaches teammates at the next flush. It needs an editor, so it is available in pi only (§4.6).
 - **Inside a session**, `remember` with `severity`, `urgency` and `paths` adds a rule, for example when the user states a new convention (§8.1).
 - **Lifecycle.** Ingested rules are pinned: they never decay and are never forgotten automatically. `forget` retires them like any other memory.
 
@@ -2054,6 +2072,7 @@ Rules that keep the document small and safe:
 
 - **Plain strings for text.** Text is stored as plain string values, not `LoroText`. Memory text is always replaced whole, so character-level history would only add size.
 - **Create child containers up front.** All of a node's child containers are created together with the node. Any child created later goes through `ensureMergeable*` (loro-crdt ≥ 1.13), so two peers creating it at once merge rather than one silently overwriting the other.
+- **Remove entries with a tombstone field.** An anchor or a `sources` entry is removed by setting `removed: true` on it, not by deleting its key, and writing it again clears the field. A concurrent field write then can't resurrect a half-filled entry. Readers skip removed entries. Only a purge deletes keys (§7.10).
 - **Fold strength events safely.** Only events older than a 14-day safety window are folded into `strength.base` and removed from `strength.events`, and replay only applies events with `t > base.t`. That keeps the map bounded while preventing concurrent folds on two machines from dropping recent events.
 - **Batch writes.** Counters, accesses and strength events are aggregated per session and written once, at shutdown.
 
@@ -2094,8 +2113,9 @@ Global and Project Personal stores use the same layout under `~/.pi/agent/realct
 - **One doc per process.** Each process holds the scope's `LoroDoc` in memory, with its own PeerID (§7.8).
 - **Commits.** Changes are committed with `doc.commit()` once per logical operation: one memory write, one operator, one ingest batch.
 - **Flush:** `doc.export({ mode: "update", from: lastFlushedVersion })` writes a new file in `updates/`.
-  - **When:** at session end; every 10 minutes during long sessions; before maintenance; and right after explicit user actions (remember, forget, ingest).
+  - **When:** at session end; every 10 minutes during long sessions (checked at each turn end, so an idle session doesn't flush on a timer); before maintenance; and right after explicit user actions (remember, forget, ingest).
   - **Shared scope:** pending changes are journaled locally in `pending-shared.loro` (so a crash loses nothing). At session end, **substantive** shared changes (new/edited/retired/merged nodes, path moves, operator outputs) flush automatically to `<repo>/.pi/realctx2/updates/`. **Counter-only deltas** from read-only sessions stay buffered in `pending-shared.loro` and piggyback onto the next substantive flush (or flush on `/realctx2 share`, `pre-commit`, or once buffered deltas exceed `shared.counterFlushThreshold`, default 50), so read-only sessions never dirty a clean git working tree. Flushes hold the per-scope lock, so two sessions never write at the same moment.
+  - **The journal records what it holds.** Next to `pending-shared.loro`, a small `pending-shared.loro.json` says whether the buffered changes are counter-only or substantive, and how many counter deltas there are. The next process to open the store, such as the session-end worker, then keeps counter-only deltas buffered. Without the note it would have to assume substantive changes and flush them into the repository.
 - **Seeing other writers.** Other processes pick up new update files on their next refresh: a directory check before retrieval, or a file watcher started in `session_start`.
 
 ### 7.6 Loading and the derived index
@@ -2135,7 +2155,7 @@ realctx2 then:
    - `head`: the current frontiers;
 2. deletes the old snapshots and the covered update files.
 
-**Why lagged.** Loro's docs say peers "can only sync if they have versions after the shallow snapshot point."
+**Why lagged.** Loro's docs say peers "can only sync if they have versions after the shallow snapshot point." In practice, importing an update whose dependencies predate the shallow root fails outright, so the root must be old enough for every update still in flight.
 
 - Keeping one epoch of history means a branch created after the previous compaction can still merge its updates.
 - If two branches compact at the same time, both snapshots share the same shallow root, so they import together. The next compaction merges them, and its `parents` lists both.
@@ -2195,9 +2215,9 @@ A branch that outlives two shared compactions can hold updates whose history has
 
 ### 7.10 Explicit forgetting
 
-A purge (§6.5.6) takes the memory out of retrieval at once. On the **shared scope**, purge is available only via explicit user `/realctx2 forget --purge` (agent `forget` retires instead), because a non-lagged snapshot affects teammates. Removing the text from store files waits for the session-end flush, so the purge can still be undone within the session. At the flush:
+A purge (§6.5.6) takes the memory out of retrieval at once. On the **shared scope**, purge is available only via explicit user `/realctx2 forget --purge` (agent `forget` retires instead), because a non-lagged snapshot affects teammates. Removing the text from store files waits for the session-end flush, so the purge can still be undone within the session. Flushes during the session (the periodic flush, `/realctx2 maintain`) write everything else and keep the purge pending. At the session-end flush:
 
-1. The node's key, its edges and dependent derived nodes are deleted (§6.5.6).
+1. The node's key, its edges and dependent derived nodes are deleted (§6.5.6). The node's child containers (anchors, evidence, counters, strength) are emptied first: Loro keeps a child container's state after its parent key is deleted, so later shallow snapshots would otherwise still hold the text.
 2. Loro's redaction is applied to the content of the purged operations.
 3. A **non-lagged** shallow snapshot is taken at the current head, so the text disappears from current files.
 
@@ -2296,11 +2316,11 @@ Every ID the agent sees is 8 base36 characters after a one-letter type (decided)
 
 pi lets a tool registered later replace an earlier one with the same name; that is how extensions override built-in tools. A name clash would therefore silently remove someone's tool. pi already has a built-in `find`, which is why the search tool is called `search`.
 
-- **At registration.** Before registering each tool, realctx2 checks `pi.getAllTools()`, which reports each tool's source. If a built-in or another extension already uses the name, realctx2 skips its own tool and reports an error naming both sources.
-- **At `session_start`.** After every extension has loaded, realctx2 checks again. If one of its names now belongs to another source, a later extension replaced its tool, and realctx2 reports that too.
+- **At registration, in `session_start`.** `pi.getAllTools()` can't be called while extensions load, so realctx2 registers its tools in `session_start` (§4.1). Before registering each tool, it checks `pi.getAllTools()`, which reports each tool's source. If a built-in or another extension already uses the name, realctx2 skips its own tool and reports an error naming both sources.
+- **At the first `before_agent_start`.** By then every extension has registered its tools, and realctx2 checks again. If one of its names now belongs to another source, a later extension replaced its tool, and realctx2 reports that too.
 - **Reporting** goes to `ctx.ui.notify(…, "error")`, the status line and `doctor`.
 - **Renaming.** `tools.names` in the configuration renames any of the five tools, for example `{ "search": "memsearch" }`. The system-prompt section and the tool descriptions use the effective names.
-- **Claude Code** prefixes plugin tools (`mcp__realctx2__search`), so they can't clash with built-in tools or with other servers' tools.
+- **Claude Code** prefixes plugin tools (`mcp__plugin_realctx2_realctx2__search`), so they can't clash with built-in tools or with other servers' tools.
 
 ### 8.2 System-prompt section
 
@@ -2330,7 +2350,7 @@ This section is installed once per session through `systemPromptOptions.sections
 - **"Project rules."** When instruction files are ingested, a second section carries the always-on rules (§6.9.5).
 - **The gate line** is left out when `urgency.gate` is `"off"` (§6.10.3).
 - **Tool names** follow `tools.names` (§8.1.3).
-- **Claude Code.** The same text goes out as `additionalContext` at `SessionStart` (§4.6.2), with the `mcp__realctx2__` names.
+- **Claude Code.** The same text goes out as `additionalContext` at `SessionStart` (§4.6.2), with the `mcp__plugin_realctx2_realctx2__` names.
 
 ---
 
@@ -2399,6 +2419,8 @@ realctx2 talks to decision models over custom HTTP adapters in both harnesses, s
   - shared routing 0.95;
   - proactive gate 0.7;
   - attribution uses deterministic signals only.
+- **Emulated answers are slow.** An LLM call takes seconds where a decision model takes milliseconds, so the call site's timeout (1.5 s for Janus and the proactive gate) would almost always expire. An emulated decision gets at least `providers.aux.emulateTimeoutMs` (default 20,000; 0 keeps the call site's timeout), and no commit point waits for it: Janus's answer and the proactive gate's cards apply at the next commit point (§5.2.1, §6.4.1).
+- **Thinking is off** for `decision.emulate` (§9.3.4). With a small model, thinking `low` took 5–10 s per answer, and thinking off 1.5–2.3 s.
 
 #### 9.1.5 Reliability
 
@@ -2521,7 +2543,7 @@ Aux roles are split by whether they need repository access:
   - **Claude Code:** the child runs with `--tools` restricted to read-only tools (`Read`, `Grep`, `Glob`, plus realctx2's read-only MCP tools), under the user's permission settings with unanswered prompts denied (§4.6.4).
 - **The instruction.** Every tool-using aux prompt starts with: "You are a read-only helper process for realctx2. Use your tools to look things up as needed. Do not attempt to modify files, git state, packages, databases or outside services."
 - **realctx2's own tools.** Tool-using aux sessions get `search` (quick mode only), `recall` and `inspect`. Their calls are not deliveries: they skip the ledger and the retrieval counters.
-- **Guard when `bash` is opted in (pi).** If a user enables `bash` for a specific role, every `bash` call is checked against the pre-edit gate for `immediate` memories (§6.10.3), the deny list (`aux.guard.deny`), and writes outside the repository (§6.8.3). Blocked calls return an error to the aux session, are logged, and appear in `status`. Optionally, `aux.pi.extensions` names extensions to load into aux sessions through pi's SDK.
+- **Guard when `bash` is opted in (pi).** If a user enables `bash` for a specific role, every `bash` call is checked against the pre-edit gate for `immediate` memories (§6.10.3), the deny list (`aux.guard.deny`), and writes outside the repository (§6.8.3). Blocked calls return an error to the aux session, are logged, and appear in `status`.
 - **Untrusted input as data.** Text from transcripts, shared memories and files goes into aux prompts inside clearly marked data blocks, with the instruction that nothing inside them is a request to act.
 - **No recursion** (decided):
   - `remember`, `forget` and thorough `search` are withheld, because each can start aux work of its own: write-path merges, re-abstraction after a purge, and the QEMem planner and constructor.
@@ -2558,7 +2580,7 @@ Each role has its own thinking level, using pi's levels: `off`, `minimal`, `low`
 | `evo.operator` | Abstract / Refine / Bridge | read-only | Nodes or relation | Medium | medium | 6 | 120 s |
 | `ingest.slicer` | Per instruction file or group of sections | read-only | Items JSON with quotes, anchors, severity and triggers | Strong | high | 12 | 300 s |
 | `reverify` | Per changed file whose memories need more than the model-free check (§6.8.6) | read-only | Verdict JSON per memory | Medium | medium | 10 | 180 s |
-| `decision.emulate` | Only without a decision model (§9.1.4) | none | Probabilities JSON | Small | low | 1 | The call site's timeout |
+| `decision.emulate` | Only without a decision model (§9.1.4) | none | Probabilities JSON | Small | off | 1 | The call site's timeout, at least `emulateTimeoutMs` (20 s) |
 
 - Every value is adjustable per role and per harness (`providers.aux.<harness>.roles.<role>`, §9.4).
 - `janus.scribe` and Palim under pressure hold up the next model request, so their limits are tight.
@@ -2583,13 +2605,14 @@ The global configuration lives in `~/.pi/agent/realctx2/config.json`. Model ids 
     "aux": {
       "maxConcurrent": 2,
       "defaultTools": "read-only",
+      "emulateTimeoutMs": 20000,
       "guard": {
         "deny": ["rm -r*", "rm -fr*", "git reset --hard*", "git clean*", "git push*", "npm publish*",
                  "*curl * | *sh*", "*wget * | *sh*", "scp *", "rsync * *:*", "curl * -T *", "curl * --upload-file *"],
         "writesOutsideRepo": "block"
       },
       "pi": {
-        "model": "<provider>/<model-id>", "thinking": "medium", "extensions": [],
+        "model": "<provider>/<model-id>", "thinking": "medium",
         "roles": {
           "janus.scribe":  { "thinking": "off", "maxTurns": 1, "timeoutMs": 15000 },
           "precip":        { "model": "<provider>/<model-id>", "tools": "none", "maxTurns": 1 },
@@ -2888,7 +2911,7 @@ Replay recorded pi sessions, with tool results played back from logs, with realc
 
 ### 14.1 Decided (2026-11-20)
 
-Rows 1–12 answer the v0.2 questions (row 11 was merged into row 10), rows 13–16 the v0.3 questions, rows 17–25 settle the v0.4 requirements, rows 26–34 come from the v0.5 review, and rows 35–42 come from the v0.6 review.
+Rows 1–12 answer the v0.2 questions (row 11 was merged into row 10), rows 13–16 the v0.3 questions, rows 17–25 settle the v0.4 requirements, rows 26–34 come from the v0.5 review, rows 35–42 come from the v0.6 review, and rows 43–44 come from the first implementation (v0.7).
 
 | # | Question | Decision | Where |
 |---|---|---|---|
@@ -2933,6 +2956,8 @@ Rows 1–12 answer the v0.2 questions (row 11 was merged into row 10), rows 13�
 | 40 | Lifecycle & rule-scoring fixes | Floor retrieval strength at `0.2 + 0.8·v(t)`, protect high-MW nodes from LML demotion, explicit no-decay for pinned nodes, count rule compliance so preventive rules aren't penalized as dead weight, protect Global from narrower-scope mutations | §6.3.2, §6.4.3, §6.5, §6.7 |
 | 41 | Calibration & FDE indexing | Inverse-probability weighting (`1 / belowSample`) on threshold refits; compact 512-dim int8 MUVERA FDEs with `index.maxBytes` eviction | §9.2.2–9.2.4 |
 | 42 | EvoDisco v1 default & rule trust | Ship `evolution.policy: "teacher"` by default (MLP opt-in, with centered `E − Ē` and randomized A/B graduation); drop historical git-blob check for "Project rules" so shallow clones and rule edits work, and auto-sync Claude Code `claudeMdExcludes` on `SessionStart` | §4.6.2, §6.6.6, §7.12 |
+| 43 | Initial layer of an unpinned `remember` | SML (v₀ = 0.8); promoted to LML by the rules of §6.5.2. Pinned memories still start in LML. | §6.3 |
+| 44 | Thinking for `decision.emulate` | Off by default; adjustable per role | §9.1.4, §9.3.4 |
 
 ### 14.2 Still open
 
@@ -2974,6 +2999,17 @@ There are no open questions for the user. Two known gaps remain:
 ## Appendix A. Change log
 
 The notes for v0.3 and v0.2 use the tool names of their time.
+
+**Changes in v0.6** (from a v0.5 design review)
+
+- **Aligned with pi 1.5.2.** `systemPromptOptions` is applied on every `before_agent_start` with cached strings (§4.2); `session_before_compact` returns a realctx2 compaction instead of cancelling overflow recovery (§5.4.5); nested tool calls (`parentToolCallId`) and `structuredContent` are handled cleanly (§4.2); the custom decision HTTP endpoint is also registered via `pi.registerProvider()` (`type: "classifier"`) so `codemode` scripts and other extensions can call it (§9.1.2).
+- **No hot-loop aux stalls.** Transcript-only aux roles (`janus.scribe`, `precip`, `palim`, `qemem.planner`, `write.merge`, `decision.emulate`) run as single-turn, tool-free calls; Precip and Palim generation decouples from synchronous intent state transitions (§3.3, §4.4, §9.3).
+- **Read-only aux sessions.** Tool-using aux roles get read-only tools only (`read`, `grep`, `find`, `ls`, plus realctx2's read tools), with no `edit`/`write` and `bash` opt-in per role (§9.3.2).
+- **Complete Palim cost check.** Pre-fold estimation includes aux generation cost `C_fold`, and cold-cache deferred folds apply via `context` on the cold request before persisting at `turn_end` (§5.4.2).
+- **CRDT and git-hygiene fixes.** `anchors`, `evidence` and `strength.events` move to keyed `LoroMap`s; violation counters are monotonic per urgency level rather than reset (§6.10.4, §7.3); read-only counter deltas stay in `pending-shared.loro` instead of dirtying a clean git working tree (§7.5); shared `purge` is restricted to explicit user `/realctx2 forget --purge` (§6.5.6, §7.10).
+- **Lifecycle, scoring and calibration fixes.** Floored retrieval strength (`0.2 + 0.8·v(t)`), high-MW demotion protection, explicit no-decay for pinned nodes, compliance credit for preventive rules, cross-scope mutation guard for Global, inverse-probability weighting in calibration refits, and MUVERA FDE sizing/eviction (§6.3–6.7, §9.2).
+- **Pragmatic EvoDisco rollout.** v1 ships with the decision-model teacher and semantic check by default while logging `(s, a, U)`; the MLP policy is opt-in, with centered rewards and unbiased randomized A/B graduation (§6.6).
+- **Simpler rule trust and Claude Code sync.** "Project rules" trust relies on `ctx.isProjectTrusted()` + `origin === "instructions"` rather than historical git blobs (which broke shallow clones and rule edits, §7.12), and Claude Code auto-syncs `claudeMdExcludes` on `SessionStart` (§4.6.2).
 
 **Changes in v0.5** (from a design review)
 

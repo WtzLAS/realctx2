@@ -1,7 +1,7 @@
 # realctx2
 
 Context and memory management for agent harnesses, implemented from
-[`docs/realctx2-design.md`](docs/realctx2-design.md) (v0.6).
+[`docs/realctx2-design.md`](docs/realctx2-design.md) (v0.7).
 
 - **Context engine**: tracks what the agent is working on (Janus), replaces finished work with a
   first-person memory (Precip), folds stable prefixes and relieves window pressure (Palim), and
@@ -119,106 +119,6 @@ that, these were run by hand against the installed CLIs, with a small model:
 Not exercised against a real harness: Precip and Palim replacing context in a long live session,
 Claude Code's compaction hand-off, a real decision endpoint, real embedding endpoints, Git LFS,
 and Windows.
-
-## Where this differs from the design document
-
-Things the document leaves open, and places where the harnesses or a real run forced a
-different choice.
-
-**Decisions without a decision model (§9.1.4).** The document gives an emulated decision the
-call site's timeout, which is 1.5 s for Janus and the proactive gate, and runs it with thinking
-`low` (§9.3.4). With a small model that call took 5 to 10 s, so every emulated Janus answer
-timed out. Now:
-
-- `decision.emulate` runs with thinking off by default. The same call then took 1.5 to 2.3 s.
-  `providers.aux.<harness>.roles["decision.emulate"].thinking` changes it.
-- `providers.aux.emulateTimeoutMs` (default 20 s) is the floor for an emulated decision. `0`
-  restores the call site's timeout.
-- No commit point waits for an emulated answer. Janus at a user message and at settle, and the
-  proactive gate at a kindle, wait `janus.lateWaitMs` and then let the answer apply at the next
-  commit point. Late proactive cards arrive as their own guidance message.
-- One Janus request is in flight at a time, and a plan made before another intent was kindled
-  cannot kindle again.
-- The cost: with emulation an intent's guidance lands a round after the work began, so that
-  round stays in the enclosing region and Precip covers less.
-
-**Context engine**
-
-- Precip may replace a closed region inside the working tail; only the latest round is excluded.
-  The working-tail invariant is enforced for Palim.
-- The innermost climb level counts as stable once its intent has been open for `stableRounds`
-  rounds. A closure resets the climb clock.
-- The fold cost check prices the fold with the aux model's rates and falls back to the main
-  model's.
-- A commit or test command is enriched with the paths edited in the current intent, so rules
-  that trigger on commit can match by path.
-- Turns are also indexed at shutdown, so a session that ends before its last round completes is
-  searchable.
-
-**Memory**
-
-- An unpinned `remember` starts in the short-term layer, at v₀ = 0.8, and is promoted by the
-  rules of §6.5.2. §6.3 puts it in the long-term layer, where it would be demoted by the first
-  hygiene pass: with no use and no related purpose its importance is 0.3 × recency, which is
-  under the demotion threshold of 0.3 from the first moment. Pinned memories, which is
-  everything `/realctx2 remember` writes, still start long-term at full strength.
-- Seed activation in retrieval is the fused rank score scaled by relative raw relevance;
-  reciprocal ranks alone are nearly flat.
-- Stop words are dropped from full-text queries. Without embeddings, conflict candidates need a
-  trigram Jaccard of at least 0.2.
-- The repository root is the glob anchor `**`.
-- Re-ingest treats a section as unchanged when its hash matches, even if the user retired its
-  items since.
-- `rules edit` patches the rule in place instead of writing a superseding memory.
-- Path reconciliation keeps "the commit this checkout was last reconciled at" in the local
-  index, not in the document. A path whose content is unchanged is not written at all, so a
-  session that only reads never dirties the shared store after a pull. `lastSeen.commit` is the
-  commit at which the content was last recorded.
-
-**Storage**
-
-- Compaction uses the previous compaction head as the shallow root, because Loro cannot import
-  an update whose dependencies predate the root.
-- Anchors and sources are removed with a tombstone field rather than a key delete, so a
-  concurrent write cannot resurrect a half-filled entry. A purge empties child containers before
-  deleting the node.
-- The shared journal (`pending-shared.loro`) has a small note next to it saying whether it holds
-  counter-only or substantive changes. Without it, the next process to open the store (the
-  session-end worker, for one) had to assume the worst and flushed counters into the repository.
-- Purges are held until the session-end flush, so they can be undone within the session.
-- The periodic flush is checked at turn ends, not on a timer.
-- The worker drops the index rows of a session whose file is gone only once that session has
-  ended or is a day old; a running session's file may not exist yet.
-
-**pi adapter**
-
-- Tools are registered at `session_start` and re-checked at the first `before_agent_start`,
-  because pi's tool list cannot be read while the extension loads.
-- pi allows `context_edit` on user, assistant, tool-result and custom messages only. Compaction
-  summaries and `!` shell runs are left in place by folds.
-- `before_agent_start` has no boundary to return entries from, so its records ride in the
-  guidance message's `details`.
-- The compaction record is written at `session_compact`, anchored at pi's compaction entry.
-- `providers.aux.pi.extensions` is not implemented: aux sessions load no other extensions.
-- Tool parameters are plain JSON Schema; `typebox` is not used.
-
-**Claude Code adapter**
-
-- Plugin tools are named `mcp__plugin_realctx2_realctx2__<tool>`, not `mcp__realctx2__<tool>`.
-- One skill per command (`/realctx2:<command>`), generated from the command table, instead of a
-  single skill.
-- Claude Code caps a hook's `additionalContext` at 10,000 characters, so the state injected
-  after a compaction is split across four `SessionStart` handlers.
-- Commands have no dialogs: confirmations take `--yes`, and `rules edit` needs pi.
-- The oversize guard rewrites Bash and plain-string tool outputs only.
-- A project is treated as trusted unless `REALCTX2_UNTRUSTED=1`, since Claude Code asks for
-  folder trust itself.
-- The hook socket's registry is under `~/.pi/agent/realctx2/claude-code/run/`.
-
-**Packaging**
-
-- `prepare` builds only when TypeScript is installed, so an install without dev dependencies
-  does not fail. Such an install needs a `dist/` that was built beforehand.
 
 ## Environment variables
 

@@ -37,5 +37,5 @@ Claude Code's context is append-only for plugins. realctx2 consolidates in the b
 its result takes effect when Claude Code compacts; until then the original turns stay in the
 window. Commands cannot open dialogs here, so confirmations take `--yes`.
 
-Configuration, stores and the full list of differences from the design are in the package's
-main README.
+Configuration and stores are described in the package's main README, and the design in
+`docs/realctx2-design.md`.
