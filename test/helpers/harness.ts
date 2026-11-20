@@ -33,6 +33,7 @@ export class FakeHarness implements HarnessAdapter {
   contextWindow = 200_000;
   systemTokens = 3000;
   price: ModelPricing | null = { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 };
+  lastCacheWriteAt?: () => number | null;
   readonly auxRunner: AuxSessionRunner;
   private seq = 0;
   private t = Date.parse("2026-11-20T10:00:00.000Z");

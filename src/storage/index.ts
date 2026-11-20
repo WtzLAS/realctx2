@@ -6,10 +6,10 @@
 import type { MemoryNode } from "../core/types.ts";
 import { sha256 } from "../util/text.ts";
 import type { ScopeDoc } from "./schema.ts";
-import { type Db, ftsQuery, openDb } from "./sqlite.ts";
+import { type Db, ftsQuery, indexTokens, openDb } from "./sqlite.ts";
 import { type Scored, VectorTables } from "./vectors.ts";
 
-const INDEX_SCHEMA = 3;
+const INDEX_SCHEMA = 4;
 
 /** Text that gets embedded for a memory node: title + text + first quote (§9.2.2). */
 export function embedText(n: MemoryNode): string {
@@ -111,7 +111,7 @@ export class MemoryIndex {
           this.db.prepare("UPDATE nodes SET rowhash = ?, status = ?, layer = ?, kind = ?, content_hash = ?, embed_hash = ? WHERE rid = ?").run(hash, n.status, n.layer, n.kind, n.contentHash, embedHash(n), rid);
           this.db.prepare("DELETE FROM nodes_fts WHERE rowid = ?").run(rid);
         }
-        this.db.prepare("INSERT INTO nodes_fts (rowid, title, text, signature, paths) VALUES (?, ?, ?, ?, ?)").run(rid, n.title, n.text, n.signature.join(" "), paths);
+        this.db.prepare("INSERT INTO nodes_fts (rowid, title, text, signature, paths) VALUES (?, ?, ?, ?, ?)").run(rid, indexTokens(n.title), indexTokens(n.text), indexTokens(n.signature.join(" ")), indexTokens(paths));
         // dormant nodes keep FTS only
         if (n.status !== "active") this.vectors.delete(n.id);
         upserted++;

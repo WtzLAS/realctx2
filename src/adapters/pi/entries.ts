@@ -7,9 +7,10 @@ import type { ContextEditEntry, ProjectedSessionEntry, SessionEntry, SessionMana
 import { GUIDANCE_TYPE } from "../../context/render.ts";
 import type { ContextEdit, EntryView, SessionRecord, ToolCallView } from "../../core/types.ts";
 import { RECORD_TYPES } from "../../core/types.ts";
+import { GENERIC_IMAGE_COST, type ImageCost, imageCostFor, type ImageModel, imageTokens } from "../../util/images.ts";
 import { estimateTokens } from "../../util/text.ts";
 
-type Part = { type: string; text?: string; thinking?: string; id?: string; name?: string; arguments?: unknown };
+type Part = { type: string; text?: string; thinking?: string; id?: string; name?: string; arguments?: unknown; data?: unknown };
 
 function partsText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -22,8 +23,8 @@ function partsText(content: unknown): string {
   return out.join("\n");
 }
 
-/** Everything in a message that costs context tokens: text, thinking and tool-call arguments. */
-function partsTokens(content: unknown): number {
+/** Everything in a message that costs context tokens: text, thinking, tool-call arguments and images. */
+function partsTokens(content: unknown, imgCost: ImageCost): number {
   if (typeof content === "string") return estimateTokens(content);
   if (!Array.isArray(content)) return 0;
   let n = 0;
@@ -31,7 +32,7 @@ function partsTokens(content: unknown): number {
     if (p?.type === "text" && typeof p.text === "string") n += estimateTokens(p.text);
     else if (p?.type === "thinking" && typeof p.thinking === "string") n += estimateTokens(p.thinking);
     else if (p?.type === "toolCall") n += estimateTokens(`${p.name ?? ""}${JSON.stringify(p.arguments ?? {})}`) + 8;
-    else if (p?.type === "image") n += 1200;
+    else if (p?.type === "image") n += imageTokens(p, imgCost);
   }
   return n;
 }
@@ -57,17 +58,17 @@ interface Shape {
 
 const COMPACTION_PREFIX = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 
-function messageShape(m: AgentMessage): Shape | null {
+function messageShape(m: AgentMessage, imgCost: ImageCost): Shape | null {
   const msg = m as { role: string; content?: unknown; [k: string]: unknown };
   switch (msg.role) {
     case "user":
-      return { kind: "user", role: "user", text: partsText(msg.content), tokens: partsTokens(msg.content) };
+      return { kind: "user", role: "user", text: partsText(msg.content), tokens: partsTokens(msg.content, imgCost) };
     case "assistant":
-      return { kind: "assistant", role: "assistant", text: partsText(msg.content), tokens: partsTokens(msg.content), toolCalls: toolCalls(msg.content) };
+      return { kind: "assistant", role: "assistant", text: partsText(msg.content), tokens: partsTokens(msg.content, imgCost), toolCalls: toolCalls(msg.content) };
     case "toolResult":
-      return { kind: "toolResult", role: "tool", text: partsText(msg.content), tokens: partsTokens(msg.content), toolCallId: String(msg.toolCallId ?? ""), toolName: typeof msg.toolName === "string" ? msg.toolName : undefined, isError: msg.isError === true };
+      return { kind: "toolResult", role: "tool", text: partsText(msg.content), tokens: partsTokens(msg.content, imgCost), toolCallId: String(msg.toolCallId ?? ""), toolName: typeof msg.toolName === "string" ? msg.toolName : undefined, isError: msg.isError === true };
     case "custom":
-      return { kind: "custom_message", role: "user", text: partsText(msg.content), tokens: partsTokens(msg.content), customType: typeof msg.customType === "string" ? msg.customType : undefined, details: msg.details };
+      return { kind: "custom_message", role: "user", text: partsText(msg.content), tokens: partsTokens(msg.content, imgCost), customType: typeof msg.customType === "string" ? msg.customType : undefined, details: msg.details };
     case "bashExecution": {
       if (msg.excludeFromContext === true) return null;
       const text = `Ran \`${String(msg.command ?? "")}\`\n${String(msg.output ?? "")}`;
@@ -87,12 +88,12 @@ function messageShape(m: AgentMessage): Shape | null {
 }
 
 /** The raw contribution of a session entry, before any context edit. Null for state-only entries. */
-export function rawShape(entry: SessionEntry): Shape | null {
+export function rawShape(entry: SessionEntry, imgCost: ImageCost = GENERIC_IMAGE_COST): Shape | null {
   switch (entry.type) {
     case "message":
-      return messageShape(entry.message);
+      return messageShape(entry.message, imgCost);
     case "custom_message":
-      return { kind: "custom_message", role: "user", text: partsText(entry.content), tokens: partsTokens(entry.content), customType: entry.customType, details: entry.details };
+      return { kind: "custom_message", role: "user", text: partsText(entry.content), tokens: partsTokens(entry.content, imgCost), customType: entry.customType, details: entry.details };
     case "compaction":
       return { kind: "summary", role: "user", text: entry.summary, tokens: estimateTokens(entry.summary) + 30 };
     case "branch_summary":
@@ -108,7 +109,7 @@ function latestEdits(branch: SessionEntry[]): Map<string, ContextEditEntry> {
   return edits;
 }
 
-function view(entry: SessionEntry, raw: Shape, projected: AgentMessage[] | null, edit: ContextEditEntry | undefined): EntryView {
+function view(entry: SessionEntry, raw: Shape, projected: AgentMessage[] | null, edit: ContextEditEntry | undefined, imgCost: ImageCost): EntryView {
   const omitted = projected !== null ? projected.length === 0 : edit?.replacement === null;
   const edited = !omitted && !!edit && edit.replacement !== null;
   let text = raw.text;
@@ -119,7 +120,7 @@ function view(entry: SessionEntry, raw: Shape, projected: AgentMessage[] | null,
     tokens = 0;
     calls = undefined;
   } else if (projected && (edited || projected.length !== 1)) {
-    const shapes = projected.map(messageShape).filter((s): s is Shape => s !== null);
+    const shapes = projected.map((m) => messageShape(m, imgCost)).filter((s): s is Shape => s !== null);
     text = shapes.map((s) => s.text).join("\n");
     tokens = shapes.reduce((n, s) => n + s.tokens, 0);
     calls = shapes.flatMap((s) => s.toolCalls ?? []);
@@ -127,7 +128,7 @@ function view(entry: SessionEntry, raw: Shape, projected: AgentMessage[] | null,
   } else if (edited && edit?.replacement) {
     // no projection at hand (archive view): read the replacement itself
     text = partsText(edit.replacement.content);
-    tokens = partsTokens(edit.replacement.content);
+    tokens = partsTokens(edit.replacement.content, imgCost);
     calls = toolCalls(edit.replacement.content);
   }
   return {
@@ -154,25 +155,27 @@ function view(entry: SessionEntry, raw: Shape, projected: AgentMessage[] | null,
 }
 
 /** The active branch as the model sees it: compaction applied, context edits applied. */
-export function projectedEntries(sm: Pick<SessionManager, "buildSessionProjection" | "getBranch">): EntryView[] {
+export function projectedEntries(sm: Pick<SessionManager, "buildSessionProjection" | "getBranch">, model?: ImageModel): EntryView[] {
+  const imgCost = model ? imageCostFor(model) : GENERIC_IMAGE_COST;
   const projection = sm.buildSessionProjection();
   const edits = latestEdits(sm.getBranch());
   const out: EntryView[] = [];
   for (const p of projection.entries as ProjectedSessionEntry[]) {
-    const raw = rawShape(p.sourceEntry);
+    const raw = rawShape(p.sourceEntry, imgCost);
     if (!raw) continue;
-    out.push(view(p.sourceEntry, raw, p.messages, edits.get(p.sourceEntry.id)));
+    out.push(view(p.sourceEntry, raw, p.messages, edits.get(p.sourceEntry.id), imgCost));
   }
   return out;
 }
 
 /** Every context-producing entry of the branch, raw: what `recall` opens, compactions included. */
-export function archiveEntries(branch: SessionEntry[]): EntryView[] {
+export function archiveEntries(branch: SessionEntry[], model?: ImageModel): EntryView[] {
+  const imgCost = model ? imageCostFor(model) : GENERIC_IMAGE_COST;
   const edits = latestEdits(branch);
   const out: EntryView[] = [];
   for (const e of branch) {
-    const raw = rawShape(e);
-    if (raw) out.push(view(e, raw, null, edits.get(e.id)));
+    const raw = rawShape(e, imgCost);
+    if (raw) out.push(view(e, raw, null, edits.get(e.id), imgCost));
   }
   return out;
 }

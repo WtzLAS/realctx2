@@ -4,10 +4,10 @@
  */
 import { stableId8 } from "../util/ids.ts";
 import { estimateTokens, sha256 } from "../util/text.ts";
-import { type Db, ftsQuery, openDb } from "./sqlite.ts";
+import { type Db, ftsQuery, indexTokens, openDb } from "./sqlite.ts";
 import { type Scored, VectorTables } from "./vectors.ts";
 
-const TURN_SCHEMA = 2;
+const TURN_SCHEMA = 3;
 export const CHUNK_TOKENS = 512;
 
 export interface TurnRow {
@@ -171,12 +171,12 @@ export class TurnIndex {
       const rid = Number(cur.rid);
       this.db.prepare("UPDATE turns SET session = ?, harness = ?, entry = ?, chunk = ?, kind = ?, at = ?, text = ?, content_hash = ?, role = ?, tool = ?, seq = ?, tokens = ? WHERE rid = ?").run(row.session, row.harness, row.entry, row.chunk, row.kind, row.at, row.text, hash, row.role, row.tool, row.seq, tokens, rid);
       this.db.prepare("DELETE FROM turns_fts WHERE rowid = ?").run(rid);
-      this.db.prepare("INSERT INTO turns_fts (rowid, text) VALUES (?, ?)").run(rid, row.text);
+      this.db.prepare("INSERT INTO turns_fts (rowid, text) VALUES (?, ?)").run(rid, indexTokens(row.text));
       this.vectors.delete(row.id);
     } else {
       this.db.prepare("INSERT INTO turns (id, session, harness, entry, chunk, kind, at, text, content_hash, role, tool, seq, tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(row.id, row.session, row.harness, row.entry, row.chunk, row.kind, row.at, row.text, hash, row.role, row.tool, row.seq, tokens);
       const rid = Number(this.db.prepare("SELECT rid FROM turns WHERE id = ?").get(row.id)!.rid);
-      this.db.prepare("INSERT INTO turns_fts (rowid, text) VALUES (?, ?)").run(rid, row.text);
+      this.db.prepare("INSERT INTO turns_fts (rowid, text) VALUES (?, ?)").run(rid, indexTokens(row.text));
     }
     return true;
   }

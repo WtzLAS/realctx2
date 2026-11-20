@@ -147,7 +147,7 @@ const PATH_EXT =
 const RE_BACKTICK = /`([^`\n]{2,120})`/g;
 const RE_URL = /\bhttps?:\/\/[^\s)'"<>]+/g;
 const RE_PATH = new RegExp(
-  `(?<![\\w@])(?:\\.{0,2}\\/)?(?:[\\w.@+-]+\\/)+[\\w.@+-]*[\\w@+-]|(?<![\\w/.-])[\\w.-]+\\.(?:${PATH_EXT})\\b`,
+  `(?<![\\w@])(?:\\.{0,2}\\/)?(?:[\\w.@+[\\]-]+\\/)+[\\w.@+[\\]-]*[\\w@+\\]-]|(?<![\\w/.-])[\\w.[\\]-]+\\.(?:${PATH_EXT})\\b`,
   "g",
 );
 const RE_IDENT =
@@ -155,11 +155,27 @@ const RE_IDENT =
 const RE_VALUE = /\b\d+(?:\.\d+)?\s?(?:ms|s|sec|secs|min|mins|h|hrs?|days?|kb|mb|gb|tb|kib|mib|gib|%|px|rpm|qps|tokens?)\b/gi;
 const RE_IDS = /#\d{1,7}\b|\b[0-9a-f]{7,40}\b|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\b(?:port|pid|issue|pr)\s+#?(\d{2,6})\b/gi;
 
+/** Strip trailing punctuation and unbalanced closing brackets without damaging bracketed path segments like `[id]`. */
+function trimTrailingPunct(s: string): string {
+  let out = s.trim().replace(/[.,;:)]+$/, "");
+  while (out.endsWith("]")) {
+    let open = 0;
+    let close = 0;
+    for (const ch of out) {
+      if (ch === "[") open++;
+      else if (ch === "]") close++;
+    }
+    if (close <= open) break;
+    out = out.slice(0, -1).replace(/[.,;:)]+$/, "");
+  }
+  return out;
+}
+
 /** True when a token looks like a repo-relative or absolute file path. */
 export function looksLikePath(token: string): boolean {
   if (/^https?:\/\//.test(token)) return false;
-  if (token.includes("/") && /^[\w.@+~/-]+$/.test(token) && !/^\/+$/.test(token)) return true;
-  return new RegExp(`^[\\w.-]+\\.(?:${PATH_EXT})$`).test(token);
+  if (token.includes("/") && /^[\w.@+~[\]/-]+$/.test(token) && !/^\/+$/.test(token)) return true;
+  return new RegExp(`^[\\w.[\\]-]+\\.(?:${PATH_EXT})$`).test(token);
 }
 
 /**
@@ -170,7 +186,7 @@ export function extractSignature(text: string, extra: string[] = [], cap = 32): 
   const out: string[] = [];
   const seen = new Set<string>();
   const add = (s: string) => {
-    const t = s.trim().replace(/[.,;:)\]]+$/, "");
+    const t = trimTrailingPunct(s);
     if (t.length < 2 || t.length > 160) return;
     const key = t.toLowerCase();
     if (seen.has(key)) return;
@@ -198,7 +214,10 @@ export function extractPathTokens(text: string): string[] {
   const out = new Set<string>();
   const noUrls = text.replace(RE_URL, " ");
   for (const m of noUrls.matchAll(RE_BACKTICK)) if (looksLikePath(m[1]!)) out.add(m[1]!);
-  for (const m of noUrls.matchAll(RE_PATH)) out.add(m[0].replace(/[.,;:)\]]+$/, ""));
+  for (const m of noUrls.matchAll(RE_PATH)) {
+    const t = trimTrailingPunct(m[0]);
+    if (t) out.add(t);
+  }
   return [...out];
 }
 

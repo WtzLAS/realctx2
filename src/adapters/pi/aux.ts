@@ -20,6 +20,18 @@ import { checkAuxBash } from "../guard.ts";
 
 const SUBMIT = "submit_result";
 const LEVELS: ThinkingLevel[] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+/** Consecutive non-abort failures before cooling a model down for background roles. */
+export const MODEL_COOLDOWN_STRIKES = 2;
+/** Cooldown duration for failing background aux models (2 minutes). */
+export const MODEL_COOLDOWN_MS = 2 * 60_000;
+/** User-initiated foreground roles still retry during cooldown and clear it on success. */
+const FOREGROUND_ROLES = new Set<AuxRole>(["qemem.planner", "qemem.constructor", "ingest.slicer"]);
+
+interface ModelHealth {
+  failures: number;
+  until: number;
+  lastError: string;
+}
 
 /** What the runner needs from pi at call time; read fresh on every run, since the context changes per event. */
 export interface PiAuxEnv {
@@ -86,12 +98,18 @@ export class PiAuxRunner implements AuxSessionRunner {
   private readonly env: PiAuxEnv;
   private readonly telemetry?: Telemetry;
   private readonly limiter: Limiter;
+  private readonly health = new Map<string, ModelHealth>();
 
   constructor(cfg: Config, env: PiAuxEnv, telemetry?: Telemetry) {
     this.cfg = cfg;
     this.env = env;
     this.telemetry = telemetry;
     this.limiter = new Limiter(cfg.providers.aux.maxConcurrent);
+  }
+
+  /** Clear per-model failure cooldowns (e.g. after settings reload). */
+  resetCooldowns(): void {
+    this.health.clear();
   }
 
   /** The model a role runs on: `providers.aux.pi` names it as `<provider>/<model-id>`; default: the session's model. */
@@ -124,6 +142,16 @@ export class PiAuxRunner implements AuxSessionRunner {
     const registry = this.env.registry();
     const model = this.modelFor(settings);
     if (!registry || !model) return { ...empty, error: "no model available" };
+    const modelKey = `${model.provider}/${model.id}`;
+    const isBackground = !FOREGROUND_ROLES.has(task.role);
+    if (isBackground) {
+      const h = this.health.get(modelKey);
+      if (h && Date.now() < h.until) {
+        const error = `${modelKey} cooling down after repeated failures: ${h.lastError}`;
+        this.telemetry?.call({ callSite: task.role, kind: "aux", latencyMs: 0, outcome: "skipped", detail: "cooldown", budget: "none" });
+        return { ...empty, error };
+      }
+    }
     const reverify = task.role === "reverify";
     const budgetKind = reverify && !this.cfg.reverify.countsTowardBudget ? "reverify" : "aux";
     if (budgetKind === "aux" && this.telemetry && this.telemetry.spentToday().aux >= this.cfg.budgets.dailyAuxTokens) {
@@ -138,6 +166,18 @@ export class PiAuxRunner implements AuxSessionRunner {
       result = { ...empty, error: String((e as Error).message ?? e) };
     }
     const aborted = task.signal?.aborted === true;
+    if (result.output !== null) {
+      this.health.delete(modelKey);
+    } else if (!aborted) {
+      const prev = this.health.get(modelKey);
+      const failures = (prev?.failures ?? 0) + 1;
+      const lastError = result.error ?? "aux error";
+      this.health.set(modelKey, {
+        failures,
+        until: failures >= MODEL_COOLDOWN_STRIKES ? Date.now() + MODEL_COOLDOWN_MS : 0,
+        lastError,
+      });
+    }
     this.telemetry?.call({
       callSite: task.role,
       kind: "aux",

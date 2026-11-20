@@ -237,7 +237,7 @@ describe("/realctx2 ingest (§6.9.2)", () => {
       "packages/api/prisma/schema.prisma": "model User { id Int @id }\n",
       ".claude/rules/sql.md": "---\npaths:\n  - \"**/*.sql\"\n  - \"db/**\"\n---\n- SQL keywords must be uppercase.\n",
     });
-    w.aux.on("ingest.slicer", fakeSlicer({ anchorFor: (t) => (t.includes("Schema edits") ? [{ kind: "file", path: "packages/api/prisma/schema.prisma", role: "applies" }, { kind: "file", path: "packages/api/missing.ts", role: "applies" }, { kind: "glob", path: "packages/[", role: "applies" }] : []) }));
+    w.aux.on("ingest.slicer", fakeSlicer({ anchorFor: (t) => (t.includes("Schema edits") ? [{ kind: "file", path: "packages/api/prisma/schema.prisma", role: "applies" }, { kind: "file", path: "packages/api/missing.ts", role: "applies" }, { kind: "file", path: "../outside.ts", role: "applies" }] : []) }));
     const out = io();
     const res = await ins.ingest({ io: out, include: ["agents", "rules"] });
     const nodes = w.graph.all(["shared"]).map((r) => r);
@@ -245,7 +245,7 @@ describe("/realctx2 ingest (§6.9.2)", () => {
     const schema = nodes.find((r) => r.node.text.startsWith("Schema"))!;
     expect(w.paths.displayAnchors(schema).map((a) => a.at)).toEqual(["packages/api/prisma/schema.prisma"]);
     expect(out.out[0]).toContain("⚠ anchor path not found: packages/api/missing.ts");
-    expect(out.out[0]).toContain("⚠ anchor does not resolve: packages/[");
+    expect(out.out[0]).toContain("⚠ anchor does not resolve: ../outside.ts");
     const sql = nodes.find((r) => r.node.text.startsWith("SQL"))!;
     expect(sql.node.anchors.map((a) => a.glob).sort()).toEqual(["**/*.sql", "db/**"]);
     expect(out.out[0]).toContain("packages/api/AGENTS.md → shared · 0 items");

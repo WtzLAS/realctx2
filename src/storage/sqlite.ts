@@ -114,13 +114,100 @@ const STOP_WORDS = new Set(
   "the a an of to in on is are was were be been being and or for with that this these those it its as at by from do does did done how what why when where which who whom not no nor if then than so but can could should would will shall may might must i we you they he she me us them our my your their his her has have had having there here into onto about after before over under again also just only very too any all some each per via vs etc".split(" "),
 );
 
+const CJK_RUN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\u3005\u30fc]+/gu;
+const HAS_CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+
+let wordSegmenter: Intl.Segmenter | null | undefined;
+function getSegmenter(): Intl.Segmenter | null {
+  if (wordSegmenter !== undefined) return wordSegmenter;
+  try {
+    wordSegmenter = new Intl.Segmenter(undefined, { granularity: "word" });
+  } catch {
+    wordSegmenter = null;
+  }
+  return wordSegmenter;
+}
+
+function segmentWords(text: string): string[] {
+  const seg = getSegmenter();
+  if (!seg) return text.split(/[^\p{L}\p{N}_]+/u).filter(Boolean);
+  const out: string[] = [];
+  for (const s of seg.segment(text)) {
+    if (!s.isWordLike) continue;
+    // Intl.Segmenter keeps dotted words like `TokenCache.refresh` together; split on
+    // non-word punctuation so each component is indexed and queried as its own FTS5 token.
+    for (const part of s.segment.split(/[^\p{L}\p{N}_]+/u)) if (part) out.push(part);
+  }
+  return out;
+}
+
+/** Split identifiers like `usedCount`, `HTTPServer2`, and `cache_ttl` into searchable sub-words. */
+function identifierSubWords(word: string): string[] {
+  if (HAS_CJK.test(word)) return [];
+  const parts = word
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((p) => p.length > 1);
+  return parts.length > 1 ? parts.map((p) => p.toLowerCase()) : [];
+}
+
+function cjkGrams(text: string, withUnigrams: boolean): string[] {
+  const out: string[] = [];
+  for (const m of text.matchAll(CJK_RUN)) {
+    const chars = [...m[0]];
+    if (chars.length === 1 || withUnigrams) out.push(...chars);
+    for (let i = 0; i + 1 < chars.length; i++) out.push(chars[i]! + chars[i + 1]!);
+  }
+  return out;
+}
+
+/**
+ * Pre-tokenize a document field for FTS5 (`unicode61`):
+ * - ICU word segmentation via `Intl.Segmenter` across scripts;
+ * - camelCase / PascalCase / snake_case sub-words alongside the original identifier;
+ * - overlapping CJK character bigrams and unigrams so CJK search never fails on segmentation mismatches.
+ */
+export function indexTokens(text: string): string {
+  if (!text) return "";
+  const raw = text.normalize("NFKC");
+  const tokens: string[] = [];
+  for (const w of segmentWords(raw)) {
+    tokens.push(w.toLowerCase());
+    for (const sub of identifierSubWords(w)) tokens.push(sub);
+  }
+  for (const g of cjkGrams(raw.toLowerCase(), true)) tokens.push(g);
+  return tokens.join(" ");
+}
+
 /**
  * Quote free text as an FTS5 query: every content token becomes a quoted term, OR-ed.
+ * Handles CJK bigrams and camelCase/snake_case sub-words to match `indexTokens`.
  * Function words are dropped (they match everything and drown rank fusion) unless nothing else is left.
  */
-export function ftsQuery(text: string, maxTerms = 24): string {
+export function ftsQuery(text: string, maxTerms = 32): string {
+  const raw = text.normalize("NFKC");
   const all: string[] = [];
-  for (const m of text.toLowerCase().matchAll(/[\p{L}\p{N}_]+/gu)) if (m[0].length >= 2 && !all.includes(m[0])) all.push(m[0]);
+  const seen = new Set<string>();
+  const add = (t: string) => {
+    if (!t || seen.has(t)) return;
+    seen.add(t);
+    all.push(t);
+  };
+  for (const w of segmentWords(raw)) {
+    const lw = w.toLowerCase();
+    if (HAS_CJK.test(lw)) {
+      if ([...lw].length <= 4) add(lw);
+      continue;
+    }
+    if (lw.length < 2 && !/\d/.test(lw)) continue;
+    add(lw);
+    for (const sub of identifierSubWords(w)) add(sub);
+  }
+  for (const g of cjkGrams(raw.toLowerCase(), false)) add(g);
   const content = all.filter((t) => !STOP_WORDS.has(t));
-  return (content.length ? content : all).slice(0, maxTerms).map((t) => `"${t}"`).join(" OR ");
+  return (content.length ? content : all)
+    .slice(0, maxTerms)
+    .map((t) => `"${t.replace(/"/g, '""')}"`)
+    .join(" OR ");
 }

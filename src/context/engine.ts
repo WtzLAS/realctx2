@@ -887,7 +887,8 @@ export class ContextEngine {
   async onContext(): Promise<ContextEdit[] | null> {
     if (this.light || this.level === 0 || !this.contextEnabled()) return null;
     const now = this.clock().getTime();
-    const cold = this.lastRequestAt > 0 && now - this.lastRequestAt >= effectiveCacheTtlSeconds(this.cfg, this.adapter.modelName()) * 1000;
+    const lastWrite = Math.max(this.lastRequestAt, this.adapter.lastCacheWriteAt?.() ?? 0);
+    const cold = lastWrite > 0 && now - lastWrite >= effectiveCacheTtlSeconds(this.cfg, this.adapter.modelName()) * 1000;
     this.lastRequestAt = now;
     const ready = [...this.foldJobs.values()].filter((j) => j.done && j.plan);
     if (!ready.length) return null;

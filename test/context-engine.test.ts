@@ -2,6 +2,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { BlobStore, guardToolResult, paginate, pickPage, reachableEntries, renderLayer } from "../src/context/archive.ts";
 import { planReplace } from "../src/context/consolidate.ts";
 import { GUIDANCE_TYPE } from "../src/context/render.ts";
+import { alignToUnits, toUnits, workingTail } from "../src/context/rounds.ts";
 import { SessionState } from "../src/context/state.ts";
 import type { AuxTask, ConsolidationRecord, EntryView } from "../src/core/types.ts";
 import { MemoryRuntime } from "../src/memory/runtime.ts";
@@ -858,6 +859,87 @@ describe("memory in the loop", () => {
 
     // At +3601s from lastRequestAt: cache is cold under the model override -> cold fold is applied
     (s.engine as any).lastRequestAt = w.now.t - 3_601_000;
+    const edits = await s.engine.onContext();
+    expect(edits).not.toBeNull();
+    expect((s.engine as any).foldJobs.has("cold:0")).toBe(false);
+  });
+
+  it("closes orphaned tool calls once a later non-result entry follows, without stalling working tail or alignment", () => {
+    const mk = (id: string, kind: "user" | "assistant" | "toolResult", extra: Record<string, unknown> = {}): EntryView => ({
+      id,
+      kind,
+      role: kind === "toolResult" ? "tool" : kind,
+      text: "body",
+      rawText: "body",
+      omitted: false,
+      edited: false,
+      timestamp: "2026-11-20T00:00:00Z",
+      tokens: 400,
+      rawTokens: 400,
+      ...extra,
+    });
+    // Mid-transcript assistant made a tool call (c1) whose result never arrived, then a user message followed.
+    const entries = [
+      mk("e0", "user"),
+      mk("e1", "assistant", { toolCalls: [{ id: "c1", name: "bash", args: {} }] }),
+      mk("e2", "user"),
+      mk("e3", "assistant", { tokens: 2000 }),
+      mk("e4", "assistant", { tokens: 2000 }),
+      mk("e5", "assistant", { tokens: 2000 }),
+    ];
+    const units = toUnits(entries);
+    expect(units[1]!.complete).toBe(true); // orphaned call c1 is closed because e2 followed and c1 never got a result
+    const c = cfg({ K: 2 });
+    const tail = workingTail(entries, units, c, 32_000, [400, 2000, 2000]);
+    expect(tail.start).toBeGreaterThan(2); // working tail does NOT pin everything back to e1
+    expect(alignToUnits(units, 0, tail.start)).toEqual([0, tail.start]);
+
+    // A call at the very end of the transcript (no following non-result entry) stays open (may still be running).
+    const running = [...entries, mk("e6", "assistant", { toolCalls: [{ id: "c2", name: "bash", args: {} }] })];
+    expect(toUnits(running).at(-1)!.complete).toBe(false);
+
+    // A call whose result arrives out-of-order later stays open so it is never cut from its result.
+    const lateResult = [
+      mk("a0", "assistant", { toolCalls: [{ id: "c3", name: "read", args: {} }] }),
+      mk("a1", "user"),
+      mk("a2", "toolResult", { toolCallId: "c3", toolName: "read" }),
+    ];
+    expect(toUnits(lateResult)[0]!.complete).toBe(false);
+  });
+
+  it("counts adapter.lastCacheWriteAt() (e.g. pi cache_warm) so cold folds do not break a warm cache", async () => {
+    const repo = tmp("ctx-cache-warm-");
+    const w = world({
+      cwd: repo,
+      cfg: { context: { maxWindow: 32000, cacheTtlSeconds: 300 } },
+    });
+    const s = new Session({ world: w });
+    await s.start();
+    await s.round("work0", [{ name: "read", args: { path: "a.ts" }, output: "hello" }]);
+    await s.round("work1", work(1, 1500));
+    await s.round("work2", work(2, 1500));
+    const entries = await s.h.listEntries();
+    const u0 = s.engine.units[0]!;
+    const coldPlan = planReplace(entries, s.engine.state, u0.start, u0.end, {
+      id: "t:warm0001",
+      kind: "palim",
+      text: "summary",
+      telos: [],
+      model: "test/main",
+      now: new Date(w.now.t).toISOString(),
+    })!;
+    (s.engine as any).foldJobs.set("cold:0", { key: "cold:0", kind: "cold", level: 0, done: true, plan: coldPlan, promise: Promise.resolve() });
+    (s.engine as any).lastRequestAt = w.now.t;
+
+    // 10 minutes pass since lastRequestAt, but the harness kept the cache warm 30s ago -> stay warm
+    w.now.t += 600_000;
+    s.h.lastCacheWriteAt = () => w.now.t - 30_000;
+    expect(await s.engine.onContext()).toBeNull();
+    expect((s.engine as any).foldJobs.has("cold:0")).toBe(true);
+
+    // Once the cache_warm refresh is older than TTL (301s), the cold fold applies
+    (s.engine as any).lastRequestAt = w.now.t - 600_000;
+    s.h.lastCacheWriteAt = () => w.now.t - 301_000;
     const edits = await s.engine.onContext();
     expect(edits).not.toBeNull();
     expect((s.engine as any).foldJobs.has("cold:0")).toBe(false);

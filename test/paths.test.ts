@@ -2,6 +2,7 @@ import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import type { MemoryNode, ScopedNode } from "../src/core/types.ts";
+import { patchFiles, resultPathEventOf } from "../src/adapters/pathevents.ts";
 import { commandActions, PathDelivery } from "../src/memory/delivery.ts";
 import { commonDir, declaresSymbol, globDepth } from "../src/memory/paths.ts";
 import { MemoryWriter } from "../src/memory/write.ts";
@@ -420,6 +421,67 @@ describe("just-in-time delivery (§6.8.5, §6.10.2)", () => {
     expect(small.ids[0]).toBe(rootMust.id);
     expect(small.overflow.length).toBeGreaterThan(0);
     expect(d.rulesAt("packages/api/src/x.ts").map((r) => r.ref.node.id)).toEqual(expect.arrayContaining([rootMust.id, cwdRule.id, personal.id]));
+    w.close();
+  });
+
+  it("treats square brackets as literal path characters in anchors and globs", async () => {
+    const repo = initRepo();
+    write(repo, "[fufu]logs/docs/HANDOFF.md", "# handoff\n");
+    write(repo, "[fufu]logs/lua/sv_init.lua", "print('hi')\n");
+    write(repo, "app/users/[id]/page.tsx", "export default function Page() {}\n");
+    commitAll(repo);
+    const w = world({ cwd: repo });
+
+    const dirMem = await remember(w, "Logs dir note.", { paths: ["[fufu]logs"] });
+    const fileMem = await remember(w, "Dynamic route note.", { paths: ["app/users/[id]/page.tsx"] });
+    const globMem = await remember(w, "Lua glob note.", { paths: ["[fufu]logs/**/*.lua"] });
+    const segGlob = await remember(w, "Route glob note.", { paths: ["app/**/[id]/*.tsx"] });
+
+    // Plain paths with brackets become tracked subtree/file anchors, not globs
+    expect(dirMem.node.anchors[0]!.kind).toBe("subtree");
+    expect(fileMem.node.anchors[0]!.kind).toBe("file");
+    expect(globMem.node.anchors[0]!.kind).toBe("glob");
+    expect(segGlob.node.anchors[0]!.kind).toBe("glob");
+
+    expect(w.paths.covering("[fufu]logs/docs/HANDOFF.md").map((c) => c.node.id)).toContain(dirMem.node.id);
+    expect(w.paths.covering("[fufu]logs/lua/sv_init.lua").map((c) => c.node.id)).toEqual(expect.arrayContaining([dirMem.node.id, globMem.node.id]));
+    expect(w.paths.covering("app/users/[id]/page.tsx").map((c) => c.node.id)).toEqual(expect.arrayContaining([fileMem.node.id, segGlob.node.id]));
+    // Brackets are literal, never a character class matching single letters
+    expect(w.paths.covering("app/users/i/page.tsx").map((c) => c.node.id)).not.toContain(segGlob.node.id);
+    w.close();
+  });
+
+  it("extracts paths from anchor-addressed tool-result details (snapshotId, unified patch, path/paths)", () => {
+    const repo = initRepo();
+    write(repo, "src/a.ts", "export const a = 1;\n");
+    write(repo, "src/b.ts", "export const b = 2;\n");
+    write(repo, "app/[id]/page.tsx", "export default 1;\n");
+    commitAll(repo);
+    const w = world({ cwd: repo });
+    const resolver = { cwd: repo, rel: (p: string, cwd?: string) => w.paths.rel(p, cwd), exists: (rel: string) => w.paths.exists(rel) };
+
+    const snap = resultPathEventOf("replace", { snapshotId: `v2|${join(repo, "src/a.ts")}|123|1.0|1.0|20` }, resolver);
+    expect(snap).toEqual({ action: "edit", paths: ["src/a.ts"] });
+
+    const patch = [
+      "--- a/src/a.ts\t2026-11-20",
+      "+++ b/src/a.ts\t2026-11-20",
+      "@@ -1,1 +1,1 @@",
+      "--- not/a/header.ts",
+      "+++ also/not/a/header.ts",
+      "--- a/src/b.ts",
+      "+++ b/src/b.ts",
+      "@@ -1,1 +1,1 @@",
+      "-old",
+      "+new",
+    ].join("\n");
+    expect(patchFiles(patch)).toEqual(["src/a.ts", "src/b.ts"]);
+    expect(resultPathEventOf("move", { patch }, resolver)).toEqual({ action: "edit", paths: ["src/a.ts", "src/b.ts"] });
+
+    expect(resultPathEventOf("custom_read", { paths: ["app/[id]/page.tsx", "does/not/exist.ts"] }, resolver)).toEqual({
+      action: "read",
+      paths: ["app/[id]/page.tsx"],
+    });
     w.close();
   });
 });

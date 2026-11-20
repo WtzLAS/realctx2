@@ -14,7 +14,8 @@ import { daysBetween } from "../util/text.ts";
 import type { MemoryGraph } from "./graph.ts";
 
 export const ROOT_GLOB = "**";
-const GLOB_CHARS = /[*?[\]{}]/;
+// Square brackets are treated as literal path characters (e.g. Next.js `app/[id]/page.tsx`), not globs.
+const GLOB_CHARS = /[*?{}]/;
 const STALE_ANCHOR_DAYS = 30;
 
 export interface Covering {

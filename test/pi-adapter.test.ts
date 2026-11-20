@@ -1,8 +1,12 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
+import { PiAdapter } from "../src/adapters/pi/adapter.ts";
+import { MODEL_COOLDOWN_STRIKES, PiAuxRunner } from "../src/adapters/pi/aux.ts";
+import { projectedEntries } from "../src/adapters/pi/entries.ts";
 import { applyEditsToMessages, DECISION_PROVIDER } from "../src/adapters/pi/index.ts";
-import { Layout } from "../src/core/config.ts";
+import { toolRenderers } from "../src/adapters/pi/tool-renderers.ts";
+import { DEFAULT_CONFIG, Layout } from "../src/core/config.ts";
 import { resolveProject } from "../src/core/project.ts";
 import { readJsonl } from "../src/util/fs.ts";
 import { cleanupTmp, commitAll, initRepo, listTree, write } from "./helpers/fixtures.ts";
@@ -571,4 +575,151 @@ describe("pressure, compaction and name conflicts in pi", () => {
       await dec.close();
     }
   }, 120_000);
+
+  it("renders compact sanitized TUI tool summaries for all five realctx2 tools", () => {
+    const theme = {
+      fg: (_c: string, s: string) => s,
+      bold: (s: string) => s,
+    } as any;
+
+    const search = toolRenderers("search", "search");
+    const callLines = search.renderCall!({ query: "auth\x1b[31m cache", mode: "thorough", path: "src/auth" } as any, theme, {} as any).render(120);
+    expect(callLines[0]).toContain("realctx2 search");
+    expect(callLines[0]).toContain("auth cache");
+    expect(callLines[0]).not.toContain("\x1b");
+    expect(callLines[0]).toContain("thorough");
+
+    const resLines = search.renderResult!(
+      {
+        content: [{ type: "text", text: "[m:abcd1234] personal · long · as of 2026-11-20\nTokenCache must be single-flight." }],
+        details: { mode: "quick", memory: [{ id: "m:abcd1234", scope: "personal", kind: "fact" }], turns: [] },
+      } as any,
+      { expanded: false, isPartial: false },
+      theme,
+      {} as any,
+    ).render(120);
+    expect(resLines[0]).toContain("1 memory");
+    expect(resLines[1]).toContain("m:abcd1234");
+    expect(resLines[1]).toContain("TokenCache must be single-flight.");
+
+    const recall = toolRenderers("recall", "recall");
+    const collapsed = recall.renderResult!(
+      { content: [{ type: "text", text: "huge body line 1\nhuge body line 2" }], details: { id: "o:12345678", type: "output", tool: "bash", tokens: 9000, page: 1, pages: 3 } } as any,
+      { expanded: false, isPartial: false },
+      theme,
+      {} as any,
+    ).render(120);
+    expect(collapsed[0]).toContain("o:12345678");
+    expect(collapsed[0]).toContain("page 1/3");
+    expect(collapsed.join("\n")).not.toContain("huge body line 1");
+    const expanded = recall.renderResult!(
+      { content: [{ type: "text", text: "huge body line 1\nhuge body line 2" }], details: { id: "o:12345678", type: "output", tool: "bash", tokens: 9000, page: 1, pages: 3 } } as any,
+      { expanded: true, isPartial: false },
+      theme,
+      {} as any,
+    ).render(120);
+    expect(expanded.join("\n")).toContain("huge body line 1");
+
+    const remember = toolRenderers("remember", "remember");
+    const remErr = remember.renderResult!({ content: [{ type: "text", text: "bad input" }], isError: true } as any, { expanded: false, isPartial: false }, theme, { isError: true } as any).render(120);
+    expect(remErr[0]).toContain("✗ bad input");
+  });
+
+  it("counts pi cache_warm usage entries in PiAdapter.lastCacheWriteAt and warns on competing context managers", () => {
+    const adapter = new PiAdapter({
+      pi: {
+        getAllTools: () => [
+          { name: "search", sourceInfo: { path: "/ext/realctx2.ts", source: "extension" } },
+          { name: "realctx_expand", sourceInfo: { path: "/ext/realctx.ts", source: "extension" } },
+        ],
+        registerTool: () => {},
+      } as any,
+      memory: () => null,
+      ownTools: () => [],
+    });
+    const baseMs = Date.parse("2026-11-20T12:00:00.000Z");
+    const warmMs = Date.parse("2026-11-20T12:04:30.000Z");
+    const otherProviderMs = Date.parse("2026-11-20T12:05:00.000Z");
+    adapter.bind({
+      model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+      sessionManager: {
+        getBranch: () => [
+          { type: "message", id: "a1", timestamp: new Date(baseMs).toISOString(), message: { role: "assistant", timestamp: baseMs, content: [{ type: "text", text: "ok" }] } },
+          { type: "usage", id: "u1", kind: "cache_warm", provider: "anthropic", model: "claude-sonnet-4-5", timestamp: new Date(warmMs).toISOString() },
+          { type: "usage", id: "u2", kind: "cache_warm", provider: "openai", model: "gpt-5", timestamp: new Date(otherProviderMs).toISOString() },
+        ],
+      },
+    } as any);
+    expect(adapter.lastCacheWriteAt()).toBe(warmMs);
+
+    const warnings = adapter.recheckTools();
+    expect(warnings.some((w) => w.includes("realctx (v1)") && w.includes("realctx_expand"))).toBe(true);
+
+    // Model-based image token estimation in projectedEntries replaces hardcoded 1200
+    const png = Buffer.alloc(24);
+    png.writeUInt32BE(0x89504e47, 0);
+    png.writeUInt32BE(0x0d0a1a0a, 4);
+    png.writeUInt32BE(13, 8);
+    png.write("IHDR", 12, "latin1");
+    png.writeUInt32BE(2000, 16);
+    png.writeUInt32BE(2000, 20);
+    const imgMsg = { role: "user", content: [{ type: "image", data: png.toString("base64"), mimeType: "image/png" }] };
+    const sm = {
+      buildSessionProjection: () => ({ entries: [{ sourceEntry: { type: "message", id: "m1", timestamp: "2026-11-20T00:00:00Z", message: imgMsg }, messages: [imgMsg] }] }),
+      getBranch: () => [],
+    } as any;
+    const son = projectedEntries(sm, { provider: "anthropic", id: "claude-sonnet-4-5" })[0]!.tokens;
+    const hires = projectedEntries(sm, { provider: "anthropic", id: "claude-opus-4-7" })[0]!.tokens;
+    const gem3 = projectedEntries(sm, { provider: "google", id: "gemini-3-pro" })[0]!.tokens;
+    expect(hires).toBeGreaterThan(son);
+    expect(gem3).toBe(1120);
+  });
+
+  it("cools down failing aux models for background roles while foreground roles still retry and clear cooldown", async () => {
+    let calls = 0;
+    let shouldFail = true;
+    const model = { provider: "anthropic", id: "claude-haiku-4-5", maxTokens: 4096, reasoning: false } as any;
+    const runner = new PiAuxRunner(DEFAULT_CONFIG, {
+      registry: () => ({
+        find: () => model,
+        streamSimple: () => ({
+          result: async () => {
+            calls++;
+            if (shouldFail) return { role: "assistant", stopReason: "error", errorMessage: "rate limit 429", content: [], usage: { input: 0, output: 0 } } as any;
+            return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: '{"ok":true}' }], usage: { input: 10, output: 5 } } as any;
+          },
+        }),
+      }) as any,
+      model: () => model,
+      cwd: () => process.cwd(),
+      root: () => null,
+      memory: () => null,
+      ownTools: () => [],
+    });
+    const schema = { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } };
+
+    // Strike 1 and Strike 2 trigger cooldown
+    for (let i = 0; i < MODEL_COOLDOWN_STRIKES; i++) {
+      const r = await runner.run({ role: "precip", instructions: "test", data: [], schema, tools: "none" });
+      expect(r.output).toBeNull();
+    }
+    expect(calls).toBe(MODEL_COOLDOWN_STRIKES);
+
+    // Next background call fast-fails without hitting the provider
+    const cooled = await runner.run({ role: "palim", instructions: "test", data: [], schema, tools: "none" });
+    expect(cooled.output).toBeNull();
+    expect(cooled.error).toContain("cooling down");
+    expect(calls).toBe(MODEL_COOLDOWN_STRIKES);
+
+    // Foreground role still attempts the provider and clears cooldown on success
+    shouldFail = false;
+    const fg = await runner.run({ role: "qemem.planner", instructions: "test", data: [], schema, tools: "none" });
+    expect(fg.output).toEqual({ ok: true });
+    expect(calls).toBe(MODEL_COOLDOWN_STRIKES + 1);
+
+    // Background role works again now that cooldown cleared
+    const bg = await runner.run({ role: "precip", instructions: "test", data: [], schema, tools: "none" });
+    expect(bg.output).toEqual({ ok: true });
+    expect(calls).toBe(MODEL_COOLDOWN_STRIKES + 2);
+  });
 });

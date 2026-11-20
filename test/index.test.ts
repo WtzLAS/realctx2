@@ -43,7 +43,7 @@ describe("sqlite shim", () => {
       throw new Error("boom");
     })).toThrow("boom");
     expect(db.prepare("SELECT COUNT(*) AS n FROM t").get()!.n).toBe(2);
-    expect(ftsQuery('TokenCache.refresh "races" on `pending` — a')).toBe('"tokencache" OR "refresh" OR "races" OR "pending"');
+    expect(ftsQuery('TokenCache.refresh "races" on `pending` — a')).toBe('"tokencache" OR "token" OR "cache" OR "refresh" OR "races" OR "pending"');
     expect(ftsQuery("how does it do that")).toBe('"how" OR "does" OR "it" OR "do" OR "that"'); // nothing but function words: keep them
     expect(ftsQuery("   ")).toBe("");
     db.close();
@@ -218,6 +218,28 @@ describe("turn index", () => {
     expect(all.vectors).toBeGreaterThan(0);
     expect(ti.vectors.count("dense")).toBe(0);
     expect(ti.vectors.getTokens("t:aaaaaaaa", "late")).not.toBeNull();
+    ti.close();
+  });
+
+  it("matches CJK queries and camelCase/snake_case sub-words via FTS5 pre-tokenization", () => {
+    const sd = ScopeDoc.create({ scope: "personal" });
+    sd.insertNode(node({ id: "cjk00001", title: "缓存策略", text: "部署到生产环境前必须清理旧的缓存策略并刷新令牌。" }));
+    sd.insertNode(node({ id: "id000001", title: "Token cache helper", text: "Call refreshAuthToken or clear_cache_entries before rotating keys." }));
+    sd.commit();
+    const idx = new MemoryIndex(join(tmp(), "cjk-index.sqlite"));
+    idx.sync(sd, "v1");
+    // CJK bigram / substring match inside a continuous Han run
+    expect(idx.bm25("生产环境", { limit: 5 }).map((s) => s.id)).toContain("cjk00001");
+    expect(idx.bm25("缓存", { limit: 5 }).map((s) => s.id)).toContain("cjk00001");
+    // camelCase and snake_case sub-word matches
+    expect(idx.bm25("auth token", { limit: 5 }).map((s) => s.id)).toContain("id000001");
+    expect(idx.bm25("entries", { limit: 5 }).map((s) => s.id)).toContain("id000001");
+    idx.close();
+
+    const ti = new TurnIndex(join(tmp(), "cjk-turns.sqlite"));
+    ti.addRaw({ session: "s1", harness: "pi", entryId: "e1", at: "2026-11-20T00:00:00Z", text: "请检查数据库连接池配置和maxRetryCount参数", seq: 0 });
+    expect(ti.bm25("连接池", { limit: 5 }).length).toBe(1);
+    expect(ti.bm25("retry", { limit: 5 }).length).toBe(1);
     ti.close();
   });
 });

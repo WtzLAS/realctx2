@@ -2,12 +2,12 @@ import picomatch from "picomatch";
 
 const cache = new Map<string, (s: string) => boolean>();
 
-/** Repo-path glob (POSIX separators, dotfiles included). */
+/** Repo-path glob (POSIX separators, dotfiles included; `[` and `]` are literal path characters). */
 export function pathMatcher(glob: string): (path: string) => boolean {
   const key = "p:" + glob;
   let m = cache.get(key);
   if (!m) {
-    m = picomatch(glob, { dot: true, nonegate: true }) as (s: string) => boolean;
+    m = picomatch(glob, { dot: true, nonegate: true, nobracket: true }) as (s: string) => boolean;
     cache.set(key, m);
   }
   return m;
@@ -16,7 +16,7 @@ export function pathMatcher(glob: string): (path: string) => boolean {
 export function globCompiles(glob: string): boolean {
   if (!glob.trim()) return false;
   try {
-    picomatch.makeRe(glob, { dot: true, strictBrackets: true });
+    picomatch.makeRe(glob, { dot: true, nobracket: true });
     return true;
   } catch {
     return false;
@@ -50,6 +50,6 @@ export function commandMatcher(pattern: string): (cmd: string) => boolean {
 
 /** How specific a glob is: more literal characters and more segments rank higher. */
 export function globSpecificity(glob: string): number {
-  const literal = glob.replace(/[*?{}[\],!]/g, "").length;
+  const literal = glob.replace(/[*?{},!]/g, "").length;
   return literal + glob.split("/").filter((s) => s && !s.includes("*")).length * 4;
 }

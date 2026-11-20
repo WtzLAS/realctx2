@@ -61,7 +61,7 @@ export const SUBCOMMANDS: Record<string, Sub> = {
   calibrate: { usage: "calibrate [model]", help: "Recalibrate similarity thresholds for an embedding model", run: (h, io, r) => memory.calibrate(h, io, parseArgs(r)) },
   reverify: { usage: "reverify [id | --all]", help: "Re-verify memories against the code now", run: (h, io, r) => memory.reverify(h, io, parseArgs(r)) },
   uninstall: { usage: "uninstall", help: "Restore the Claude Code settings realctx2 changed", run: (h, io) => store.uninstall(h, io) },
-  git: { usage: "git install-hooks | git lfs", help: "Install the optional git hooks; move future shared files to Git LFS", run: (h, io, r) => store.git(h, io, parseArgs(r)) },
+  git: { usage: "git install-hooks | git lfs | git fix-gitignore", help: "Install optional git hooks; move shared files to Git LFS; un-ignore .pi/realctx2/ in .gitignore", run: (h, io, r) => store.git(h, io, parseArgs(r)) },
 };
 
 export function helpText(prefix = "/realctx2 "): string {

@@ -12,8 +12,17 @@ import type { AuxRole, AuxSessionRunner, CommandDef, CommitBatch, ContextEdit, E
 import type { MemoryRuntime, SessionEntry as RegisteredSession } from "../../memory/runtime.ts";
 import { PiAuxRunner } from "./aux.ts";
 import { archiveEntries, branchRecords, projectedEntries, replacementFor } from "./entries.ts";
+import { toolRenderers } from "./tool-renderers.ts";
 
 export const STATUS_KEY = "realctx2";
+
+/** Known tools belonging to competing context/memory managers (non-destructive conflict warning). */
+const COMPETING_TOOLS: Array<{ tool: string; manager: string }> = [
+  { tool: "realctx_expand", manager: "realctx (v1)" },
+  { tool: "realctx_recall", manager: "realctx (v1)" },
+  { tool: "realmem_recall", manager: "realmem" },
+  { tool: "ctx_memory", manager: "Magic Context" },
+];
 
 /** Entry drafts a boundary handler returns (pi `SessionBoundaryDraft`). */
 export type Draft =
@@ -96,15 +105,54 @@ export class PiAdapter implements HarnessAdapter {
   }
 
   async listEntries(): Promise<EntryView[]> {
-    return projectedEntries(this.need().sessionManager);
+    return projectedEntries(this.need().sessionManager, this.ctx?.model);
   }
 
   async archiveEntries(): Promise<EntryView[]> {
-    return archiveEntries(this.need().sessionManager.getBranch());
+    return archiveEntries(this.need().sessionManager.getBranch(), this.ctx?.model);
   }
 
   async listRecords(): Promise<SessionRecord[]> {
     return branchRecords(this.need().sessionManager.getBranch());
+  }
+
+  /**
+   * When the provider prompt cache was last written: the latest assistant response on the active
+   * branch, or a later pi cache-warming refresh (`usage` entry with `kind === "cache_warm"`) for
+   * the active provider. Keeps cold-cache folds from breaking a cache pi is paying to keep warm.
+   */
+  lastCacheWriteAt(): number | null {
+    const ctx = this.ctx;
+    if (!ctx) return null;
+    let branch: SessionEntry[];
+    try {
+      branch = ctx.sessionManager.getBranch();
+    } catch {
+      return null;
+    }
+    const provider = ctx.model?.provider;
+    let latestWarm = 0;
+    let lastAssistant = 0;
+    for (let i = branch.length - 1; i >= 0; i--) {
+      const e = branch[i] as unknown as {
+        type?: string;
+        kind?: string;
+        provider?: string;
+        timestamp?: string;
+        message?: { role?: string; timestamp?: number };
+      };
+      if (e.type === "message" && e.message?.role === "assistant") {
+        const msgTs = typeof e.message.timestamp === "number" && e.message.timestamp > 0 ? e.message.timestamp : Date.parse(e.timestamp ?? "");
+        if (Number.isFinite(msgTs) && msgTs > 0) lastAssistant = msgTs;
+        break;
+      }
+      if (provider && e.type === "usage" && e.kind === "cache_warm" && e.provider === provider && typeof e.timestamp === "string") {
+        const at = Date.parse(e.timestamp);
+        if (Number.isFinite(at) && at > latestWarm) latestWarm = at;
+      }
+    }
+    if (lastAssistant <= 0) return latestWarm > 0 ? latestWarm : null;
+    return Math.max(lastAssistant, latestWarm);
   }
 
   async requestTokens(): Promise<number | null> {
@@ -228,6 +276,7 @@ export class PiAdapter implements HarnessAdapter {
       // plain JSON Schema: pi validates tool arguments as JSON Schema, whatever built the schema
       parameters: def.parameters as never,
       annotations: { readOnlyHint: def.readOnly, destructiveHint: def.key === "forget", openWorldHint: false },
+      ...toolRenderers(def.key, def.name),
       execute: async (toolCallId, params, signal) => {
         const res = await def.execute((params ?? {}) as Record<string, unknown>, { toolCallId, signal, nested: toolCallId.includes("/") });
         return { content: [{ type: "text" as const, text: res.text }], details: res.details as never, isError: res.isError };
@@ -236,7 +285,7 @@ export class PiAdapter implements HarnessAdapter {
     this.ownSource ??= this.allTools()?.find((t) => t.name === def.name)?.sourceInfo?.path ?? null;
   }
 
-  /** After every extension has loaded: a name that now belongs to another source was replaced. */
+  /** After every extension has loaded: detect replaced tools and competing context/memory managers. */
   recheckTools(): string[] {
     const fresh: string[] = [];
     for (const [key, def] of this.registered) {
@@ -245,6 +294,23 @@ export class PiAdapter implements HarnessAdapter {
         const msg = `tool name "${def.name}" now belongs to ${taken}: it replaced realctx2's ${key} tool (rename ours with tools.names in config.json)`;
         this.conflicts.set(key, msg);
         fresh.push(msg);
+      }
+    }
+    const all = this.allTools();
+    if (all) {
+      const foundManagers = new Set<string>();
+      for (const { tool, manager } of COMPETING_TOOLS) {
+        if (foundManagers.has(manager)) continue;
+        const match = all.find((t) => t.name === tool);
+        if (!match) continue;
+        if (this.ownSource !== null && match.sourceInfo?.path === this.ownSource) continue;
+        foundManagers.add(manager);
+        const key = `manager:${manager}`;
+        if (!this.conflicts.has(key)) {
+          const msg = `another context/memory manager (${manager}, tool "${tool}") is also loaded in this pi session; running two context managers together can fight over prompt edits and memory`;
+          this.conflicts.set(key, msg);
+          fresh.push(msg);
+        }
       }
     }
     return fresh;

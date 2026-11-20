@@ -268,6 +268,11 @@ export interface HarnessAdapter {
   pricing(): ModelPricing | null;
   /** Prices of the model an aux role runs on, when the harness knows them (C_fold in §5.4.2). */
   auxPricing?(role: AuxRole): ModelPricing | null;
+  /**
+   * Epoch ms when the provider's prompt cache was last written (latest assistant response, or
+   * a later harness cache-warming refresh for the active provider). Used for cold-cache folds.
+   */
+  lastCacheWriteAt?(): number | null;
   modelName(): string;
   notify(text: string, level?: "info" | "warning" | "error"): void;
   setStatus?(text: string | undefined): void;

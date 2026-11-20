@@ -12,6 +12,7 @@ import { REALCTX2_VERSION } from "../storage/schema.ts";
 import { sharedGitattributes } from "../storage/store.ts";
 import { existsSync, listFiles, readJsonl } from "../util/fs.ts";
 import { runSync } from "../util/git.ts";
+import { checkSharedIgnored, describeIgnoreProblem } from "../util/gitignore.ts";
 import { parseId } from "../util/ids.ts";
 import { hasSecrets } from "../util/secrets.ts";
 import { num, table } from "./args.ts";
@@ -75,8 +76,12 @@ export async function status(host: Host, io: CommandIO): Promise<void> {
     lines.push(table(rows));
     if (host.project.sharedDir && !mem.graph.has("shared")) lines.push(`  shared: not loaded${host.trusted ? " (no shared store in this repository yet; it is created by the first shared write)" : " (the project is not trusted)"}`);
     if (mem.graph.has("shared")) {
-      const pending = uncommittedShared(host);
-      lines.push(`  shared memory follows the git branch · ${pending.length ? `${pending.length} shared file change(s) not committed yet (git add ${relShared(host)} && git commit)` : "nothing to commit"}`);
+      const ignored = host.project.inGit && host.project.root ? checkSharedIgnored(host.project.root) : undefined;
+      if (ignored) lines.push(`  ⚠ ${describeIgnoreProblem(ignored)}`);
+      else {
+        const pending = uncommittedShared(host);
+        lines.push(`  shared memory follows the git branch · ${pending.length ? `${pending.length} shared file change(s) not committed yet (git add ${relShared(host)} && git commit)` : "nothing to commit"}`);
+      }
     }
     if (mem.lastReconcile && (mem.lastReconcile.moved.length || mem.lastReconcile.deleted.length || mem.lastReconcile.flagged.length)) lines.push(`Paths: ${mem.lastReconcile.moved.length} moved, ${mem.lastReconcile.deleted.length} deleted, ${mem.lastReconcile.flagged.length} rule(s) flagged at session start`);
     const reappeared = safe(() => mem.instructions.reappeared(), []);
@@ -305,6 +310,8 @@ export async function doctor(host: Host, io: CommandIO): Promise<void> {
         if (leaks.length) error(`Shared store: ${leaks.length} memor${leaks.length === 1 ? "y looks" : "ies look"} like they contain secrets: ${leaks.slice(0, 5).map((n) => `[m:${n.node.id}]`).join(", ")}. Purge them with /realctx2 forget <id> --purge.`);
         const dir = host.project.sharedDir!;
         const ga = join(dir, ".gitattributes");
+        const ignored = host.project.inGit && host.project.root ? checkSharedIgnored(host.project.root) : undefined;
+        if (ignored) warn(describeIgnoreProblem(ignored));
         // the directory is created by the first shared write
         if (!store.exists()) ok("Shared store: not created yet (the first shared memory creates it).");
         else if (!existsSync(ga)) warn(`Shared store: ${ga} is missing (it marks .loro files as binary/generated).`);

@@ -15,7 +15,7 @@ import { SUBCOMMANDS } from "../../commands/index.ts";
 import type { PendingDelivery } from "../../context/engine.ts";
 import type { PathEvent } from "../../memory/delivery.ts";
 import { PROMPT_SECTION_ID, RULES_SECTION_ID, type ToolKey } from "../../tools/index.ts";
-import { pathEventOf } from "../pathevents.ts";
+import { pathEventOf, resultPathEventOf } from "../pathevents.ts";
 import { loadAnySession } from "../sessions.ts";
 import { type Draft, PiAdapter, STATUS_KEY } from "./adapter.ts";
 
@@ -306,12 +306,20 @@ class PiExtension {
     return res ? { block: true, reason: res.block } : undefined;
   }
 
-  private async onToolResult(event: { toolName: string; toolCallId: string; parentToolCallId?: string; content: Part[]; details?: unknown; structuredContent?: unknown; isError: boolean }) {
+  private async onToolResult(event: { toolName: string; toolCallId: string; parentToolCallId?: string; content: Part[]; details?: unknown; structuredContent?: unknown; isError: boolean }, ctx: ExtensionContext) {
     const host = this.host;
     if (!host) return undefined;
     const own = this.isOwn(event.toolName);
-    const pathEvent = this.events.get(event.toolCallId);
+    let pathEvent = this.events.get(event.toolCallId);
     this.events.delete(event.toolCallId);
+    const mem = host.memory;
+    if (!own && !pathEvent && mem && event.details) {
+      pathEvent = resultPathEventOf(event.toolName, event.details, {
+        cwd: ctx.cwd,
+        rel: (p, cwd) => mem.paths.rel(p, cwd),
+        exists: (rel) => mem.paths.exists(rel),
+      });
+    }
     const deliveries = own ? ((event.details as { deliveries?: PendingDelivery[] } | undefined)?.deliveries ?? undefined) : undefined;
     const patch = await host.engine.onToolResult({ toolCallId: event.toolCallId, toolName: event.toolName, text: textOf(event.content), isError: event.isError, event: pathEvent, nested: !!event.parentToolCallId, own, deliveries });
     if (!patch) return undefined;
@@ -551,7 +559,7 @@ class PiExtension {
     pi.on("before_agent_start", this.safe("before_agent_start", (e, ctx) => this.onBeforeAgentStart(e, ctx)));
     pi.on("context", this.safe("context", (e, ctx) => this.onContext(e, ctx)));
     pi.on("tool_call", this.safe("tool_call", (e, ctx) => this.onToolCall(e, ctx)));
-    pi.on("tool_result", this.safe("tool_result", (e) => this.onToolResult(e)));
+    pi.on("tool_result", this.safe("tool_result", (e, ctx) => this.onToolResult(e, ctx)));
     pi.on(
       "user_bash",
       this.safe("user_bash", (e, ctx) => {

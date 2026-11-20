@@ -4,8 +4,10 @@ import { afterAll, describe, expect, it } from "vitest";
 import { catalogContextWindow, warmModelCatalog } from "../src/core/catalog.ts";
 import { applyProjectOverrides, DEFAULT_CONFIG, deepMerge, diffConfig, effectiveCacheTtlSeconds, effectiveMaxWindow, isContextEngineEnabled, scaledContext } from "../src/core/config.ts";
 import { tryLock } from "../src/util/fs.ts";
+import { applyIgnoreFix, checkSharedIgnored, describeIgnoreProblem } from "../src/util/gitignore.ts";
 import { commandMatcher, globCompiles, pathMatcher } from "../src/util/glob.ts";
 import { findIds, parseId, randomId8 } from "../src/util/ids.ts";
+import { imageCostFor, imageSize, imageTokens } from "../src/util/images.ts";
 import { scanSecrets } from "../src/util/secrets.ts";
 import { analyzeCommand, normalizeCommandParts, parseShell } from "../src/util/shell.ts";
 import { estimateTokens, extractPathTokens, extractSignature, headTail, ngramOverlap, sanitize, trigramJaccard, verifyQuote } from "../src/util/text.ts";
@@ -286,5 +288,85 @@ describe("file locks", () => {
     expect(taken).not.toBeNull();
     taken!.release();
     expect(existsSync(initLock)).toBe(false);
+  });
+});
+
+function pngBase64(w: number, h: number): string {
+  const b = Buffer.alloc(24);
+  b.writeUInt32BE(0x89504e47, 0);
+  b.writeUInt32BE(0x0d0a1a0a, 4);
+  b.writeUInt32BE(13, 8);
+  b.write("IHDR", 12, "latin1");
+  b.writeUInt32BE(w, 16);
+  b.writeUInt32BE(h, 20);
+  return b.toString("base64");
+}
+
+function gifBase64(w: number, h: number): string {
+  const b = Buffer.alloc(10);
+  b.write("GIF89a", 0, "latin1");
+  b.writeUInt16LE(w, 6);
+  b.writeUInt16LE(h, 8);
+  return b.toString("base64");
+}
+
+function jpegBase64(w: number, h: number): string {
+  // SOI + APP0(4 bytes) + SOF0(width/height)
+  const b = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00, 0xff, 0xc0, 0x00, 0x0b, 0x08, (h >> 8) & 0xff, h & 0xff, (w >> 8) & 0xff, w & 0xff]);
+  return b.toString("base64");
+}
+
+describe("image token estimation", () => {
+  it("parses PNG, GIF and JPEG headers and applies model-specific token pricing", () => {
+    const png = pngBase64(2000, 2000);
+    expect(imageSize(png)).toEqual({ width: 2000, height: 2000 });
+    expect(imageSize(gifBase64(320, 240))).toEqual({ width: 320, height: 240 });
+    expect(imageSize(jpegBase64(1024, 768))).toEqual({ width: 1024, height: 768 });
+
+    const claude = imageCostFor({ provider: "anthropic", id: "claude-sonnet-4-5" });
+    const claudeHires = imageCostFor({ provider: "anthropic", id: "claude-opus-4-7" });
+    const gemini3 = imageCostFor({ provider: "google", id: "gemini-3-pro" });
+    const gpt5 = imageCostFor({ provider: "openai", id: "gpt-5" });
+    expect(claude.name).toBe("anthropic");
+    expect(claudeHires.name).toBe("anthropic-hires");
+    expect(gemini3.name).toBe("gemini-3");
+    expect(gpt5.name).toBe("openai-gpt5");
+
+    // 2000x2000 image costs far more on Claude >= 4.7 hi-res than standard Claude or Gemini 3
+    expect(imageTokens({ data: png }, claudeHires)).toBeGreaterThan(imageTokens({ data: png }, claude));
+    expect(imageTokens({ data: png }, gemini3)).toBe(1120);
+    // Small icon is much cheaper than the old flat 1200
+    expect(imageTokens({ data: gifBase64(200, 200) }, claude)).toBeLessThan(100);
+  });
+});
+
+describe("shared store gitignore detection and verified fix", () => {
+  it("detects .pi/ exclusion, finds the multi-line re-include fix, and verifies it clears checkSharedIgnored", () => {
+    const repo = initRepo();
+    write(repo, ".gitignore", "node_modules/\n.pi/\n");
+    commitAll(repo);
+
+    const problem = checkSharedIgnored(repo);
+    expect(problem).toBeDefined();
+    expect(problem!.source).toBe(".gitignore");
+    expect(problem!.pattern).toBe(".pi/");
+    expect(problem!.fix).toEqual(expect.objectContaining({ file: ".gitignore", lines: ["!/.pi/", "/.pi/*", "!/.pi/realctx2/", "!/.pi/realctx2/**"] }));
+    expect(describeIgnoreProblem(problem!)).toContain("/realctx2 git fix-gitignore");
+
+    applyIgnoreFix(repo, problem!.fix!);
+    expect(checkSharedIgnored(repo)).toBeUndefined();
+  });
+
+  it("handles nested .pi/.gitignore and *.loro rules cleanly", () => {
+    const repo = initRepo();
+    write(repo, ".pi/.gitignore", "*\n");
+    commitAll(repo);
+
+    const problem = checkSharedIgnored(repo);
+    expect(problem).toBeDefined();
+    expect(problem!.source).toBe(".pi/.gitignore");
+    expect(problem!.fix?.file).toBe(".pi/.gitignore");
+    applyIgnoreFix(repo, problem!.fix!);
+    expect(checkSharedIgnored(repo)).toBeUndefined();
   });
 });

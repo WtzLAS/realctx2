@@ -59,8 +59,8 @@ realctx2 commands:
       Re-verify memories against the code now
   /realctx2:uninstall
       Restore the Claude Code settings realctx2 changed
-  /realctx2:git install-hooks | git lfs
-      Install the optional git hooks; move future shared files to Git LFS
+  /realctx2:git install-hooks | git lfs | git fix-gitignore
+      Install optional git hooks; move shared files to Git LFS; un-ignore .pi/realctx2/ in .gitignore
 ```
 
 If a command was named, its output follows:

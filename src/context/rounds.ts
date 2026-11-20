@@ -22,6 +22,8 @@ export interface Unit {
 
 /** Split the entry list into units. Tool results always stay with the assistant message that called them. */
 export function toUnits(entries: EntryView[]): Unit[] {
+  const answered = new Set<string>();
+  for (const e of entries) if (e.kind === "toolResult" && e.toolCallId) answered.add(e.toolCallId);
   const units: Unit[] = [];
   let i = 0;
   while (i < entries.length) {
@@ -34,6 +36,13 @@ export function toUnits(entries: EntryView[]): Unit[] {
         if (entries[j]!.toolCallId) want.delete(entries[j]!.toolCallId!);
         tokens += entries[j]!.tokens;
         j++;
+      }
+      // A tool call that never gets a result anywhere in the transcript (harness restarted or
+      // aborted mid-call) is closed by the next non-result entry, matching pi-ai's synthetic
+      // "No result provided" result. Calls at the end of the transcript stay open (still running),
+      // and calls answered out-of-order later stay open so they are not cut from their result.
+      if (want.size > 0 && j < entries.length) {
+        for (const id of want) if (!answered.has(id)) want.delete(id);
       }
       units.push({ start: i, end: j, round: true, complete: want.size === 0, tokens });
       i = j;

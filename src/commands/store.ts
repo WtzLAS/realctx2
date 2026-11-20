@@ -6,6 +6,7 @@ import { restoreClaudeSettings } from "../adapters/claude-code/settings.ts";
 import type { Host } from "../core/host.ts";
 import type { CommandIO, ScopeName } from "../core/types.ts";
 import { ensureDir, existsSync } from "../util/fs.ts";
+import { applyIgnoreFix, checkSharedIgnored, describeIgnoreProblem } from "../util/gitignore.ts";
 import { type Parsed, num } from "./args.ts";
 import { uncommittedShared } from "./status.ts";
 
@@ -31,8 +32,11 @@ export async function share(host: Host, io: CommandIO, p: Parsed): Promise<void>
   const pending = uncommittedShared(host);
   const git = host.project.git;
   const dir = host.project.sharedDir!;
+  const ignored = host.project.inGit && host.project.root ? checkSharedIgnored(host.project.root) : undefined;
+  if (ignored) lines.push(`⚠ ${describeIgnoreProblem(ignored)}`);
   if (p.flags.has("commit")) {
     if (!git || !host.project.root) lines.push("Not a git repository: nothing to commit.");
+    else if (ignored) lines.push("Run /realctx2 git fix-gitignore first so git tracks the shared store.");
     else if (!pending.length) lines.push("Nothing to commit in the shared store.");
     else {
       const rel = relative(host.project.root, dir) || ".";
@@ -147,7 +151,24 @@ export async function git(host: Host, io: CommandIO, p: Parsed): Promise<void> {
     if (!store.switchToLfs()) return io.print("The shared store is read-only here.");
     return io.print("Future shared .loro files go to Git LFS (.gitattributes updated; history is not rewritten). Commit .pi/realctx2/.gitattributes. Your hosting provider's LFS quotas apply.");
   }
-  io.print("Usage: /realctx2 git install-hooks | /realctx2 git lfs");
+  if (sub === "fix-gitignore") {
+    const problem = checkSharedIgnored(host.project.root);
+    if (!problem) return io.print(".pi/realctx2/ is not ignored by git.");
+    if (!problem.fix) return io.print(describeIgnoreProblem(problem));
+    const detail = [
+      describeIgnoreProblem(problem),
+      "",
+      `Append to ${problem.fix.file}:`,
+      ...problem.fix.lines.map((l) => `  ${l}`),
+    ].join("\n");
+    const ok = await io.confirm("Fix .gitignore for .pi/realctx2/", detail);
+    if (!ok) return io.print("Cancelled; .gitignore was not changed.");
+    applyIgnoreFix(host.project.root, problem.fix);
+    const after = checkSharedIgnored(host.project.root);
+    if (after) return io.print(`Updated ${problem.fix.file}, but .pi/realctx2/ is still ignored:\n${describeIgnoreProblem(after)}`);
+    return io.print(`Updated ${problem.fix.file}: git now tracks .pi/realctx2/.`);
+  }
+  io.print("Usage: /realctx2 git install-hooks | /realctx2 git lfs | /realctx2 git fix-gitignore");
 }
 
 export async function uninstall(host: Host, io: CommandIO): Promise<void> {
