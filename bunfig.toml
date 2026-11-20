@@ -1,0 +1,4 @@
+[install]
+# pi provides its own packages (the @earendil-works/* peers) to extensions; installing them
+# here would give the extension a second copy. npm skips them through pi's --legacy-peer-deps.
+peer = false
