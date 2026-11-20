@@ -318,12 +318,12 @@ sequenceDiagram
 
 ### 4.1 Packaging
 
-- realctx2 ships as a pi package. Its `package.json` declares `"pi": { "extensions": ["./dist/index.js"] }`.
+- realctx2 ships as a pi package. Its `package.json` declares `"pi": { "extensions": ["./src/index.ts"] }`: pi loads TypeScript extensions itself, so the repository installs straight from git (`pi install https://github.com/WtzLAS/realctx2`) with no build step.
 - **Install it globally**, either in `~/.pi/agent/extensions/realctx2/` or through `settings.json` → `packages`. The plugin must reach the global and personal stores in every project. Project-local extensions also load only after the project is trusted.
 - The factory registers handlers and the command only. Following pi's rule, it starts no processes, timers or watchers. Those start in `session_start` and stop in an idempotent `session_shutdown`.
 - **Tools are registered in `session_start`**, not in the factory: pi's tool list can't be read while extensions load, so the name check (§8.1.3) can't run there. The check runs again at the first `before_agent_start`, once every extension has registered its tools.
 - **Tool parameters are plain JSON Schema.** realctx2 doesn't depend on `typebox`; the same definitions serve pi and the Claude Code MCP server.
-- **Build.** `dist/` is built by `npm run build`, which also generates the Claude Code skills (§4.6.1). The `prepare` script builds only when TypeScript is installed, so an install without dev dependencies (pi installs git sources with `--omit=dev`) doesn't fail; such an install needs a `dist/` built beforehand.
+- **Build (optional).** `npm run build` writes `dist/` for the package's `main` export and generates the Claude Code skills (§4.6.1). Nothing else needs it: the launchers for the worker and the MCP server run `dist/` when it exists and `src/` otherwise. The sources use only erasable TypeScript syntax, so Bun runs them as they are, and Node does with type stripping (default from 22.18; behind `--experimental-strip-types` from 22.6, which the launchers add). The `prepare` script builds only when TypeScript is installed, so installs without dev dependencies (pi installs git sources with `--omit=dev`) skip it.
 
 ```ts
 // src/adapters/pi/index.ts (signatures abbreviated)

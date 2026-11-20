@@ -12,9 +12,9 @@
     "realctx2-hook": "./realctx2-claude/bin/realctx2-hook.cjs",
     "realctx2-mcp": "./bin/realctx2-mcp.js"
   },
-  "files": ["dist", "bin", "realctx2-claude", "scripts", "docs", "README.md"],
+  "files": ["src", "dist", "bin", "realctx2-claude", "scripts", "docs", "README.md"],
   "keywords": ["pi-package", "pi-extension", "memory", "context"],
-  "pi": { "extensions": ["./dist/index.js"] },
+  "pi": { "extensions": ["./src/index.ts"] },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/gen-skills.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",

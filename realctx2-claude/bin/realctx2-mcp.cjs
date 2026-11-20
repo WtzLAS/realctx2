@@ -30,15 +30,11 @@ function candidates() {
   return out;
 }
 
-const root = candidates().find((dir) => fs.existsSync(path.join(dir, "dist", "adapters", "claude-code", "server.js")));
+// a built package, or a git checkout run from its sources
+const root = candidates().find((dir) => fs.existsSync(path.join(dir, "bin", "run-entry.cjs")) && (fs.existsSync(path.join(dir, "dist", "adapters", "claude-code", "server.js")) || fs.existsSync(path.join(dir, "src", "adapters", "claude-code", "server.ts"))));
 if (!root) {
-  process.stderr.write("realctx2: cannot find the realctx2 package (dist/adapters/claude-code/server.js). Install it with `npm i -g realctx2` or set REALCTX2_PACKAGE.\n");
+  process.stderr.write("realctx2: cannot find the realctx2 package (dist/ or src/adapters/claude-code/server). Install it, or set REALCTX2_PACKAGE.\n");
   process.exit(1);
 }
-import(pathToFileURL(path.join(root, "dist", "adapters", "claude-code", "server.js")).href)
-  .then((m) => m.main())
-  .then((code) => process.exit(code))
-  .catch((e) => {
-    process.stderr.write("realctx2: " + String((e && e.stack) || e) + "\n");
-    process.exit(1);
-  });
+const { entryFile, run } = require(path.join(root, "bin", "run-entry.cjs"));
+run(entryFile(root, "adapters/claude-code/server"), process.argv.slice(2));

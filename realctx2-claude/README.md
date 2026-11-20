@@ -8,11 +8,11 @@ extension of the same name, so both harnesses on one machine see the same memory
 
 ## Setup
 
-The plugin is part of the `realctx2` package and needs that package's built `dist/`:
+The plugin is part of the `realctx2` package and runs the package around it, built or not:
 
 ```bash
-cd /path/to/realctx2 && npm install        # builds dist/ and the skills
-claude --plugin-dir /path/to/realctx2/realctx2-claude
+git clone https://github.com/WtzLAS/realctx2 && cd realctx2 && npm install --omit=dev
+claude --plugin-dir "$PWD/realctx2-claude"
 ```
 
 If this directory is copied somewhere else, set `REALCTX2_PACKAGE` to the package directory, or

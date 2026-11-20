@@ -14,8 +14,9 @@ Context and memory management for agent harnesses, implemented from
 
 ## Requirements
 
-- Node 22.5 or newer (for `node:sqlite`), or Bun. pi 1.5 and Claude Code 2.1 are the versions
-  this was built and run against.
+- Node 22.18 or newer, or Bun. pi 1.5 and Claude Code 2.1 are the versions this was built and
+  run against. (Node 22.5 is enough for `node:sqlite`; running from source without a build needs
+  Node's type stripping, which is on by default from 22.18 and behind a flag from 22.6.)
 - git, for the shared scope and path tracking. Projects outside git get the global scope and
   `stat`-based path tracking.
 
@@ -28,21 +29,28 @@ npm test             # vitest: 16 files
 npm run build        # tsc → dist/, then scripts/gen-skills.mjs → realctx2-claude/skills/
 ```
 
-`dist/` is not checked in. The worker, the MCP server and the pi entry point all load from it,
-so build before using a checkout. One worker test runs the built `bin/realctx2-worker.js` and
-skips itself when `dist/` is missing.
+`dist/` is not checked in, and nothing needs it: pi loads the extension from `src/index.ts`, and
+the launchers in `bin/` (worker, MCP server) run `dist/` when it exists and `src/` otherwise.
+The sources use only erasable TypeScript syntax, so Bun and Node run them as they are. `dist/` is
+for the package's `main` export and for running on Node versions without type stripping. One
+worker test runs the built `bin/realctx2-worker.js` and skips itself when `dist/` is missing.
 
 ## Install
 
 **pi.** Install globally, so the global and personal stores are reachable in every project:
 
 ```bash
-pi install /path/to/realctx2        # or add the path to "packages" in ~/.pi/agent/settings.json
-pi -e /path/to/realctx2/dist/index.js   # one run, without installing
+pi install https://github.com/WtzLAS/realctx2      # or git:github.com/WtzLAS/realctx2@<ref>
+pi install /path/to/realctx2                      # a local checkout
+pi -e https://github.com/WtzLAS/realctx2          # one run, without installing
 ```
 
-**Claude Code.** The plugin directory is `realctx2-claude/` inside this package. It finds the
-package's `dist/` next to it, through `REALCTX2_PACKAGE`, or in the global `node_modules`.
+pi clones the repository and installs its runtime dependencies (`loro-crdt`, `picomatch`); no
+build step runs. `pi update --extensions` pulls new commits.
+
+**Claude Code.** The plugin directory is `realctx2-claude/` inside this package. It runs the
+package next to it (from `dist/` or `src/`), the one `REALCTX2_PACKAGE` names, or one in the
+global `node_modules`. A pi git install works too: point `--plugin-dir` at its `realctx2-claude/`.
 
 ```bash
 claude --plugin-dir /path/to/realctx2/realctx2-claude
