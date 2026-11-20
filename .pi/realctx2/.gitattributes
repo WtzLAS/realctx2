@@ -1,0 +1,3 @@
+# realctx2 shared memory store: files are immutable and merged by realctx2, never by git (§7.4).
+*.loro binary linguist-generated=true
+snapshots/*.json linguist-generated=true
