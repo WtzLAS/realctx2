@@ -17,6 +17,8 @@ import { Host, type HostOptions } from "../../core/host.ts";
 import type { AuxSessionRunner, CommandIO, ToolResultPayload } from "../../core/types.ts";
 import type { PathEvent } from "../../memory/delivery.ts";
 import { AUX_TOOL_KEYS, buildTools, type ToolKey, toolNames } from "../../tools/index.ts";
+import { raceTimeout } from "../../util/async.ts";
+import { errMsg } from "../../util/errors.ts";
 import { existsSync, readJson, removeFile, writeJson } from "../../util/fs.ts";
 import { clipTokens } from "../../util/text.ts";
 import { checkAuxBash } from "../guard.ts";
@@ -31,9 +33,9 @@ import { SessionLog } from "./state.ts";
 import { TranscriptReader } from "./transcript.ts";
 
 /** Claude Code caps each `additionalContext` string at 10,000 characters. */
-export const CONTEXT_CAP = 9500;
+const CONTEXT_CAP = 9500;
 /** SessionStart hooks registered for `compact`: one for the prompt section, the rest for the injected state. */
-export const INJECTION_PARTS = 4;
+const INJECTION_PARTS = 4;
 
 const OWN_TOOL = /^mcp__(?:plugin_[A-Za-z0-9_-]*_)?realctx2__(.+)$/;
 
@@ -173,7 +175,7 @@ export class ClaudeServer {
       const batch = await s.host.shutdown({ spawnWorker });
       for (const r of batch.records) s.log.append(r);
     } catch (e) {
-      s.host.telemetry.event("cc.shutdown_failed", { error: String((e as Error).message ?? e) });
+      s.host.telemetry.event("cc.shutdown_failed", { error: errMsg(e) });
     }
   }
 
@@ -265,7 +267,7 @@ export class ClaudeServer {
         }
       }
     } catch (e) {
-      host.telemetry.event("cc.settings_failed", { error: String((e as Error).message ?? e) });
+      host.telemetry.event("cc.settings_failed", { error: errMsg(e) });
     }
   }
 
@@ -354,7 +356,7 @@ export class ClaudeServer {
 
   private failOpen(where: string, e: unknown): null {
     try {
-      this.session?.host.telemetry.event("cc.hook_failed", { where, error: String((e as Error)?.message ?? e) });
+      this.session?.host.telemetry.event("cc.hook_failed", { where, error: errMsg(e) });
     } catch {
       // nothing left to do
     }
@@ -538,7 +540,7 @@ export class ClaudeServer {
 
       case "PreCompact": {
         // finish pending shadow consolidations, so the injection after compaction is complete
-        await Promise.race([engine.onIdle().then(() => engine.settleBackground()), new Promise((r) => setTimeout(r, 20_000))]).catch(() => undefined);
+        await raceTimeout(engine.onIdle().then(() => engine.settleBackground()), 20_000).catch(() => undefined);
         return null;
       }
 

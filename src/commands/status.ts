@@ -10,6 +10,7 @@ import { OPERATORS } from "../memory/policy.ts";
 import { describeRecovery } from "../storage/recover.ts";
 import { REALCTX2_VERSION } from "../storage/schema.ts";
 import { sharedGitattributes } from "../storage/store.ts";
+import { errMsg } from "../util/errors.ts";
 import { existsSync, listFiles, readJsonl } from "../util/fs.ts";
 import { runSync } from "../util/git.ts";
 import { checkSharedIgnored, describeIgnoreProblem } from "../util/gitignore.ts";
@@ -266,7 +267,7 @@ export async function doctor(host: Host, io: CommandIO): Promise<void> {
   else if (host.http) {
     const res = await host.http.decide("doctor probe: the sky is blue.", [{ kind: "binary", name: "probe", instructions: "Does the text mention a color?" }], { callSite: "doctor", timeoutMs: 8000, noRetry: true }).then(
       (a) => (a.probe?.p !== undefined ? null : "the answer had no probability for the probe question"),
-      (e: unknown) => String((e as Error).message ?? e),
+      (e: unknown) => errMsg(e),
     );
     if (res) error(`Decision model ${h.decision.model} (${h.decision.format}): ${res}`);
     else ok(`Decision model ${h.decision.model} (${h.decision.format}) answers.`);

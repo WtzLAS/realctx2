@@ -4,9 +4,10 @@
  * schedule, and semantic checks before any operator commits.
  */
 import { join } from "node:path";
-import type { DecisionQuestion, MemoryEdge, MemoryNode, Relation, ScopedNode, ScopeName } from "../core/types.ts";
+import type { DecisionQuestion, MemoryEdge, MemoryNode, Relation, ScopeName } from "../core/types.ts";
 import { RELATIONS } from "../core/types.ts";
 import { binaryP, choiceProbs } from "../providers/decision.ts";
+import { errMsg } from "../util/errors.ts";
 import { appendJsonl, readJsonl, writeFileAtomic } from "../util/fs.ts";
 import { clamp, daysBetween, sanitize, trigramJaccard } from "../util/text.ts";
 import type { Lifecycle } from "./lifecycle.ts";
@@ -792,7 +793,7 @@ export class Evolution {
         else if (action.operator === "bridge") result = await this.bridge(scope, cands.bridge[action.candidate]!, action, signal);
         else result = await this.reframe(scope, cands.reframe[action.candidate]!, action, signal);
       } catch (e) {
-        result = { committed: false, detail: `${action.operator}: ${String((e as Error).message)}` };
+        result = { committed: false, detail: `${action.operator}: ${errMsg(e)}` };
       }
     }
     let U = NON_COMMIT_U;

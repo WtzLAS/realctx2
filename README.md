@@ -25,7 +25,7 @@ Context and memory management for agent harnesses, implemented from
 ```bash
 npm install          # builds dist/ and the Claude Code skills through `prepare`
 npm run typecheck
-npm test             # vitest: 16 files
+npm test             # vitest (test/*.test.ts)
 npm run build        # tsc → dist/, then scripts/gen-skills.mjs → realctx2-claude/skills/
 ```
 

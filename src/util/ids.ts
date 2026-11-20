@@ -19,10 +19,6 @@ export function freshId8(taken: (id: string) => boolean): string {
   throw new Error("could not draw a free id");
 }
 
-export function formatId(type: IdType, id: string): string {
-  return `${type}:${id}`;
-}
-
 export function bracket(type: IdType, id: string): string {
   return `[${type}:${id}]`;
 }

@@ -298,7 +298,7 @@ describe("Palim (§5.4)", () => {
     // warm cache: Δ̂·p_read·R̂ = 0.65·span·0.1·20 = 1.3·span never covers re-caching the suffix plus the aux call
     expect(log.filter((t) => t.role === "palim")).toEqual([]);
     expect(s.engine.status().foldsSkippedByCost).toBeGreaterThan(0);
-    const folds = () => (s.engine as unknown as { foldJobs: Map<string, { kind: string; done: boolean }> }).foldJobs;
+    const folds = () => s.engine.palim.jobs;
     // with the aux model priced like the main model, the fold does not pay off even on a cold cache
     await s.engine.onIdle();
     await s.drain();
@@ -747,7 +747,8 @@ describe("memory in the loop", () => {
     expect(facts.length).toBe(2);
     expect(s.engine.state.records.get(record.id)!.knowledge!.every((k) => typeof k.memoryId === "string")).toBe(true);
     expect(await s.engine.idleHarvest()).toBe(0);
-    expect(s.engine.leftover()).toEqual([]);
+    // nothing is left for a queued idle-harvest job (what `Host.shutdown` would enqueue)
+    expect([...s.engine.state.records.values()].filter((r) => r.kind === "precip" && !r.knowledge && !s.engine.state.parentOf(r.id))).toEqual([]);
     mem.shutdown();
   });
 
@@ -849,19 +850,19 @@ describe("memory in the loop", () => {
       now: new Date(w.now.t).toISOString(),
     })!;
     expect(coldPlan).toBeTruthy();
-    (s.engine as any).foldJobs.set("cold:0", { key: "cold:0", kind: "cold", level: 0, done: true, plan: coldPlan, promise: Promise.resolve() });
+    s.engine.palim.jobs.set("cold:0", { key: "cold:0", kind: "cold", level: 0, done: true, plan: coldPlan, promise: Promise.resolve(coldPlan), startedRound: s.engine.round });
     (s.engine as any).lastRequestAt = w.now.t;
 
     // At +600s (past global 300s default, but below model override 3600s): cache is still warm -> no fold applied
     w.now.t += 600_000;
     expect(await s.engine.onContext()).toBeNull();
-    expect((s.engine as any).foldJobs.has("cold:0")).toBe(true);
+    expect(s.engine.palim.jobs.has("cold:0")).toBe(true);
 
     // At +3601s from lastRequestAt: cache is cold under the model override -> cold fold is applied
     (s.engine as any).lastRequestAt = w.now.t - 3_601_000;
     const edits = await s.engine.onContext();
     expect(edits).not.toBeNull();
-    expect((s.engine as any).foldJobs.has("cold:0")).toBe(false);
+    expect(s.engine.palim.jobs.has("cold:0")).toBe(false);
   });
 
   it("closes orphaned tool calls once a later non-result entry follows, without stalling working tail or alignment", () => {
@@ -928,20 +929,20 @@ describe("memory in the loop", () => {
       model: "test/main",
       now: new Date(w.now.t).toISOString(),
     })!;
-    (s.engine as any).foldJobs.set("cold:0", { key: "cold:0", kind: "cold", level: 0, done: true, plan: coldPlan, promise: Promise.resolve() });
+    s.engine.palim.jobs.set("cold:0", { key: "cold:0", kind: "cold", level: 0, done: true, plan: coldPlan, promise: Promise.resolve(coldPlan), startedRound: s.engine.round });
     (s.engine as any).lastRequestAt = w.now.t;
 
     // 10 minutes pass since lastRequestAt, but the harness kept the cache warm 30s ago -> stay warm
     w.now.t += 600_000;
     s.h.lastCacheWriteAt = () => w.now.t - 30_000;
     expect(await s.engine.onContext()).toBeNull();
-    expect((s.engine as any).foldJobs.has("cold:0")).toBe(true);
+    expect(s.engine.palim.jobs.has("cold:0")).toBe(true);
 
     // Once the cache_warm refresh is older than TTL (301s), the cold fold applies
     (s.engine as any).lastRequestAt = w.now.t - 600_000;
     s.h.lastCacheWriteAt = () => w.now.t - 301_000;
     const edits = await s.engine.onContext();
     expect(edits).not.toBeNull();
-    expect((s.engine as any).foldJobs.has("cold:0")).toBe(false);
+    expect(s.engine.palim.jobs.has("cold:0")).toBe(false);
   });
 });

@@ -26,7 +26,7 @@ export interface MemoryServices {
   actorId: string;
 }
 
-/** Decision timeouts by call site (§9.1.5). */
-export const TIMEOUTS = { janus: 30_000, gate: 1500, routing: 5000, conflict: 5000, attribution: 10_000, teacher: 10_000, check: 10_000 } as const;
+/** Decision timeouts by call site (§9.1.5). Janus's is configurable: `janus.timeoutMs`. */
+export const TIMEOUTS = { gate: 1500, routing: 5000, conflict: 5000, attribution: 10_000, teacher: 10_000, check: 10_000 } as const;
 /** Stricter thresholds for uncalibrated (aux-emulated) answers (§9.1.4). */
 export const UNCALIBRATED = { tauClose: 0.9, sharedRouting: 0.95, proactiveGate: 0.7 } as const;

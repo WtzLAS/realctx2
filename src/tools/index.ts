@@ -3,6 +3,7 @@
  * hands them to `registerTool`, the Claude Code adapter to its MCP server.
  */
 import type { JSONSchema, ToolCallContext, ToolDef, ToolResultPayload } from "../core/types.ts";
+import { errMsg } from "../util/errors.ts";
 import { AUX_TOOL_KEYS, fail, TOOL_KEYS, type ToolEnv, type ToolKey, toolNames } from "./env.ts";
 import { runInspect } from "./inspect.ts";
 import { runForget, runRemember } from "./memwrite.ts";
@@ -158,8 +159,8 @@ export function buildTools(getEnv: () => ToolEnv | null, cfg: ToolEnv["cfg"], op
         try {
           return await RUNNERS[key](env, params ?? {}, call);
         } catch (e) {
-          env.memory?.telemetry?.event("tool.failed", { tool: key, error: String((e as Error).message ?? e) });
-          return fail(`${names[key]} failed: ${String((e as Error).message ?? e)}`);
+          env.memory?.telemetry?.event("tool.failed", { tool: key, error: errMsg(e) });
+          return fail(`${names[key]} failed: ${errMsg(e)}`);
         }
       },
     };

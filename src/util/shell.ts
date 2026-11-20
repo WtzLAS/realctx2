@@ -10,8 +10,6 @@ export interface ShellPart {
   redirects: Array<{ op: string; target: string }>;
 }
 
-const SEPARATORS = new Set([";", "&&", "||", "|", "&", "|&", "\n", "(", ")", "{", "}"]);
-
 /** Split a command line into simple commands. */
 export function parseShell(line: string): ShellPart[] {
   const parts: ShellPart[] = [];
@@ -162,7 +160,7 @@ const ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const WRAPPERS = new Set(["sudo", "command", "exec", "time", "nohup", "nice", "builtin"]);
 
 /** Strip leading env assignments, `env`, and transparent wrappers. */
-export function stripPrefix(words: string[]): string[] {
+function stripPrefix(words: string[]): string[] {
   let w = [...words];
   for (;;) {
     while (w.length && ASSIGN.test(w[0]!)) w = w.slice(1);

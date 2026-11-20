@@ -163,7 +163,7 @@ export const AUX_ROLES: Array<{ role: AuxRole; label: string; description: strin
   { role: "decision.emulate", label: "decision.emulate", description: "Emulates decision-model probability answers when no decision endpoint is available. Runs single-turn without tools.", transcriptOnly: true },
 ];
 
-export const THINKING_OPTIONS: EnumOption[] = [
+const THINKING_OPTIONS: EnumOption[] = [
   { value: "off", label: "off", description: "No reasoning tokens (fastest, runs at temperature 0)" },
   { value: "minimal", label: "minimal", description: "Very brief reasoning (~1k tokens)" },
   { value: "low", label: "low", description: "Light reasoning (~2k tokens)" },
@@ -294,7 +294,7 @@ export function maskSecret(value: string | undefined): string {
   return `••••${value.slice(-4)}`;
 }
 
-export function formatBytes(bytes: number): string {
+function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes)) return String(bytes);
   if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(bytes % 1024 ** 3 === 0 ? 0 : 1)} GiB`;
   if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(bytes % 1024 ** 2 === 0 ? 0 : 1)} MiB`;
@@ -519,7 +519,7 @@ function defaultEmbeddingEndpoint(kind: "late" | "dense"): EmbeddingProviderConf
     : { url: "", model: "", kind: "dense", dimensions: 1024, batchSize: 128, transport: "embeddings" };
 }
 
-export function buildDecisionEndpointScreen(cfg: Config, ctx?: SettingsDisplayContext): SettingScreenSpec {
+function buildDecisionEndpointScreen(cfg: Config, ctx?: SettingsDisplayContext): SettingScreenSpec {
   const d = cfg.providers.decision;
   const h = ctx?.health?.decision;
   const authNote = d ? ` · Auth: ${describeEndpointAuth(d).summary}` : "";
@@ -679,7 +679,7 @@ export function buildDecisionEndpointScreen(cfg: Config, ctx?: SettingsDisplayCo
   };
 }
 
-export function buildEmbeddingEndpointScreen(kind: "late" | "dense", cfg: Config, ctx?: SettingsDisplayContext): SettingScreenSpec {
+function buildEmbeddingEndpointScreen(kind: "late" | "dense", cfg: Config, ctx?: SettingsDisplayContext): SettingScreenSpec {
   const basePath = `providers.embedding.${kind}`;
   const ep = cfg.providers.embedding[kind];
   const labelTitle = kind === "late" ? "Late-Interaction Embedding Endpoint" : "Dense Embedding Endpoint";
@@ -921,7 +921,7 @@ export function buildEmbeddingEndpointScreen(kind: "late" | "dense", cfg: Config
   };
 }
 
-export function buildAuxRoleScreen(harness: "pi" | "claudeCode", role: AuxRole, cfg: Config): SettingScreenSpec {
+function buildAuxRoleScreen(harness: "pi" | "claudeCode", role: AuxRole, cfg: Config): SettingScreenSpec {
   const roleMeta = AUX_ROLES.find((r) => r.role === role)!;
   const baseDefaults = ROLE_DEFAULTS[role];
   const basePath = `providers.aux.${harness}.roles.${role}`;
@@ -1007,7 +1007,7 @@ function summarizeRole(harness: "pi" | "claudeCode", role: AuxRole, cfg: Config)
   return `default (${base.thinking}, ${base.maxTurns}t, ${Math.round(base.timeoutMs / 1000)}s)`;
 }
 
-export function buildAuxHarnessScreen(harness: "pi" | "claudeCode", cfg: Config): SettingScreenSpec {
+function buildAuxHarnessScreen(harness: "pi" | "claudeCode", cfg: Config): SettingScreenSpec {
   const basePath = `providers.aux.${harness}`;
   const isPi = harness === "pi";
   return {

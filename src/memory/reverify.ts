@@ -92,7 +92,7 @@ export function mechanicalChange(before: string, after: string): boolean {
 }
 
 /** Unified diff of two texts through `git diff --no-index` (the new content need not be in git). */
-export function diffText(before: string, after: string, label: string): string {
+function diffText(before: string, after: string, label: string): string {
   if (before === after) return "";
   const dir = mkdtempSync(join(tmpdir(), "realctx2-diff-"));
   try {

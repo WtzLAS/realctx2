@@ -10,6 +10,7 @@ import { agentDir, claudeDir } from "../core/config.ts";
 import type { CommandIO, DecisionQuestion, Kind, MemoryNode, PathAnchor, ScopedNode, ScopeName, Severity, TriggerAction, Urgency } from "../core/types.ts";
 import { binaryP, choiceProbs } from "../providers/decision.ts";
 import type { SourceSection } from "../storage/schema.ts";
+import { errMsg } from "../util/errors.ts";
 import { ensureDir, removeFile, writeFileAtomic } from "../util/fs.ts";
 import { globCompiles } from "../util/glob.ts";
 import { estimateTokens, makeTitle, sanitize, sha256, verifyQuote } from "../util/text.ts";
@@ -658,7 +659,7 @@ export class Instructions {
       try {
         plans.push(await this.planFile(f, opts.signal));
       } catch (e) {
-        problems.push(`${f.display}: ${String((e as Error).message)}`);
+        problems.push(`${f.display}: ${errMsg(e)}`);
       }
     }
     await this.judge(plans, opts.signal);

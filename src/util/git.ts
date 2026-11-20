@@ -1,6 +1,5 @@
 import { execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
 
 export interface ExecResult {
   code: number;
@@ -198,14 +197,6 @@ function parseRenames(stdout: string): Array<{ from: string; to: string }> {
 export function blobHash(content: Uint8Array | string): string {
   const buf = typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content);
   return createHash("sha1").update(`blob ${buf.length}\0`).update(buf).digest("hex");
-}
-
-export function fileBlobHash(absPath: string): string | null {
-  try {
-    return blobHash(readFileSync(absPath));
-  } catch {
-    return null;
-  }
 }
 
 /** Content fingerprint for move detection without git: a set of hashed line shingles. */

@@ -2,7 +2,7 @@
 import type { Config } from "../core/config.ts";
 import { type DecisionAnswer, type DecisionQuestion, type Kind, type MemoryNode, type PathAnchor, type Severity, type Urgency, URGENCY_ORDER } from "../core/types.ts";
 
-export const URGENCY_DESCRIPTIONS: Record<Urgency, string> = {
+const URGENCY_DESCRIPTIONS: Record<Urgency, string> = {
   immediate:
     "The agent must know this before it acts. Learning it from the tool result afterwards would cause harm or work that is hard to undo: editing generated files, destructive or irreversible commands, migrations, publishing.",
   hint: "The full text helps when the agent touches this path or runs this command, and acting on it afterwards is cheap.",

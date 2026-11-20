@@ -29,7 +29,7 @@ export function captionLine(ref: ScopedNode): string {
   return `${mid(ref.node)} ${ref.node.title || ref.node.text.split("\n")[0]}`;
 }
 
-export function cardHeader(ref: ScopedNode, graph: MemoryGraph, paths?: PathTracker): string {
+function cardHeader(ref: ScopedNode, graph: MemoryGraph, paths?: PathTracker): string {
   const n = ref.node;
   const parts = [scopeLabel(ref.scope), n.layer === "long" ? "long-term" : "short-term"];
   if (n.kind !== "fact") parts.push(n.kind === "rule" && n.severity ? `rule ${n.severity.toUpperCase()}` : n.kind);

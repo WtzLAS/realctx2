@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { restoreClaudeSettings } from "../adapters/claude-code/settings.ts";
 import type { Host } from "../core/host.ts";
 import type { CommandIO, ScopeName } from "../core/types.ts";
+import { errMsg } from "../util/errors.ts";
 import { ensureDir, existsSync } from "../util/fs.ts";
 import { applyIgnoreFix, checkSharedIgnored, describeIgnoreProblem } from "../util/gitignore.ts";
 import { type Parsed, num } from "./args.ts";
@@ -101,7 +102,7 @@ export async function compact(host: Host, io: CommandIO, p: Parsed): Promise<voi
         lines.push(`${scope}: ${before.updates} update file(s) and ${before.snapshots} snapshot(s) → ${after.updates} and ${after.snapshots} (${num(before.updateBytes + before.snapshotBytes)} → ${num(after.updateBytes + after.snapshotBytes)} bytes).`);
       } else lines.push(`${scope}: nothing to compact${store.readOnly ? " (read-only)" : ""}.`);
     } catch (e) {
-      lines.push(`${scope}: compaction failed: ${String((e as Error).message ?? e)}`);
+      lines.push(`${scope}: compaction failed: ${errMsg(e)}`);
     }
   }
   io.print(lines.join("\n") || "No stores.");

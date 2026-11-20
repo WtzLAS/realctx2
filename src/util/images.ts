@@ -27,7 +27,7 @@ export interface ImageCost {
 }
 
 /** The largest image pi sends by default (its auto-resize bound). */
-export const PI_MAX_IMAGE = 2000;
+const PI_MAX_IMAGE = 2000;
 
 export interface ImageModel {
   provider?: string;
@@ -190,7 +190,7 @@ function fingerprint(data: string): string {
   return `${data.length}:${data.slice(0, 48)}:${data.slice(mid, mid + 32)}:${data.slice(-48)}`;
 }
 
-export function cachedImageSize(data: string): ImageSize | undefined {
+function cachedImageSize(data: string): ImageSize | undefined {
   if (typeof data !== "string") return undefined;
   const key = fingerprint(data);
   const hit = sizeCache.get(key);

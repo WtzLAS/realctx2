@@ -10,6 +10,7 @@ import type { MemoryRuntime } from "../memory/runtime.ts";
 import { memoryWorth, strengthAt, useSignals, worthClass } from "../memory/strength.ts";
 import { capUrgency, hasTrigger, violationsAtLevel } from "../memory/urgency.ts";
 import { anchorKey } from "../storage/schema.ts";
+import { errMsg } from "../util/errors.ts";
 import { globCompiles } from "../util/glob.ts";
 import { parseIdLoose } from "../util/ids.ts";
 import { contentHash, makeTitle, sanitize } from "../util/text.ts";
@@ -31,7 +32,7 @@ function flushNow(mem: MemoryRuntime, scope?: ScopeName): void {
   try {
     mem.graph.flush({ scopes: scope ? [scope] : undefined, keepPurges: true });
   } catch (e) {
-    mem.telemetry?.event("flush.failed", { error: String((e as Error).message ?? e) });
+    mem.telemetry?.event("flush.failed", { error: errMsg(e) });
   }
 }
 

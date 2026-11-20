@@ -88,7 +88,7 @@ function messageShape(m: AgentMessage, imgCost: ImageCost): Shape | null {
 }
 
 /** The raw contribution of a session entry, before any context edit. Null for state-only entries. */
-export function rawShape(entry: SessionEntry, imgCost: ImageCost = GENERIC_IMAGE_COST): Shape | null {
+function rawShape(entry: SessionEntry, imgCost: ImageCost = GENERIC_IMAGE_COST): Shape | null {
   switch (entry.type) {
     case "message":
       return messageShape(entry.message, imgCost);

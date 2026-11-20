@@ -29,7 +29,7 @@ const FAMILIES: Record<string, ToolFamily> = {
   LS: "list",
 };
 
-export function toolFamily(name: string): ToolFamily | undefined {
+function toolFamily(name: string): ToolFamily | undefined {
   return FAMILIES[name];
 }
 

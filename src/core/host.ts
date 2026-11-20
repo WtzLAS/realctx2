@@ -14,6 +14,7 @@ import type { Candidate } from "../memory/write.ts";
 import { EmulatedDecisionClient, type FetchLike, HttpDecisionClient, ResilientDecisionClient } from "../providers/decision.ts";
 import { createEmbeddingClients } from "../providers/embedding.ts";
 import { buildTools, promptSection, type ToolEnv, type ToolKey } from "../tools/index.ts";
+import { errMsg } from "../util/errors.ts";
 import { ensureDir } from "../util/fs.ts";
 import { warmModelCatalog } from "./catalog.ts";
 import { type Config, type DecisionProviderConfig, Layout, loadConfig, type ProjectOverrideReport } from "./config.ts";
@@ -148,7 +149,7 @@ export class Host {
       });
     } catch (e) {
       // context management still works without the stores
-      this.memoryError = String((e as Error).message ?? e);
+      this.memoryError = errMsg(e);
       this.problems.push(`memory stores could not be opened: ${this.memoryError}`);
       this.telemetry.event("memory.open_failed", { error: this.memoryError });
     }
@@ -262,7 +263,7 @@ export class Host {
       try {
         this.probes[kind] = await c.probe();
       } catch (e) {
-        this.probes[kind] = { ok: false, problem: String((e as Error).message ?? e) };
+        this.probes[kind] = { ok: false, problem: errMsg(e) };
       }
       if (this.probes[kind] && !this.probes[kind]!.ok) this.telemetry.event("embedding.probe_failed", { kind, problem: this.probes[kind]!.problem });
     };
@@ -347,20 +348,21 @@ export class Host {
     this.noteInput();
     const abort = new AbortController();
     this.idleAbort = abort;
-    const first = this.engine.onIdle(abort.signal).catch((e) => this.telemetry.event("idle.engine_failed", { error: String((e as Error).message ?? e) }));
+    const first = this.engine.onIdle(abort.signal).catch((e) => this.telemetry.event("idle.engine_failed", { error: errMsg(e) }));
     this.idleRunning = first.then(() => undefined);
     const wait = Math.max(0, this.cfg.maintenance.idleMinutes) * 60_000;
     this.idleTimer = setTimeout(() => {
       this.idleTimer = null;
       if (abort.signal.aborted || this.closed) return;
-      this.idleRunning = this.maintain({ signal: abort.signal }).then(() => undefined, () => undefined);
+      // maintenance follows the engine's idle step, never runs beside it, and `settle()` waits for both
+      this.idleRunning = first.then(() => (abort.signal.aborted || this.closed ? undefined : this.maintain({ signal: abort.signal }))).then(() => undefined, () => undefined);
     }, wait);
     // never keep the process alive for maintenance
     (this.idleTimer as { unref?: () => void }).unref?.();
   }
 
   /** Model-dependent maintenance in this process (idle time, or `/realctx2 maintain`). */
-  async maintain(opts: { signal?: AbortSignal; force?: boolean; scopes?: Parameters<MemoryRuntime["idle"]>[0] extends infer O ? (O extends { scopes?: infer S } ? S : never) : never } = {}): Promise<{ harvested: number; idle: Awaited<ReturnType<MemoryRuntime["idle"]>> | null }> {
+  async maintain(opts: { signal?: AbortSignal; force?: boolean; scopes?: NonNullable<Parameters<MemoryRuntime["idle"]>[0]>["scopes"] } = {}): Promise<{ harvested: number; idle: Awaited<ReturnType<MemoryRuntime["idle"]>> | null }> {
     const mem = this.memory;
     if (!mem) return { harvested: 0, idle: null };
     let harvested = 0;
@@ -368,7 +370,7 @@ export class Host {
       harvested += await this.engine.idleHarvest(opts.signal);
       harvested += await this.queuedHarvests(opts.signal);
     } catch (e) {
-      this.telemetry.event("idle.harvest_failed", { error: String((e as Error).message ?? e) });
+      this.telemetry.event("idle.harvest_failed", { error: errMsg(e) });
     }
     if (opts.signal?.aborted) return { harvested, idle: null };
     const idle = await mem.idle({ signal: opts.signal, force: opts.force, scopes: opts.scopes });
@@ -428,7 +430,7 @@ export class Host {
     try {
       batch = await this.engine.onShutdown({ reload: opts.reload });
     } catch (e) {
-      this.telemetry.event("shutdown.engine_failed", { error: String((e as Error).message ?? e) });
+      this.telemetry.event("shutdown.engine_failed", { error: errMsg(e) });
     }
     this.closed = true;
     const mem = this.memory;
@@ -442,7 +444,7 @@ export class Host {
           if (mem.reverifier.pending({ sessionEnding: true }).groups.length) mem.enqueue({ kind: "reverify", sessionId: this.sessionId });
         }
       } catch (e) {
-        this.telemetry.event("shutdown.queue_failed", { error: String((e as Error).message ?? e) });
+        this.telemetry.event("shutdown.queue_failed", { error: errMsg(e) });
       }
       if (!opts.reload) {
         const deliveries = this.engine.state.deliveries.filter((d) => !d.subagent);
@@ -463,7 +465,7 @@ export class Host {
       try {
         mem.shutdown({ requests: s.requests });
       } catch (e) {
-        this.telemetry.event("shutdown.memory_failed", { error: String((e as Error).message ?? e) });
+        this.telemetry.event("shutdown.memory_failed", { error: errMsg(e) });
       }
       if (opts.spawnWorker !== false && !opts.reload && !this.light) this.spawnWorker();
     }
@@ -483,7 +485,7 @@ export class Host {
       child.unref();
       return true;
     } catch (e) {
-      this.telemetry.event("worker.spawn_failed", { error: String((e as Error).message ?? e) });
+      this.telemetry.event("worker.spawn_failed", { error: errMsg(e) });
       return false;
     }
   }

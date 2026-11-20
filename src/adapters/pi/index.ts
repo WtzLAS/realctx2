@@ -15,6 +15,7 @@ import { SUBCOMMANDS } from "../../commands/index.ts";
 import type { PendingDelivery } from "../../context/engine.ts";
 import type { PathEvent } from "../../memory/delivery.ts";
 import { PROMPT_SECTION_ID, RULES_SECTION_ID, type ToolKey } from "../../tools/index.ts";
+import { errMsg } from "../../util/errors.ts";
 import { pathEventOf, resultPathEventOf } from "../pathevents.ts";
 import { loadAnySession } from "../sessions.ts";
 import { type Draft, PiAdapter, STATUS_KEY } from "./adapter.ts";
@@ -115,7 +116,7 @@ class PiExtension {
 
   private fail(where: string, err: unknown): void {
     try {
-      this.host?.telemetry.event("pi.handler_failed", { handler: where, error: String((err as Error)?.message ?? err) });
+      this.host?.telemetry.event("pi.handler_failed", { handler: where, error: errMsg(err) });
     } catch {
       // nothing left to do
     }
@@ -190,7 +191,7 @@ class PiExtension {
           }
           return { ...base, answers, stopReason: "stop" as const };
         } catch (e) {
-          return { ...base, answers: {}, stopReason: options?.signal?.aborted ? ("aborted" as const) : ("error" as const), errorMessage: String((e as Error).message ?? e) };
+          return { ...base, answers: {}, stopReason: options?.signal?.aborted ? ("aborted" as const) : ("error" as const), errorMessage: errMsg(e) };
         }
       };
       this.pi.registerProvider(DECISION_PROVIDER, {
@@ -659,7 +660,7 @@ class PiExtension {
           await this.onCommand(args, ctx);
         } catch (e) {
           this.fail("command", e);
-          await this.showReport(ctx, "realctx2 error", `/realctx2 failed: ${String((e as Error).message ?? e)}`, { tone: "error" });
+          await this.showReport(ctx, "realctx2 error", `/realctx2 failed: ${errMsg(e)}`, { tone: "error" });
         }
       },
     });

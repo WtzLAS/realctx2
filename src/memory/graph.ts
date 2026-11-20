@@ -10,6 +10,7 @@ import type { Clock, MemoryEdge, MemoryNode, PathAnchor, Relation, ScopedNode, S
 import { MemoryIndex } from "../storage/index.ts";
 import type { ScopeDoc } from "../storage/schema.ts";
 import { ScopeStore } from "../storage/store.ts";
+import { errMsg } from "../util/errors.ts";
 import { freshId8, parseId } from "../util/ids.ts";
 
 export interface ScopeHandle {
@@ -33,10 +34,10 @@ export interface GraphOptions {
 }
 
 /** Precedence when facts conflict: more specific and more private wins (§6.1). */
-export const SCOPE_PRECEDENCE: ScopeName[] = ["personal", "shared", "global"];
+const SCOPE_PRECEDENCE: ScopeName[] = ["personal", "shared", "global"];
 
 /** Where an edge stored in `src` scope may point (§6.1). */
-export function edgeAllowed(src: ScopeName, dst: ScopeName): boolean {
+function edgeAllowed(src: ScopeName, dst: ScopeName): boolean {
   if (src === "personal") return true;
   return src === dst;
 }
@@ -98,7 +99,7 @@ export class MemoryGraph {
           index = new MemoryIndex(layout.indexFile(storeId), { fdeDims: cfg.index.lateInteraction.fdeDims, fdeQuant: cfg.index.lateInteraction.fdeQuant });
           index.sync(store.sd, store.versionKey());
         } catch (e) {
-          this.opts.telemetry?.event("index.open_failed", { scope: name, error: String((e as Error).message) });
+          this.opts.telemetry?.event("index.open_failed", { scope: name, error: errMsg(e) });
           index = null;
         }
       }
@@ -111,8 +112,8 @@ export class MemoryGraph {
         }),
       );
     } catch (e) {
-      this.opts.telemetry?.event("store.open_failed", { scope: name, error: String((e as Error).message) });
-      if (name === "shared") this.sharedHidden = `shared store failed to open: ${(e as Error).message}`;
+      this.opts.telemetry?.event("store.open_failed", { scope: name, error: errMsg(e) });
+      if (name === "shared") this.sharedHidden = `shared store failed to open: ${errMsg(e)}`;
     }
   }
 
@@ -385,7 +386,7 @@ export class MemoryGraph {
     try {
       h.index.sync(h.store.sd, h.store.versionKey());
     } catch (e) {
-      this.opts.telemetry?.event("index.sync_failed", { scope, error: String((e as Error).message) });
+      this.opts.telemetry?.event("index.sync_failed", { scope, error: errMsg(e) });
     }
   }
 
@@ -400,23 +401,26 @@ export class MemoryGraph {
       try {
         if (h.store.refresh()) changed = true;
       } catch (e) {
-        this.opts.telemetry?.event("store.refresh_failed", { scope: h.name, error: String((e as Error).message) });
+        this.opts.telemetry?.event("store.refresh_failed", { scope: h.name, error: errMsg(e) });
       }
     }
     return changed;
   }
 
-  /** Flush every scope. `force` also flushes buffered shared counter deltas (`/realctx2 share`). */
-  flush(opts: { force?: boolean; scopes?: ScopeName[]; keepPurges?: boolean } = {}): Array<{ scope: ScopeName; kind: string; file: string | null; bytes: number }> {
+  /**
+   * Flush every scope. `force` also flushes buffered shared counter deltas (`/realctx2 share`);
+   * `wait: false` defers a scope whose store lock another process holds (`ScopeStore.flush`).
+   */
+  flush(opts: { force?: boolean; scopes?: ScopeName[]; keepPurges?: boolean; wait?: boolean } = {}): Array<{ scope: ScopeName; kind: string; file: string | null; bytes: number }> {
     const out: Array<{ scope: ScopeName; kind: string; file: string | null; bytes: number }> = [];
     for (const h of this.handles.values()) {
       if (opts.scopes && !opts.scopes.includes(h.name)) continue;
       try {
-        const r = h.store.flush({ force: opts.force, keepPurges: opts.keepPurges });
+        const r = h.store.flush({ force: opts.force, keepPurges: opts.keepPurges, wait: opts.wait });
         out.push({ scope: h.name, ...r });
         if (r.kind === "snapshot") this.syncIndex(h.name);
       } catch (e) {
-        this.opts.telemetry?.event("store.flush_failed", { scope: h.name, error: String((e as Error).message) });
+        this.opts.telemetry?.event("store.flush_failed", { scope: h.name, error: errMsg(e) });
       }
     }
     return out;

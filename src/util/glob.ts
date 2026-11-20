@@ -47,9 +47,3 @@ export function commandMatcher(pattern: string): (cmd: string) => boolean {
   }
   return m;
 }
-
-/** How specific a glob is: more literal characters and more segments rank higher. */
-export function globSpecificity(glob: string): number {
-  const literal = glob.replace(/[*?{},!]/g, "").length;
-  return literal + glob.split("/").filter((s) => s && !s.includes("*")).length * 4;
-}

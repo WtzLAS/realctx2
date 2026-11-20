@@ -1,9 +1,12 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { catalogContextWindow, warmModelCatalog } from "../src/core/catalog.ts";
 import { applyProjectOverrides, DEFAULT_CONFIG, deepMerge, diffConfig, effectiveCacheTtlSeconds, effectiveMaxWindow, isContextEngineEnabled, scaledContext } from "../src/core/config.ts";
-import { tryLock } from "../src/util/fs.ts";
+import { raceTimeout } from "../src/util/async.ts";
+import { errMsg } from "../src/util/errors.ts";
+import { takeOverStale, tryLock, writeFileAtomic } from "../src/util/fs.ts";
 import { applyIgnoreFix, checkSharedIgnored, describeIgnoreProblem } from "../src/util/gitignore.ts";
 import { commandMatcher, globCompiles, pathMatcher } from "../src/util/glob.ts";
 import { findIds, parseId, randomId8 } from "../src/util/ids.ts";
@@ -288,6 +291,69 @@ describe("file locks", () => {
     expect(taken).not.toBeNull();
     taken!.release();
     expect(existsSync(initLock)).toBe(false);
+  });
+
+  it("takes over a dead owner's lock, but never removes a lock renewed after it was judged stale", () => {
+    const dir = tmp("locks-stale-");
+    const lockPath = join(dir, "store.lock");
+    const dead = spawnSync(process.execPath, ["-e", ""]).pid!;
+    writeFileSync(lockPath, JSON.stringify({ pid: dead, at: Date.now(), token: "dead-owner" }));
+    const taken = tryLock(lockPath, 60_000);
+    expect(taken).not.toBeNull();
+    expect(readFileSync(lockPath, "utf8")).not.toContain("dead-owner");
+    taken!.release();
+    // a contender judged `stale` stale, but another process replaced it with `fresh` in the meantime
+    const stale = JSON.stringify({ pid: dead, at: 0, token: "stale" });
+    const fresh = JSON.stringify({ pid: process.pid, at: Date.now(), token: "fresh" });
+    writeFileSync(lockPath, fresh);
+    expect(takeOverStale(lockPath, stale)).toBe(false);
+    expect(readFileSync(lockPath, "utf8")).toBe(fresh);
+    expect(readdirSync(dir)).toEqual(["store.lock"]);
+    // the lock it did judge is removed, with nothing left aside
+    writeFileSync(lockPath, stale);
+    expect(takeOverStale(lockPath, stale)).toBe(true);
+    expect(readdirSync(dir)).toEqual([]);
+    // gone already (another contender won): the path is free to try
+    expect(takeOverStale(lockPath, stale)).toBe(true);
+  });
+});
+
+describe("atomic writes", () => {
+  it("leaves no temp file behind when the write fails", () => {
+    const dir = tmp("atomic-");
+    const target = join(dir, "taken");
+    mkdirSync(join(target, "sub"), { recursive: true }); // a non-empty directory where the file should go
+    expect(() => writeFileAtomic(target, "x")).toThrow();
+    expect(readdirSync(dir)).toEqual(["taken"]);
+    writeFileAtomic(join(dir, "ok.json"), "{}");
+    expect(readdirSync(dir).sort()).toEqual(["ok.json", "taken"]);
+  });
+});
+
+describe("async and error helpers", () => {
+  it("raceTimeout clears its timer whichever side settles first", async () => {
+    vi.useFakeTimers();
+    try {
+      await expect(raceTimeout(Promise.resolve(7), 10_000)).resolves.toBe(7);
+      expect(vi.getTimerCount()).toBe(0);
+      await expect(raceTimeout(Promise.reject(new Error("boom")), 10_000)).rejects.toThrow("boom");
+      expect(vi.getTimerCount()).toBe(0);
+      const pending = raceTimeout(new Promise<number>(() => undefined), 50);
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(50); // the synchronous form: Bun's `vi` has no advanceTimersByTimeAsync
+      await expect(pending).resolves.toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("errMsg reads errors, message-bearing objects and bare thrown values", () => {
+    expect(errMsg(new Error("x"))).toBe("x");
+    expect(errMsg({ message: "m" })).toBe("m");
+    expect(errMsg("plain")).toBe("plain");
+    expect(errMsg(undefined)).toBe("undefined");
+    expect(errMsg(null)).toBe("null");
   });
 });
 

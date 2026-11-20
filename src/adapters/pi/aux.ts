@@ -14,6 +14,7 @@ import type { Config } from "../../core/config.ts";
 import type { Telemetry } from "../../core/telemetry.ts";
 import type { AuxResult, AuxRole, AuxSessionRunner, AuxTask, ModelPricing, ThinkingLevel, ToolDef } from "../../core/types.ts";
 import type { MemoryRuntime } from "../../memory/runtime.ts";
+import { errMsg } from "../../util/errors.ts";
 import { runSync } from "../../util/git.ts";
 import { clipTokens } from "../../util/text.ts";
 import { checkAuxBash } from "../guard.ts";
@@ -23,7 +24,7 @@ const LEVELS: ThinkingLevel[] = ["minimal", "low", "medium", "high", "xhigh", "m
 /** Consecutive non-abort failures before cooling a model down for background roles. */
 export const MODEL_COOLDOWN_STRIKES = 2;
 /** Cooldown duration for failing background aux models (2 minutes). */
-export const MODEL_COOLDOWN_MS = 2 * 60_000;
+const MODEL_COOLDOWN_MS = 2 * 60_000;
 /** User-initiated foreground roles still retry during cooldown and clear it on success. */
 const FOREGROUND_ROLES = new Set<AuxRole>(["qemem.planner", "qemem.constructor", "ingest.slicer"]);
 
@@ -163,7 +164,7 @@ export class PiAuxRunner implements AuxSessionRunner {
     try {
       result = await this.limiter.run(() => runAsAux(task.role, () => this.session(task, settings, registry, model)), task.signal);
     } catch (e) {
-      result = { ...empty, error: String((e as Error).message ?? e) };
+      result = { ...empty, error: errMsg(e) };
     }
     const aborted = task.signal?.aborted === true;
     if (result.output !== null) {
@@ -206,7 +207,7 @@ export class PiAuxRunner implements AuxSessionRunner {
       try {
         for (const t of await (this.env.builtinTools ?? piBuiltins)(cwd, withBash)) tools.set(t.name, t);
       } catch (e) {
-        this.telemetry?.event("aux.tools_unavailable", { error: String((e as Error).message ?? e) });
+        this.telemetry?.event("aux.tools_unavailable", { error: errMsg(e) });
       }
       for (const def of this.env.ownTools()) {
         tools.set(def.name, {
@@ -330,14 +331,14 @@ export class PiAuxRunner implements AuxSessionRunner {
               const text = res.content.map((c) => (c.type === "text" ? (c.text ?? "") : `[${c.type}]`)).join("\n");
               reply(clipTokens(text, 6000), res.isError === true);
             } catch (e) {
-              reply(`Tool error: ${String((e as Error).message ?? e)}`, true);
+              reply(`Tool error: ${errMsg(e)}`, true);
             }
           }
           if (giveUp) break;
         }
       }
     } catch (e) {
-      out.error = timeout.aborted ? "timeout" : String((e as Error).message ?? e);
+      out.error = timeout.aborted ? "timeout" : errMsg(e);
     }
     if (out.output !== null) out.error = undefined;
     else if (!out.error) out.error = timeout.aborted ? "timeout" : "no valid result";

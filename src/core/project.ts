@@ -1,6 +1,6 @@
 /** Project identity and machine identity (§6.1, §7.8). */
 import { randomUUID } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, parse, resolve } from "node:path";
 import { readJson, writeJson } from "../util/fs.ts";
@@ -70,8 +70,4 @@ export function machineActorId(layout: Layout): string {
     // a read-only home still gets a usable (per-process) id
   }
   return actorId;
-}
-
-export function sharedStoreExists(project: ProjectInfo): boolean {
-  return project.sharedDir !== null && existsSync(join(project.sharedDir, "store.json"));
 }

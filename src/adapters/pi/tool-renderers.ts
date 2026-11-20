@@ -2,7 +2,7 @@
  * Compact TUI-only renderers for realctx2's five agent tools in pi.
  * Display-only: the complete tool text still reaches the model unchanged.
  */
-import type { Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type Component, truncateToWidth } from "@earendil-works/pi-tui";
 
 // Untrusted terminal data (queries, memory text, ids): strip ANSI escape and control sequences.

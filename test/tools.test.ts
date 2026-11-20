@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { Layout } from "../src/core/config.ts";
 import { Host } from "../src/core/host.ts";
 import type { CommandIO, ToolDef } from "../src/core/types.ts";
@@ -560,5 +560,29 @@ describe("the host across sessions", () => {
     expect(r.host.health()).toEqual({ decision: { configured: false, healthy: false, format: undefined, model: undefined, lastError: undefined, emulated: true }, late: null, dense: null, aux: { available: true } });
     await r.host.shutdown({ spawnWorker: false });
     expect((await r.host.tools()[0]!.execute({ query: "x" }, {})).text).toBe("realctx2 has not finished starting in this session.");
+  });
+
+  it("starts idle maintenance only after the engine's idle step, and settle waits for both", async () => {
+    const r = await rig({ cfg: { maintenance: { idleMinutes: 0 } } });
+    let finishIdle!: () => void;
+    const onIdle = vi.spyOn(r.host.engine, "onIdle").mockReturnValue(new Promise<void>((res) => (finishIdle = res)));
+    const maintain = vi.spyOn(r.host, "maintain").mockResolvedValue({ harvested: 0, idle: null });
+    r.host.noteSettled();
+    await new Promise((res) => setTimeout(res, 50)); // the idle timer (0 minutes) has fired
+    expect(onIdle).toHaveBeenCalledTimes(1);
+    expect(maintain).not.toHaveBeenCalled();
+    finishIdle();
+    await r.host.settle();
+    expect(maintain).toHaveBeenCalledTimes(1);
+    // a user action during the engine's idle step cancels the maintenance that would follow it
+    let finishSecond!: () => void;
+    onIdle.mockReturnValue(new Promise<void>((res) => (finishSecond = res)));
+    r.host.noteSettled();
+    await new Promise((res) => setTimeout(res, 50));
+    r.host.noteInput();
+    finishSecond();
+    await r.host.settle();
+    expect(maintain).toHaveBeenCalledTimes(1);
+    await r.host.shutdown({ spawnWorker: false });
   });
 });

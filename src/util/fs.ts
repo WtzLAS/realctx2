@@ -19,15 +19,21 @@ export function readJson<T>(path: string, fallback: T): T {
 export function writeFileAtomic(path: string, data: string | Uint8Array, mode?: number): void {
   ensureDir(dirname(path));
   const tmp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  writeFileSync(tmp, data, mode !== undefined ? { mode } : undefined);
-  if (mode !== undefined) {
-    try {
-      chmodSync(tmp, mode);
-    } catch {
-      // ignore chmod failures on filesystems that don't support POSIX modes
+  try {
+    writeFileSync(tmp, data, mode !== undefined ? { mode } : undefined);
+    if (mode !== undefined) {
+      try {
+        chmodSync(tmp, mode);
+      } catch {
+        // ignore chmod failures on filesystems that don't support POSIX modes
+      }
     }
+    renameSync(tmp, path);
+  } catch (e) {
+    // a failed write (a full disk, a directory in the way) leaves no temp file behind
+    removeFile(tmp);
+    throw e;
   }
-  renameSync(tmp, path);
 }
 
 export function writeJson(path: string, value: unknown, mode?: number): void {
@@ -101,6 +107,57 @@ export interface LockHandle {
   release(): void;
 }
 
+function readText(path: string): string | null {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function parseOwner(raw: string): { pid?: number; at?: number } {
+  try {
+    return JSON.parse(raw) as { pid?: number; at?: number };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Remove a lock file judged stale from its contents `observed`. Deleting by path alone would let
+ * two contenders that both judged it stale delete each other's fresh lock. Instead the file is
+ * renamed aside, which only one contender can do, and checked: if what was moved is not the
+ * stale lock (another process took over in between), it is put back. Returns whether the stale
+ * lock is gone, so the caller may try to take the lock.
+ */
+export function takeOverStale(path: string, observed: string): boolean {
+  const aside = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.stale`;
+  try {
+    renameSync(path, aside);
+  } catch (e) {
+    // ENOENT: another contender removed it first, and the path is free to try
+    return (e as NodeJS.ErrnoException).code === "ENOENT";
+  }
+  if (readText(aside) === observed) {
+    removeFile(aside);
+    return true;
+  }
+  // a fresh lock was moved: put it back, unless yet another holder has the path by now
+  try {
+    linkSync(aside, path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST" && !existsSync(path)) {
+      try {
+        renameSync(aside, path);
+      } catch {
+        // nothing more to restore
+      }
+    }
+  }
+  removeFile(aside);
+  return false;
+}
+
 /**
  * OS-level lock file published atomically via hard-link (falling back to O_EXCL).
  * A lock whose owner process is gone, or which is older than `staleMs`, is taken over.
@@ -147,7 +204,9 @@ export function tryLock(path: string, staleMs = 10 * 60_000): LockHandle | null 
       if (created) return makeHandle();
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-      const owner = readJson<{ pid?: number; at?: number }>(path, {});
+      const raw = readText(path);
+      if (raw === null) continue; // released in the meantime
+      const owner = parseOwner(raw);
       let stale: boolean;
       if (owner.pid) {
         stale = !pidAlive(owner.pid) || Date.now() - (owner.at ?? 0) > staleMs;
@@ -159,8 +218,7 @@ export function tryLock(path: string, staleMs = 10 * 60_000): LockHandle | null 
           stale = false;
         }
       }
-      if (!stale) return null;
-      removeFile(path);
+      if (!stale || !takeOverStale(path, raw)) return null;
     }
   }
   return null;

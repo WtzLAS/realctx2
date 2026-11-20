@@ -2,8 +2,11 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LoroDoc, LoroMap } from "loro-crdt";
 import { afterAll, describe, expect, it } from "vitest";
+import { MemoryRuntime } from "../src/memory/runtime.ts";
 import { ScopeDoc } from "../src/storage/schema.ts";
 import type { ScopeStore } from "../src/storage/store.ts";
+import { tryLock } from "../src/util/fs.ts";
+import { world } from "./helpers/fakes.ts";
 import { cleanupTmp, commitAll, copyDir, git, initRepo, listTree, mergeDirs, node, openStore, rng, sharedStore, stateOf, testConfig, tmp, treeContains } from "./helpers/fixtures.ts";
 
 afterAll(cleanupTmp);
@@ -193,6 +196,45 @@ describe("store files", () => {
     const again = openStore(dir);
     expect(again.sd.getNode("aaaaaaaa")!.text).toBe("second");
     expect(stateOf(again)).toEqual(stateOf(s));
+  });
+
+  it("does not wait for a store lock another process holds when told not to", () => {
+    const s = openStore(join(tmp(), "store"));
+    s.sd.insertNode(node({ id: "aaaaaaaa", text: "first" }));
+    s.commit("write");
+    const held = tryLock(s.opts.lockFile)!; // another process, compacting
+    const started = Date.now();
+    expect(s.flush({ wait: false }).kind).toBe("deferred");
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(s.hasUnflushed()).toBe(true);
+    expect(s.updateFiles()).toEqual([]);
+    held.release();
+    expect(s.flush({ wait: false }).kind).toBe("update");
+    expect(s.hasUnflushed()).toBe(false);
+  });
+
+  it("keeps a deferred periodic flush due, and retries it at the next commit point", () => {
+    const repo = initRepo();
+    const w = world({ cwd: repo });
+    const mem = new MemoryRuntime({ layout: w.layout, cfg: w.cfg, cwd: repo, trusted: true, decision: w.decision, aux: w.aux, clock: w.clock, sessionId: "sess-test", harness: "test" });
+    const store = mem.graph.handle("personal").store;
+    store.sd.insertNode(node({ id: "aaaaaaaa", text: "first" }));
+    store.commit("write");
+    w.now.t += (w.cfg.storage.flushMinutes + 1) * 60_000;
+    const held = tryLock(store.opts.lockFile)!;
+    const started = Date.now();
+    mem.flushIfDue();
+    expect(Date.now() - started).toBeLessThan(1000); // the harness's thread was not held for the lock
+    expect(store.hasUnflushed()).toBe(true);
+    held.release();
+    mem.flushIfDue(); // same clock: still due
+    expect(store.hasUnflushed()).toBe(false);
+    store.sd.patchNode("aaaaaaaa", { text: "second" });
+    store.commit();
+    mem.flushIfDue(); // flushed now: due again only after flushMinutes
+    expect(store.hasUnflushed()).toBe(true);
+    mem.shutdown();
+    w.close();
   });
 
   it("lets a second process see new files on refresh", () => {

@@ -11,6 +11,7 @@ import type { Config } from "../../core/config.ts";
 import type { Telemetry } from "../../core/telemetry.ts";
 import type { AuxResult, AuxSessionRunner, AuxTask, ThinkingLevel } from "../../core/types.ts";
 import type { MemoryRuntime } from "../../memory/runtime.ts";
+import { errMsg } from "../../util/errors.ts";
 import { runSync } from "../../util/git.ts";
 
 export interface SpawnResult {
@@ -21,7 +22,7 @@ export interface SpawnResult {
 }
 export type SpawnFn = (cmd: string, args: string[], opts: { input: string; env: Record<string, string | undefined>; cwd: string; timeoutMs: number; signal?: AbortSignal }) => Promise<SpawnResult>;
 
-export const spawnClaude: SpawnFn = (cmd, args, opts) =>
+const spawnClaude: SpawnFn = (cmd, args, opts) =>
   new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
@@ -163,7 +164,7 @@ export class ClaudeAuxRunner implements AuxSessionRunner {
     try {
       result = await this.limiter.run(() => this.session(task, settings), task.signal);
     } catch (e) {
-      result = { ...empty, error: String((e as Error).message ?? e) };
+      result = { ...empty, error: errMsg(e) };
     }
     this.telemetry?.call({
       callSite: task.role,

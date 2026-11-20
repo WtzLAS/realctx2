@@ -5,17 +5,17 @@
 import type { MemoryNode, StrengthEvent, UseCounters } from "../core/types.ts";
 import { clamp, daysBetween } from "../util/text.ts";
 
-export const LAMBDA_BASE = 0.1; // per day (F)
-export const MU = 1.0; // importance modulation (ours)
-export const BETA = { short: 1.2, long: 0.8 } as const; // decay shape (F)
-export const DELTA_V = 0.25;
-export const N_REINFORCE = 5;
-export const FOLD_SAFETY_DAYS = 14;
+const LAMBDA_BASE = 0.1; // per day (F)
+const MU = 1.0; // importance modulation (ours)
+const BETA = { short: 1.2, long: 0.8 } as const; // decay shape (F)
+const DELTA_V = 0.25;
+const N_REINFORCE = 5;
+const FOLD_SAFETY_DAYS = 14;
 export const V0 = { normal: 0.6, pinned: 1.0, explicit: 0.8 } as const;
 export const THETA_PROMOTE = 0.7;
 export const THETA_DEMOTE = 0.3;
 
-export function decayRate(importance: number, divisor = 1): number {
+function decayRate(importance: number, divisor = 1): number {
   return (LAMBDA_BASE * Math.exp(-MU * clamp(importance, 0, 1))) / Math.max(1, divisor);
 }
 
@@ -96,7 +96,7 @@ export function recentUses(node: MemoryNode, now: Date, days = 7): number {
 }
 
 /** Attributed-use rate with a 14-day half-life (f_i in §6.5.2). */
-export function useRate(node: MemoryNode, now: Date): number {
+function useRate(node: MemoryNode, now: Date): number {
   let f = 0;
   for (const e of node.strength.events) {
     if (e.kind !== "reinforce") continue;

@@ -16,7 +16,8 @@ Owner: laserrks · Harnesses (v1): [pi](https://docs.pi.dev/latest/extensions) (
 
 **Changes in v0.7** (from the first implementation and runs against pi 1.5.2 and Claude Code 2.1.326; earlier changes are in Appendix A)
 
-- **Decisions without a decision model work in practice.** Emulated answers took 5–10 s against a 1.5 s timeout, so none arrived. `decision.emulate` now runs without thinking, has a timeout floor, and no commit point waits for it: Janus's answer and proactive cards apply at the next commit point (§5.2.1, §6.4.1, §9.1.4, §9.3.4).
+- **Decisions without a decision model work in practice.** Emulated answers took 5–10 s against a 1.5 s timeout, so none arrived. `decision.emulate` now runs without thinking and has a timeout floor, and a commit point waits for it at most `janus.lateWaitMs`: Janus's answer and proactive cards that miss it apply at the next commit point (§5.2.1, §6.4.1, §9.1.4, §9.3.4).
+- **Janus waits longer by default.** `janus.timeoutMs` is 30 s (was 1.5 s) and `janus.lateWaitMs` 10 s (was 200 ms), so a slow answer is more often used at the commit point it was asked for instead of the next one (§5.2.1, §5.2.7, §5.7, §9.1.5, §9.4).
 - **Remembered memories start short-term.** An unpinned `remember` goes to SML and earns LML by the usual rules; in LML the first hygiene pass demoted it (§6.3).
 - **Read-only sessions keep the shared store clean.** Path reconciliation writes nothing for unchanged paths, and keeps the checkout's last reconciled commit in the local index (§6.8.2–6.8.3); the shared journal records whether it holds counter-only changes, so the worker doesn't flush them (§7.5).
 - **pi details.** Tools register in `session_start` and are re-checked at the first `before_agent_start` (§4.1, §8.1.3); records decided in `before_agent_start` travel in the guidance message's `details` (§4.2, §5.1); the compaction record is written in `session_compact` (§4.2, §5.4.5); summaries and `!` runs can't be edited (§4.3). `aux.pi.extensions` is dropped.
@@ -270,7 +271,7 @@ flowchart LR
 
 | Loop | Runs | Work | Latency budget |
 |---|---|---|---|
-| **Hot** | Before each model request (`before_agent_start`, `turn_end`) | 1. Janus decision. 2. Intent state transitions and guidance. 3. Commit any finished async Precip/Palim edits and trigger new ones in the background. 4. Pressure control. | Only user messages wait for Janus (≤ 1.5 s); otherwise it runs while tools execute (§5.2.1). Precip and Palim run asynchronously (single-turn, tool-free) and commit at the next `turn_end`, while pressure folds are prepared ahead (§4.4, §5.4.3). |
+| **Hot** | Before each model request (`before_agent_start`, `turn_end`) | 1. Janus decision. 2. Intent state transitions and guidance. 3. Commit any finished async Precip/Palim edits and trigger new ones in the background. 4. Pressure control. | User messages wait for Janus (≤ `janus.timeoutMs`, 30 s); otherwise it runs while tools execute, and `turn_end` waits for it at most `janus.lateWaitMs` (10 s) (§5.2.1). Precip and Palim run asynchronously (single-turn, tool-free) and commit at the next `turn_end`, while pressure folds are prepared ahead (§4.4, §5.4.3). |
 | **Warm** | On tool calls and tool results | Record deliveries. Guard against oversized tool output. Extract paths and commands, run the gate for `immediate` memories (§6.10.3), append path memories, track moves (§6.8). | ≤ 50 ms (no model calls; path lookups hit the local index) |
 | **Cold, model-free** | Detached worker: at session end, or on command | Path reconciliation, forgetting pass, strength folding, shared flush, compaction (§7.7), index rebuild | Seconds to minutes |
 | **Cold, model-dependent** | Inside a session while it is idle (§6.6.8); work left over is queued for the next session | Harvest, re-verification, re-slicing changed imports, conflict re-checks, fusion, EvoDisco attempts and policy update | Minutes, within a budget; yields as soon as the user acts |
@@ -625,14 +626,14 @@ interface Intent {
 
 | Moment | Mode | Timing |
 |---|---|---|
-| `before_agent_start`: a new user message | Full (closure and focus), with the user message included | Synchronous: the request waits for the answer, within the 1.5 s timeout |
-| A model response with tool calls | Full | Off the critical path (decided in v0.5). Janus starts at the turn's first `tool_call`, while the tools run, with evidence ending at the new assistant message. `turn_end` uses the answer if it arrives within `janus.lateWaitMs` (default 200 ms) of the tools finishing; otherwise the answer applies at the next commit point. |
+| `before_agent_start`: a new user message | Full (closure and focus), with the user message included | Synchronous: the request waits for the answer, within `janus.timeoutMs` (default 30 s) |
+| A model response with tool calls | Full | Off the critical path (decided in v0.5). Janus starts at the turn's first `tool_call`, while the tools run, with evidence ending at the new assistant message. `turn_end` uses the answer if it arrives within `janus.lateWaitMs` (default 10 s) of the tools finishing; otherwise the answer applies at the next commit point. |
 | `agent_before_settle` | Closure only, with no kindle | Synchronous |
 
 - **What it costs.** A closure that only shows in the tool results, such as a test that now passes, is seen one step later, when the next run's evidence includes those results. A late closure only delays consolidation (§5.2.7). Kindles usually show in the assistant's own message ("now I'll look at …"), so they are rarely late.
 - **What it saves.** The decision model's latency leaves the critical path on every step except user messages.
 - **Claude Code.** The same moments are `UserPromptSubmit`; the first `PreToolUse` of a batch, with the answer applied at `PostToolBatch`; and `Stop` (§4.6.2).
-- **Without a decision model** (§9.1.4), answers take seconds, so no moment waits for them. A user message and settle wait at most `janus.lateWaitMs`, like `turn_end`, and an answer that misses its moment applies at the next commit point. One Janus request is in flight at a time: while it runs, later steps don't start another. A plan applied late can't kindle an intent if another intent was kindled since its evidence was taken.
+- **Without a decision model** (§9.1.4), answers take seconds, so no moment waits for the full timeout. A user message and settle wait at most `janus.lateWaitMs` (default 10 s), like `turn_end`, and an answer that misses its moment applies at the next commit point. One Janus request is in flight at a time: while it runs, later steps don't start another. A plan applied late can't kindle an intent if another intent was kindled since its evidence was taken.
 
 #### 5.2.2 Evidence
 
@@ -697,7 +698,7 @@ Proactive memory cards (§6.4.1) are attached only when an intent is kindled.
 
 #### 5.2.7 Failures and cost
 
-- **Decision timeout or error.** The default timeout is 1,500 ms. On timeout or error, treat the answer as `continue` with no closures. That is safe: a missed closure only delays consolidation, and pressure control still bounds the window.
+- **Decision timeout or error.** The default timeout is 30,000 ms (`janus.timeoutMs`). On timeout or error, treat the answer as `continue` with no closures. That is safe: a missed closure only delays consolidation, and pressure control still bounds the window.
 - **No decision model configured.** Use aux-emulated decisions (§9.1.4) with a stricter τ_close of 0.9. They apply one step late (§5.2.1), so an intent's guidance lands a round after its work began; that round stays in the enclosing region, and Precip covers less of the work.
 - **Cost:**
   - One decision request per step, with 2–8K input tokens, mostly cache-stable.
@@ -992,7 +993,8 @@ rules only:  complied += P(complied) ;  violated += P(violated)
 | J, fold retries | 2 | H |
 | Scaling when W ≠ 128,000 | B_min, T_min and Δ_min scale by W/128,000, with floors of 2,048, 8,192 and 4,096 | ours |
 | τ_close / τ_open | 0.80 / 0.60 | ours |
-| Janus timeout / input cap | 1,500 ms / 8,000 tokens | ours |
+| Janus timeout / input cap | 30,000 ms / 8,000 tokens | ours |
+| Janus late-answer wait at a commit point | 10,000 ms | ours |
 | Precip skip threshold | 1,500 tokens | ours |
 | Climb: rounds before a level counts as stable | 8 | ours |
 | Climb: rounds between frontier steps | 8 | ours |
@@ -1268,7 +1270,7 @@ centrality(v) = log(1 + Σ_{active e ∋ v} w_e · κ(layer(src_e), layer(dst_e)
    - Otherwise inject the cards with P ≥ 0.6, at most 5 cards and 1,200 tokens.
    - Cards are rendered without an LLM (§6.4.5) and recorded as deliveries. `immediate` and `hint` memories get full cards; `caption` memories get one line each.
 
-**Without a decision model** (§9.1.4), the gate's emulated answer takes seconds. The kindle doesn't wait for it: the guidance goes out without cards, and the cards follow at the next commit point as their own guidance message (`[intent] Memory that may help with "…":`), if the intent is still open. Cards that became visible in the meantime, for example through a path delivery, are left out.
+**Without a decision model** (§9.1.4), the gate's emulated answer takes seconds. The kindle waits for it at most `janus.lateWaitMs` (default 10 s); if it is still running then, the guidance goes out without cards, and the cards follow at the next commit point as their own guidance message (`[intent] Memory that may help with "…":`), if the intent is still open. Cards that became visible in the meantime, for example through a path delivery, are left out.
 
 This gate targets MemUse's finding that 71–99% of delivered entries were irrelevant. It is also why proactive cards are offered only at intent boundaries, when the agent can act on them.
 
@@ -2419,14 +2421,14 @@ realctx2 talks to decision models over custom HTTP adapters in both harnesses, s
   - shared routing 0.95;
   - proactive gate 0.7;
   - attribution uses deterministic signals only.
-- **Emulated answers are slow.** An LLM call takes seconds where a decision model takes milliseconds, so the call site's timeout (1.5 s for Janus and the proactive gate) would almost always expire. An emulated decision gets at least `providers.aux.emulateTimeoutMs` (default 20,000; 0 keeps the call site's timeout), and no commit point waits for it: Janus's answer and the proactive gate's cards apply at the next commit point (§5.2.1, §6.4.1).
+- **Emulated answers are slow.** An LLM call takes seconds where a decision model takes milliseconds, so a short call-site timeout (1.5 s for the proactive gate) would almost always expire. An emulated decision gets at least `providers.aux.emulateTimeoutMs` (default 20,000; 0 keeps the call site's timeout): the gate gets 20 s, and Janus keeps its own 30 s. A commit point waits for an emulated answer at most `janus.lateWaitMs` (default 10 s): Janus's answer and the proactive gate's cards that miss it apply at the next commit point (§5.2.1, §6.4.1).
 - **Thinking is off** for `decision.emulate` (§9.3.4). With a small model, thinking `low` took 5–10 s per answer, and thinking off 1.5–2.3 s.
 
 #### 9.1.5 Reliability
 
 | Setting | Values |
 |---|---|
-| Timeouts | Janus 1.5 s · gate 1.5 s · routing and conflicts 5 s · attribution, teacher and checks 10 s |
+| Timeouts | Janus 30 s (`janus.timeoutMs`) · gate 1.5 s · routing and conflicts 5 s · attribution, teacher and checks 10 s |
 | Retry | 1 retry with jitter on 429/5xx. Janus never retries. |
 | Circuit breaker | Opens after 5 consecutive failures, for 60 s |
 
@@ -2638,7 +2640,7 @@ The global configuration lives in `~/.pi/agent/realctx2/config.json`. Model ids 
                "skipCloseProb": 0.5, "innermostMinTokens": 32768, "costCheck": true, "expectedRequests": "auto" },
     "cacheTtlSeconds": 300, "prepareFraction": 0.7
   },
-  "janus": { "timeoutMs": 1500, "lateWaitMs": 200, "maxInputTokens": 8000, "remindEvery": 8 },
+  "janus": { "timeoutMs": 30000, "lateWaitMs": 10000, "maxInputTokens": 8000, "remindEvery": 8, "maxDepth": 6 },
   "memory": {
     "kappaShortToLong": 0.25, "kappaActivation": 1.0,
     "similarity": { "dedup": 0.92, "conflict": 0.75, "floor": 0.75, "fusion": 0.75, "intentDuplicate": 0.9,

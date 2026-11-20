@@ -5,7 +5,7 @@
 import type { DecisionQuestion, ScopedNode, ScopeName } from "../core/types.ts";
 import { binaryP } from "../providers/decision.ts";
 import type { TurnRow } from "../storage/turnindex.ts";
-import { rrf, type Scored } from "../storage/vectors.ts";
+import { rrf } from "../storage/vectors.ts";
 import { bracket } from "../util/ids.ts";
 import { clipTokens, estimateTokens, sanitize, verifyQuote } from "../util/text.ts";
 import { renderCards } from "./cards.ts";
@@ -14,9 +14,9 @@ import { irrelevanceRate, memoryWorth, proactiveEligible, strengthAt } from "./s
 import { effectiveUrgency } from "./urgency.ts";
 
 export const SEEDS = 5;
-export const MAX_HOPS = 2;
-export const HOP_DECAY = 0.5;
-export const NODES_PER_QUERY = 15;
+const MAX_HOPS = 2;
+const HOP_DECAY = 0.5;
+const NODES_PER_QUERY = 15;
 const SCOPE_WEIGHT: Record<ScopeName, number> = { personal: 1.0, shared: 1.0, global: 0.8 };
 const PATH_BOOST = 1.5;
 

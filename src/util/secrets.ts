@@ -12,7 +12,7 @@ export interface ScanResult {
   pii: string[];
 }
 
-export const REDACTED = "[secret:redacted]";
+const REDACTED = "[secret:redacted]";
 
 const PATTERNS: Array<{ type: string; re: RegExp; group?: number }> = [
   { type: "private-key", re: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g },
@@ -34,7 +34,7 @@ const PATTERNS: Array<{ type: string; re: RegExp; group?: number }> = [
   },
 ];
 
-export function shannonEntropy(s: string): number {
+function shannonEntropy(s: string): number {
   if (!s) return 0;
   const freq = new Map<string, number>();
   for (const ch of s) freq.set(ch, (freq.get(ch) ?? 0) + 1);

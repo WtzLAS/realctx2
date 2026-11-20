@@ -12,6 +12,7 @@ import {
   type EmbeddingProviderConfig,
   resolveApiKeyInfo,
 } from "../core/config.ts";
+import { errMsg } from "../util/errors.ts";
 import { type FetchLike, HttpDecisionClient } from "./decision.ts";
 import { DenseEmbeddingClient, MultiVectorEmbeddingClient } from "./embedding.ts";
 
@@ -265,7 +266,7 @@ export async function fetchEndpointModels(
     };
   } catch (e) {
     const latencyMs = Date.now() - started;
-    const message = String((e as Error)?.message ?? e);
+    const message = errMsg(e);
     return {
       endpoint: kind,
       ok: false,
@@ -321,7 +322,7 @@ function shortErrorSummary(status: number | undefined, rawMessage: string): stri
   return clean.length > 48 ? `${clean.slice(0, 45)}…` : clean || "Request failed";
 }
 
-export async function testDecisionEndpoint(
+async function testDecisionEndpoint(
   cfg: DecisionProviderConfig | null,
   opts: EndpointTestOptions = {},
 ): Promise<EndpointTestResult> {
@@ -383,7 +384,7 @@ export async function testDecisionEndpoint(
     };
   } catch (e) {
     const latencyMs = Date.now() - started;
-    const message = String((e as Error).message ?? e);
+    const message = errMsg(e);
     const status = parseHttpStatus(message);
     const parts = [`Probe failed after ${latencyMs}ms: ${message}.`, `Auth: ${authSummary}.`];
     let availableModels: string[] | undefined;
@@ -408,7 +409,7 @@ export async function testDecisionEndpoint(
   }
 }
 
-export async function testEmbeddingEndpoint(
+async function testEmbeddingEndpoint(
   kind: "late" | "dense",
   cfg: EmbeddingProviderConfig | null,
   opts: EndpointTestOptions = {},
@@ -499,7 +500,7 @@ export async function testEmbeddingEndpoint(
     }
   } catch (e) {
     const latencyMs = Date.now() - started;
-    const message = String((e as Error).message ?? e);
+    const message = errMsg(e);
     const status = parseHttpStatus(message);
     const parts = [`Probe failed after ${latencyMs}ms: ${message}.`, `Auth: ${authSummary}.`];
     let availableModels: string[] | undefined;

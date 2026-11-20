@@ -8,6 +8,7 @@ import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync } from "node
 import { createConnection, createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { errMsg } from "../../util/errors.ts";
 import { ensureDir, existsSync, listFiles, readJson, removeFile, writeJson } from "../../util/fs.ts";
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
@@ -168,7 +169,7 @@ export function listen(path: string, handler: Handler): Promise<Server> {
       try {
         out = await handler(JSON.parse(line) as Record<string, unknown>);
       } catch (e) {
-        out = { error: String((e as Error).message ?? e) };
+        out = { error: errMsg(e) };
       }
       if (!conn.destroyed) conn.end(`${JSON.stringify(out ?? null)}\n`);
     };

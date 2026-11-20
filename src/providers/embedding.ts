@@ -7,6 +7,7 @@ import type { EmbeddingProviderConfig } from "../core/config.ts";
 import { buildAuthHeaders } from "../core/config.ts";
 import type { Telemetry } from "../core/telemetry.ts";
 import type { DenseVector, EmbeddingClient, TokenMatrix } from "../core/types.ts";
+import { errMsg } from "../util/errors.ts";
 import { clipTokens, estimateTokens, sha256 } from "../util/text.ts";
 import { CircuitBreaker, extractHttpError, type FetchLike } from "./decision.ts";
 
@@ -18,7 +19,7 @@ export interface EmbeddingOptions {
   now?: () => number;
 }
 
-export class EmbeddingShapeError extends Error {}
+class EmbeddingShapeError extends Error {}
 
 function l2normalize(v: Float32Array): Float32Array {
   let n = 0;
@@ -92,7 +93,7 @@ abstract class BaseClient {
         return json;
       } catch (e) {
         if (signal?.aborted) throw new Error("aborted");
-        lastErr = timeout.aborted ? "timeout" : String((e as Error).message ?? e);
+        lastErr = timeout.aborted ? "timeout" : errMsg(e);
       }
     }
     this.breaker.failure();
@@ -155,7 +156,7 @@ export class DenseEmbeddingClient extends BaseClient implements EmbeddingClient<
       const [v] = await this.embed(["realctx2 embedding probe"], "document");
       return v && v.length > 0 ? { ok: true } : { ok: false, problem: "empty vector" };
     } catch (e) {
-      return { ok: false, problem: String((e as Error).message ?? e) };
+      return { ok: false, problem: errMsg(e) };
     }
   }
 }
@@ -210,7 +211,7 @@ export class MultiVectorEmbeddingClient extends BaseClient implements EmbeddingC
       const [m] = await this.embed(["realctx2 embedding probe"], "document");
       return m && m.length > 0 ? { ok: true } : { ok: false, problem: "empty matrix" };
     } catch (e) {
-      return { ok: false, problem: String((e as Error).message ?? e) };
+      return { ok: false, problem: errMsg(e) };
     }
   }
 }

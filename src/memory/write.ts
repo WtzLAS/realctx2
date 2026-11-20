@@ -7,6 +7,7 @@ import { KINDS, zeroCounters } from "../core/types.ts";
 import { binaryP, choiceProbs } from "../providers/decision.ts";
 import { embedHash, embedText } from "../storage/index.ts";
 import { rrf } from "../storage/vectors.ts";
+import { errMsg } from "../util/errors.ts";
 import { randomId8 } from "../util/ids.ts";
 import { scanSecrets } from "../util/secrets.ts";
 import { clamp, contentHash, daysBetween, extractSignature, looksLikePath, makeTitle, sanitize, verifyQuote } from "../util/text.ts";
@@ -14,7 +15,7 @@ import { reviveNode } from "./lifecycle.ts";
 import { type MemoryServices, TIMEOUTS, UNCALIBRATED } from "./services.ts";
 import type { Encoded, SimMode } from "./similarity.ts";
 import { recentUses, strengthAt, V0 } from "./strength.ts";
-import { capUrgency, defaultUrgency, hasTrigger, pickUrgency, urgencyQuestion } from "./urgency.ts";
+import { capUrgency, defaultUrgency, pickUrgency, urgencyQuestion } from "./urgency.ts";
 
 export interface Candidate {
   text: string;
@@ -100,7 +101,7 @@ const W_AGE_DAYS = 30;
 const LEXICAL_CONFLICT_MIN = 0.2; // trigram Jaccard: prunes BM25 hits that only share stop words
 
 /** Narrower scopes never mutate broader ones (§6.3.2 step 9). */
-export function mayMutate(writer: ScopeName, target: ScopeName): boolean {
+function mayMutate(writer: ScopeName, target: ScopeName): boolean {
   return BREADTH[target] <= BREADTH[writer];
 }
 
@@ -123,7 +124,7 @@ export class MemoryWriter {
       try {
         r = p.discard ? { status: "discarded", reason: p.discard } : await this.store(p, opts.signal, touched);
       } catch (e) {
-        r = { status: "failed", reason: String((e as Error).message ?? e) };
+        r = { status: "failed", reason: errMsg(e) };
         this.s.telemetry?.event("write.failed", { error: r.reason });
       }
       if (p.redacted) r.redacted = true;

@@ -24,7 +24,7 @@ export interface SearchParams {
   budget: number;
 }
 
-export function parseSearch(env: ToolEnv, p: Record<string, unknown>, aux: boolean): SearchParams | string {
+function parseSearch(env: ToolEnv, p: Record<string, unknown>, aux: boolean): SearchParams | string {
   const query = str(p.query);
   if (!query) return "search needs a `query`.";
   const within = strList(p.in).filter((x) => x === "memory" || x === "turns");

@@ -69,8 +69,8 @@ const HEAD_OFF: Record<HeadName, number> = (() => {
   }
   return out;
 })();
-export const POLICY_OUT = HEAD_OFF.frame + HEADS.frame.length;
-export const ACTION_DIM = OPERATORS.length + MAX_CANDIDATES + HEAD_NAMES.reduce((s, h) => s + HEADS[h].length, 0);
+const POLICY_OUT = HEAD_OFF.frame + HEADS.frame.length;
+const ACTION_DIM = OPERATORS.length + MAX_CANDIDATES + HEAD_NAMES.reduce((s, h) => s + HEADS[h].length, 0);
 
 // ───────────────────────────── a tiny MLP with Adam
 
@@ -216,7 +216,7 @@ export interface Masks {
   candidates: Record<Operator, number>;
 }
 
-export function encodeAction(a: Action): number[] {
+function encodeAction(a: Action): number[] {
   const out = new Array<number>(ACTION_DIM).fill(0);
   out[OPERATORS.indexOf(a.operator)] = 1;
   out[OPERATORS.length + Math.min(MAX_CANDIDATES - 1, Math.max(0, a.candidate))] = 1;

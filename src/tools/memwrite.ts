@@ -25,7 +25,7 @@ export interface RememberInput {
   by: "agent" | "user";
 }
 
-export function describeWrite(mem: MemoryRuntime, r: WriteResult): string {
+function describeWrite(mem: MemoryRuntime, r: WriteResult): string {
   if (r.status === "discarded") return `Not stored: ${r.reason ?? "discarded"}.`;
   if (r.status === "failed" || !r.id) return `Could not store the memory: ${r.reason ?? "unknown error"}.`;
   const ref = mem.graph.get(r.id);

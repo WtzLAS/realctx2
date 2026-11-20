@@ -101,6 +101,39 @@ describe("memory index", () => {
   });
 });
 
+describe("sqlite transactions", () => {
+  it("rolls back only a failed nested transaction, and everything when the outer one fails", () => {
+    const db = openDb(":memory:");
+    db.exec("CREATE TABLE t (v INTEGER)");
+    const insert = (v: number) => db.prepare("INSERT INTO t VALUES (?)").run(v);
+    const rows = () => db.prepare("SELECT v FROM t ORDER BY v").all().map((r) => Number(r.v));
+    db.transaction(() => {
+      insert(1);
+      expect(() =>
+        db.transaction(() => {
+          insert(2);
+          throw new Error("inner");
+        }),
+      ).toThrow("inner");
+      insert(3);
+    });
+    // the outer transaction caught the inner failure: its own rows commit, the inner row does not
+    expect(rows()).toEqual([1, 3]);
+    expect(() =>
+      db.transaction(() => {
+        insert(4);
+        db.transaction(() => insert(5));
+        throw new Error("outer");
+      }),
+    ).toThrow("outer");
+    expect(rows()).toEqual([1, 3]);
+    // the wrapper is usable afterwards: no transaction or savepoint was left open
+    db.transaction(() => insert(6));
+    expect(rows()).toEqual([1, 3, 6]);
+    db.close();
+  });
+});
+
 describe("vector tables", () => {
   it("searches dense vectors by cosine with a floor and a filter", () => {
     const db = openDb(":memory:");

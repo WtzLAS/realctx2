@@ -32,18 +32,13 @@ export function headTail(text: string, head: number, tail: number, marker?: (omi
   return `${h}\n${marker ? marker(omitted) : `[… ${omitted} tokens omitted …]`}\n${t}`;
 }
 
-export function wordCount(text: string): number {
-  const m = text.trim().match(/\S+/g);
-  return m ? m.length : 0;
-}
-
 export function clipWords(text: string, max: number): string {
   const words = text.trim().split(/\s+/);
   return words.length <= max ? text.trim() : words.slice(0, max).join(" ");
 }
 
 /** Normalization for content hashing: case, whitespace and quote characters folded. */
-export function normalizeText(text: string): string {
+function normalizeText(text: string): string {
   return text
     .normalize("NFKC")
     .replace(/[\u2018\u2019\u201A\u201B\u2032]/g, "'")

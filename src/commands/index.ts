@@ -2,6 +2,7 @@
 import type { Host } from "../core/host.ts";
 import { findCategory, SETTINGS_CATEGORIES } from "../core/settings-schema.ts";
 import type { CommandDef, CommandIO } from "../core/types.ts";
+import { errMsg } from "../util/errors.ts";
 import { parseArgs } from "./args.ts";
 import * as memory from "./memory.ts";
 import * as status from "./status.ts";
@@ -84,8 +85,8 @@ export async function runCommand(host: Host, line: string, io: CommandIO): Promi
   try {
     await sub.run(host, io, rest);
   } catch (e) {
-    host.telemetry.event("command.failed", { command: name, error: String((e as Error).message ?? e) });
-    io.notify(`/realctx2 ${name} failed: ${String((e as Error).message ?? e)}`, "error");
+    host.telemetry.event("command.failed", { command: name, error: errMsg(e) });
+    io.notify(`/realctx2 ${name} failed: ${errMsg(e)}`, "error");
   }
   host.updateStatus();
 }

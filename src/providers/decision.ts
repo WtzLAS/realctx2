@@ -6,6 +6,7 @@ import type { DecisionProviderConfig } from "../core/config.ts";
 import { buildAuthHeaders } from "../core/config.ts";
 import type { Telemetry } from "../core/telemetry.ts";
 import type { AuxSessionRunner, DecideOptions, DecisionAnswer, DecisionClient, DecisionQuestion } from "../core/types.ts";
+import { errMsg } from "../util/errors.ts";
 import { estimateTokens, headTail } from "../util/text.ts";
 
 export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal }) => Promise<{
@@ -372,7 +373,7 @@ export class HttpDecisionClient implements DecisionClient {
           this.telemetry?.call({ callSite: opts.callSite, kind: "decision", latencyMs: Date.now() - started, outcome: "aborted" });
           throw new DecisionUnavailable("aborted");
         }
-        lastErr = timeout.aborted ? "timeout" : String((e as Error).message ?? e);
+        lastErr = timeout.aborted ? "timeout" : errMsg(e);
         if (timeout.aborted) break;
       }
     }
@@ -383,7 +384,7 @@ export class HttpDecisionClient implements DecisionClient {
   }
 }
 
-export class DecisionUnavailable extends Error {}
+class DecisionUnavailable extends Error {}
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -551,17 +552,4 @@ export function binaryP(answers: Record<string, DecisionAnswer>, name: string): 
 export function choiceProbs(answers: Record<string, DecisionAnswer>, name: string): Record<string, number> | undefined {
   const a = answers[name];
   return a && a.kind === "choice" ? a.probs : undefined;
-}
-
-export function choiceOf(answers: Record<string, DecisionAnswer>, name: string): { choice: string; p: number; probs: Record<string, number>; calibrated: boolean } | undefined {
-  const a = answers[name];
-  if (!a || a.kind !== "choice" || !a.probs) return undefined;
-  const choice = argmax(a.probs);
-  if (!choice) return undefined;
-  return { choice, p: a.probs[choice] ?? 0, probs: a.probs, calibrated: a.calibrated };
-}
-
-export function scoreOf(answers: Record<string, DecisionAnswer>, name: string): { score01: number; probs: Record<string, number> } | undefined {
-  const a = answers[name];
-  return a && a.kind === "score" && a.score01 !== undefined ? { score01: a.score01, probs: a.probs ?? {} } : undefined;
 }

@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readJson, writeJson } from "../util/fs.ts";
-import type { AuxRole, AuxTools, ThinkingLevel, Urgency } from "./types.ts";
+import type { AuxRole, AuxTools, ThinkingLevel } from "./types.ts";
 
 export interface DecisionProviderConfig {
   format: "systemone" | "decisions";
@@ -61,10 +61,11 @@ export interface Config {
       maxConcurrent: number;
       defaultTools: AuxTools;
       /**
-       * How long an aux-emulated decision may take (§9.1.4). An LLM rarely answers within a call
-       * site's own timeout (1.5 s for Janus and the proactive gate), so those answers apply at
-       * the next commit point instead of holding the current one. Where the call site's timeout
-       * is longer, it applies. 0 keeps the call site's timeout.
+       * How long an aux-emulated decision may take (§9.1.4). An LLM rarely answers within a short
+       * call-site timeout (1.5 s for the proactive gate), so this is a floor: the gate gets 20 s,
+       * while Janus keeps its longer `janus.timeoutMs`. A commit point waits for an emulated
+       * answer at most `janus.lateWaitMs`; one that misses it applies at the next commit point.
+       * 0 keeps the call site's timeout.
        */
       emulateTimeoutMs: number;
       guard: { deny: string[]; writesOutsideRepo: "block" | "allow" };
@@ -494,7 +495,7 @@ export function agentDir(): string {
   return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 }
 
-export function realctx2Home(): string {
+function realctx2Home(): string {
   return process.env.REALCTX2_HOME || join(agentDir(), "realctx2");
 }
 
@@ -704,7 +705,7 @@ export function normalizeEnvVarName(raw: string | undefined): string | undefined
   return cleaned.length > 0 ? cleaned : undefined;
 }
 
-export function normalizeSecret(raw: string | undefined): string | undefined {
+function normalizeSecret(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
   const trimmed = raw.trim().replace(/^bearer\s+/i, "").trim();
   return trimmed.length > 0 ? trimmed : undefined;
@@ -833,7 +834,7 @@ export function buildAuthHeaders(
   return headers;
 }
 
-export function configHasInlineSecrets(cfg: Config): boolean {
+function configHasInlineSecrets(cfg: Config): boolean {
   const endpoints: Array<ApiKeyProviderFields | null | undefined> = [
     cfg.providers.decision,
     cfg.providers.embedding.late,
@@ -851,7 +852,7 @@ export function configHasInlineSecrets(cfg: Config): boolean {
   return false;
 }
 
-export const FALLBACK_CONTEXT_WINDOW = 128000;
+const FALLBACK_CONTEXT_WINDOW = 128000;
 
 /** Look up a per-model override by exact `"provider/id"` first, then bare `"id"`. */
 function lookupModelOverride<T>(map: Record<string, T> | undefined, modelName?: string): T | undefined {
@@ -868,7 +869,7 @@ function lookupModelOverride<T>(map: Record<string, T> | undefined, modelName?: 
 }
 
 /** Resolve the active maxWindow setting (`"auto"`, `0` = disabled, or token cap) for `modelName`. */
-export function resolveMaxWindowSetting(cfg: Config, modelName?: string): "auto" | number {
+function resolveMaxWindowSetting(cfg: Config, modelName?: string): "auto" | number {
   const over = lookupModelOverride(cfg.context.modelMaxWindows, modelName);
   if (typeof over === "number" && Number.isFinite(over) && over >= 0) return over;
   return cfg.context.maxWindow;
@@ -910,5 +911,3 @@ export function scaledContext(cfg: Config, modelWindow: number, modelName?: stri
   const innermostMin = cfg.context.climb.innermostMinTokens != null ? Math.max(2 * 8192, Math.round(cfg.context.climb.innermostMinTokens * f)) : 2 * Tmin;
   return { W, Bmin, Tmin, deltaMin, innermostMin, maxToolResult: Math.round(cfg.context.maxToolResultFraction * W) };
 }
-
-export const URGENCY_LEVELS: Urgency[] = ["immediate", "hint", "caption", "passive"];

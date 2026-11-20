@@ -1,6 +1,7 @@
 /** SQLite driver shim: node:sqlite, then bun:sqlite, then better-sqlite3 (A5). */
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
+import { errMsg } from "../util/errors.ts";
 import { ensureDir } from "../util/fs.ts";
 
 export type SqlValue = string | number | bigint | null | Uint8Array;
@@ -44,19 +45,27 @@ function wrap(raw: { exec(sql: string): unknown; prepare(sql: string): unknown; 
       cache.clear();
       raw.close();
     },
+    /**
+     * Run `fn` atomically. A nested call is a savepoint: when it throws, only its own writes roll
+     * back, so an outer transaction that catches the error commits its own work, not half of the
+     * inner one's.
+     */
     transaction<T>(fn: () => T): T {
-      if (depth > 0) return fn();
-      raw.exec("BEGIN");
+      const savepoint = depth > 0 ? `realctx2_sp${depth}` : null;
+      raw.exec(savepoint ? `SAVEPOINT ${savepoint}` : "BEGIN");
       depth++;
       try {
         const out = fn();
-        raw.exec("COMMIT");
+        raw.exec(savepoint ? `RELEASE ${savepoint}` : "COMMIT");
         return out;
       } catch (e) {
         try {
-          raw.exec("ROLLBACK");
+          if (savepoint) {
+            raw.exec(`ROLLBACK TO ${savepoint}`);
+            raw.exec(`RELEASE ${savepoint}`);
+          } else raw.exec("ROLLBACK");
         } catch {
-          // ignore
+          // the error that got us here is the one to report
         }
         throw e;
       } finally {
@@ -93,19 +102,19 @@ export function openDb(path: string): Db {
     }
     return pragmas(wrap(new mod.DatabaseSync(path), "node:sqlite"));
   } catch (e) {
-    errors.push(`node:sqlite: ${(e as Error).message}`);
+    errors.push(`node:sqlite: ${errMsg(e)}`);
   }
   try {
     const mod = require_("bun:sqlite") as { Database: new (p: string) => { exec(sql: string): unknown; prepare(sql: string): unknown; close(): void } };
     return pragmas(wrap(new mod.Database(path), "bun:sqlite"));
   } catch (e) {
-    errors.push(`bun:sqlite: ${(e as Error).message}`);
+    errors.push(`bun:sqlite: ${errMsg(e)}`);
   }
   try {
     const Better = require_("better-sqlite3") as new (p: string) => { exec(sql: string): unknown; prepare(sql: string): unknown; close(): void };
     return pragmas(wrap(new Better(path), "better-sqlite3"));
   } catch (e) {
-    errors.push(`better-sqlite3: ${(e as Error).message}`);
+    errors.push(`better-sqlite3: ${errMsg(e)}`);
   }
   throw new Error(`no SQLite binding available (need Node >= 22.5 for node:sqlite, or install better-sqlite3): ${errors.join("; ")}`);
 }

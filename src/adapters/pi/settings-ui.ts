@@ -49,6 +49,7 @@ import {
   modelsUrlFor,
   testEndpoint,
 } from "../../providers/test-endpoint.ts";
+import { errMsg } from "../../util/errors.ts";
 
 export interface SettingsTheme {
   fg(color: "accent" | "border" | "borderMuted" | "success" | "error" | "warning" | "muted" | "dim" | "text", text: string): string;
@@ -182,7 +183,6 @@ export class Realctx2SettingsComponent implements Component, Focusable {
   private flash: { text: string; tone: "success" | "warning" | "error" | "muted" } | null = null;
   private endpointTests: Partial<Record<EndpointKind, { status: "running"; abort: AbortController } | { status: "done"; result: EndpointTestResult }>> = {};
   private endpointModelsCache: Partial<Record<EndpointKind, { fingerprint: string; result: EndpointModelsResult }>> = {};
-  private lastViewportRowOffset = 0;
   private lastVisibleSelectableIndices: Array<{ rowY: number; index: number }> = [];
 
   constructor(opts: Realctx2SettingsOptions) {
@@ -353,7 +353,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
         (e: unknown) => {
           const cur = this.endpointTests[endpoint];
           if (!cur || cur.status !== "running" || cur.abort !== abort) return;
-          const msg = String((e as Error)?.message ?? e);
+          const msg = errMsg(e);
           const result: EndpointTestResult = {
             endpoint,
             ok: false,
@@ -377,7 +377,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
       this.onSave(structuredClone(next));
       this.flash = { text: message, tone: "success" };
     } catch (e) {
-      this.flash = { text: `Save failed: ${String((e as Error).message ?? e)}`, tone: "error" };
+      this.flash = { text: `Save failed: ${errMsg(e)}`, tone: "error" };
     }
     this.tui?.requestRender();
   }
@@ -1307,7 +1307,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
         modal.abort = undefined;
         modal.status = "error";
         modal.models = [];
-        modal.error = String((e as Error)?.message ?? e) || "Could not fetch /v1/models.";
+        modal.error = errMsg(e) || "Could not fetch /v1/models.";
         modal.selected = 0;
         this.tui?.requestRender();
       },
@@ -1583,7 +1583,6 @@ export class Realctx2SettingsComponent implements Component, Focusable {
     lines.push(this.spreadRow(` ${t.bold(t.fg("accent", crumbs))}`, `${rightText} `, w));
 
     this.lastVisibleSelectableIndices = [];
-    this.lastViewportRowOffset = lines.length;
 
     if (this.modal) {
       lines.push(...this.renderModal(this.modal, w));

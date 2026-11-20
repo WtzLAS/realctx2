@@ -14,6 +14,7 @@ import { Telemetry } from "../core/telemetry.ts";
 import type { DecisionClient } from "../core/types.ts";
 import { MemoryRuntime } from "../memory/runtime.ts";
 import { createEmbeddingClients } from "../providers/embedding.ts";
+import { errMsg } from "../util/errors.ts";
 import { tryLock } from "../util/fs.ts";
 
 export interface WorkerOptions {
@@ -91,7 +92,7 @@ export async function runWorker(o: WorkerOptions): Promise<WorkerReport> {
             mem.graph.syncIndex(scope);
           }
         } catch (e) {
-          telemetry.event("compact.failed", { scope, error: String((e as Error).message) });
+          telemetry.event("compact.failed", { scope, error: errMsg(e) });
         }
       }
       return report;
@@ -106,15 +107,15 @@ export async function runWorker(o: WorkerOptions): Promise<WorkerReport> {
       try {
         report.embedded = (await mem.warm(AbortSignal.timeout(5 * 60_000))).embedded;
       } catch (e) {
-        telemetry.event("worker.embed_failed", { error: String((e as Error).message) });
+        telemetry.event("worker.embed_failed", { error: errMsg(e) });
       }
     }
     telemetry.rotate(30);
     telemetry.event("worker.done", { project: project.projectKey, ...report, hygiene: undefined });
     return report;
   } catch (e) {
-    telemetry.event("worker.failed", { error: String((e as Error).message ?? e) });
-    return { ran: false, reason: String((e as Error).message ?? e) };
+    telemetry.event("worker.failed", { error: errMsg(e) });
+    return { ran: false, reason: errMsg(e) };
   } finally {
     try {
       mem?.shutdown();

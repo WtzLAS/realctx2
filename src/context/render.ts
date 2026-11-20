@@ -1,5 +1,5 @@
 /** Deterministic rendering: transcript excerpts for model evidence, guidance and consolidated messages. */
-import type { ConsolidationRecord, EntryView, Intent, IntentOutcome, KnowledgeItem } from "../core/types.ts";
+import type { EntryView, Intent, IntentOutcome, KnowledgeItem } from "../core/types.ts";
 import { clipTokens, estimateTokens, headTail } from "../util/text.ts";
 import type { Unit } from "./rounds.ts";
 import type { SessionState } from "./state.ts";
@@ -165,8 +165,4 @@ export function renderReinjection(state: SessionState, budgetTokens: number): st
     if (lines.length) push(`Knowledge kept from earlier work:\n${lines.join("\n")}`);
   }
   return parts.join("\n\n");
-}
-
-export function recordHeader(r: ConsolidationRecord): string {
-  return `${r.id} (${r.kind}${r.outcome ? `, ${r.outcome}` : ""})`;
 }

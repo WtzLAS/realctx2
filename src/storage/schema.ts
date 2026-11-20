@@ -25,9 +25,9 @@ import {
 } from "../core/types.ts";
 import { sha256 } from "../util/text.ts";
 
-export const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 1;
 /** Schema version this build writes. Clients older than meta.minWriter open read-only (§7.13). */
-export const WRITER_VERSION = 1;
+const WRITER_VERSION = 1;
 export const REALCTX2_VERSION = "0.6.0";
 
 export const PLAIN_FIELDS = [
@@ -78,7 +78,7 @@ export function evidenceKey(e: Evidence): string {
   return sha256(`${e.quote}|${e.source.type}:${e.source.ref}`).slice(0, 16);
 }
 
-export function edgeId(src: string, rel: string, dst: string): string {
+function edgeId(src: string, rel: string, dst: string): string {
   return sha256(`${src}|${rel}|${dst}`).slice(0, 24);
 }
 
@@ -199,7 +199,7 @@ export function nodeFromJson(id: string, j: unknown): MemoryNode | string {
   return node;
 }
 
-export function edgeFromJson(id: string, j: unknown): MemoryEdge | null {
+function edgeFromJson(id: string, j: unknown): MemoryEdge | null {
   if (!isRecord(j) || j.removed === true) return null;
   if (typeof j.src !== "string" || typeof j.dst !== "string" || !RELATIONS.includes(j.rel as MemoryEdge["rel"])) return null;
   return {

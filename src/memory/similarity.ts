@@ -14,6 +14,7 @@ import { symmetricMaxSim } from "../providers/late.ts";
 import { embedHash, embedText } from "../storage/index.ts";
 import type { TurnIndex } from "../storage/turnindex.ts";
 import type { Scored, VectorTables } from "../storage/vectors.ts";
+import { errMsg } from "../util/errors.ts";
 import { readJson, writeJson } from "../util/fs.ts";
 import { clamp, cosine, median, sha256, trigramJaccard } from "../util/text.ts";
 import { CALIBRATION_SET_VERSION, CALIBRATION_TARGETS, calibrationPairs } from "./calibration-data.ts";
@@ -21,7 +22,7 @@ import type { MemoryGraph, ScopeHandle } from "./graph.ts";
 
 export type SimMode = "late" | "dense" | "lexical";
 export type ThresholdName = "dedup" | "conflict" | "floor" | "fusion" | "intentDuplicate" | "analogous";
-export const THRESHOLD_NAMES: ThresholdName[] = ["dedup", "conflict", "floor", "fusion", "intentDuplicate", "analogous"];
+const THRESHOLD_NAMES: ThresholdName[] = ["dedup", "conflict", "floor", "fusion", "intentDuplicate", "analogous"];
 const LEXICAL_THRESHOLDS: Record<ThresholdName, number> = { dedup: 0.9, intentDuplicate: 0.9, analogous: 0.8, conflict: 0.5, fusion: 0.6, floor: 0 };
 
 export interface Encoded {
@@ -213,7 +214,7 @@ export class Similarity {
       this.telemetry?.event("calibration.done", { model: cal.modelKey, thresholds });
       return { ok: true };
     } catch (e) {
-      const problem = String((e as Error).message ?? e);
+      const problem = errMsg(e);
       this.telemetry?.event("calibration.failed", { problem });
       return { ok: false, problem };
     }
@@ -416,7 +417,7 @@ export class Similarity {
           }
           done += nodes.length;
         } catch (e) {
-          this.telemetry?.event("embed.nodes_failed", { scope, kind, error: String((e as Error).message) });
+          this.telemetry?.event("embed.nodes_failed", { scope, kind, error: errMsg(e) });
         }
       }
     }
@@ -507,7 +508,7 @@ export class Similarity {
         }
         done += rows.length;
       } catch (e) {
-        this.telemetry?.event("embed.turns_failed", { kind, error: String((e as Error).message) });
+        this.telemetry?.event("embed.turns_failed", { kind, error: errMsg(e) });
         break;
       }
     }

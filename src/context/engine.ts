@@ -7,24 +7,27 @@
 import type { Config } from "../core/config.ts";
 import { effectiveCacheTtlSeconds, isContextEngineEnabled, scaledContext } from "../core/config.ts";
 import type { Telemetry } from "../core/telemetry.ts";
-import type { Clock, CommitBatch, ConsolidationRecord, ContextEdit, DecisionClient, Delivery, DeliveryChannel, EntryView, GuidanceMessage, HarnessAdapter, Intent, IntentOutcome, KnowledgeItem, ScopedNode, ScopeName, SessionRecord } from "../core/types.ts";
+import type { Clock, CommitBatch, ConsolidationRecord, ContextEdit, DecisionClient, Delivery, DeliveryChannel, EntryView, GuidanceMessage, HarnessAdapter, Intent, IntentOutcome, ScopedNode, ScopeName, SessionRecord } from "../core/types.ts";
 import { emptyBatch } from "../core/types.ts";
 import { renderCards } from "../memory/cards.ts";
 import { commandActions, type PathEvent, type Shown } from "../memory/delivery.ts";
 import type { Retriever } from "../memory/retrieve.ts";
 import type { MemoryRuntime } from "../memory/runtime.ts";
-import type { Candidate } from "../memory/write.ts";
 import { rawTurnId } from "../storage/turnindex.ts";
+import { raceTimeout } from "../util/async.ts";
+import { errMsg } from "../util/errors.ts";
 import { randomId8 } from "../util/ids.ts";
 import { normalizeCommandParts } from "../util/shell.ts";
-import { estimateTokens, extractPathTokens, ngramOverlap, quantile, sha256 } from "../util/text.ts";
+import { estimateTokens, extractPathTokens, ngramOverlap } from "../util/text.ts";
 import { type BlobStore, guardToolResult } from "./archive.ts";
 import { Attributor } from "./attribution.ts";
-import { checkInvariants, Consolidator, knowledgeKey, planReplace, renderForAux, type ReplacePlan, spanFingerprint } from "./consolidate.ts";
+import { checkInvariants, Consolidator, planReplace, renderForAux, type ReplacePlan, spanFingerprint } from "./consolidate.ts";
+import { Harvester } from "./harvest.ts";
 import { Janus, type JanusInput, type JanusPlan } from "./janus.ts";
+import { Palim } from "./palim.ts";
 import { GUIDANCE_TYPE, renderGuidance, renderLateCards, renderPalim, renderPrecip, renderReinjection, renderReminder } from "./render.ts";
-import { alignToUnits, latestRoundStart, roundCount, roundsBefore, sumTokens, toUnits, type Unit, workingTail } from "./rounds.ts";
-import { type Region, SessionState } from "./state.ts";
+import { alignToUnits, latestRoundStart, roundCount, sumTokens, toUnits, type Unit, workingTail } from "./rounds.ts";
+import { SessionState } from "./state.ts";
 
 export interface EngineOptions {
   adapter: HarnessAdapter;
@@ -83,16 +86,6 @@ interface JanusRun {
   intents: number;
 }
 
-interface FoldJob {
-  key: string;
-  level: number;
-  kind: "ordinary" | "prepared" | "cold";
-  promise: Promise<ReplacePlan | null>;
-  plan: ReplacePlan | null;
-  done: boolean;
-  startedRound: number;
-}
-
 interface PrecipJob {
   intent: Intent;
   outcome: IntentOutcome;
@@ -109,15 +102,6 @@ interface PrecipJob {
   attributionOnly?: boolean;
 }
 
-interface FoldSpan {
-  level: number;
-  from: number;
-  to: number;
-  tokens: number;
-  consolidated: number;
-  intent: Intent | null;
-}
-
 const ROOT = "root";
 
 export class ContextEngine {
@@ -129,6 +113,10 @@ export class ContextEngine {
   readonly janus: Janus;
   readonly consolidator: Consolidator;
   readonly attributor: Attributor;
+  /** Folds of stable prefixes and pressure relief (§5.4). */
+  readonly palim: Palim;
+  /** Episodes and knowledge handed to long-term memory (§5.3.4, §5.4.4). */
+  private readonly harvester: Harvester;
   readonly light: boolean;
   private readonly telemetry?: Telemetry;
   private readonly clock: Clock;
@@ -151,7 +139,6 @@ export class ContextEngine {
   private janusStartedThisTurn = false;
   private closeProb: Record<string, number> = {};
   private precipJobs: PrecipJob[] = [];
-  private foldJobs = new Map<string, FoldJob>();
   /** Plans applied to a live request through the `context` hook, to be persisted at the next commit point. */
   private appliedNow: ReplacePlan[] = [];
   private actions = new Map<string, PathEvent[]>();
@@ -160,15 +147,11 @@ export class ContextEngine {
   private shownThisTurn = new Set<string>();
   private lastRequestAt = 0;
   private requests = 0;
-  private harvested = new Set<string>();
-  private lastEpisode: { scope: ScopeName; id: string } | null = null;
-  private episodes = new Map<string, { scope: ScopeName; id: string }>();
   private background = new Set<Promise<unknown>>();
   private lastReminderRound = new Map<string, number>();
   private statsDirty = false;
   private indexedEntries: Set<string> | null = null;
   private projectRuleIds = new Set<string>();
-  private exhaustedNotifiedAt = -1;
   /** Tokens saved by edits queued in this step: the harness's request size does not reflect them yet. */
   private savedThisStep = 0;
   problems: string[] = [];
@@ -192,6 +175,35 @@ export class ContextEngine {
     this.janus = new Janus({ cfg: o.cfg, decision: o.decision, aux, sim: this.memory?.sim ?? null });
     this.consolidator = new Consolidator({ aux, maxInputTokens: () => Math.max(8000, Math.floor(this.window() * 0.4)) });
     this.attributor = new Attributor({ cfg: o.cfg, decision: o.decision, graph: this.memory?.graph, delivery: this.memory?.delivery, accounting: this.memory?.accounting, log: this.memory?.evoLog });
+    this.harvester = new Harvester({
+      memory: this.memory,
+      sessionId: o.sessionId,
+      consolidator: this.consolidator,
+      state: () => this.state,
+      emit: (record) => this.emit(record),
+      track: (p) => this.track(p),
+    });
+    this.palim = new Palim({
+      cfg: o.cfg,
+      adapter: o.adapter,
+      consolidator: this.consolidator,
+      telemetry: o.telemetry,
+      entries: () => this.entries,
+      units: () => this.units,
+      state: () => this.state,
+      round: () => this.round,
+      window: () => this.window(),
+      scaled: () => this.scaled(),
+      now: () => this.now(),
+      expectedRequests: () => (this.memory ? this.memory.expectedRequests(this.requests) : 20),
+      closeProb: (intentId) => this.closeProb[intentId] ?? 0,
+      savedThisStep: () => this.savedThisStep,
+      statsChanged: () => {
+        this.statsDirty = true;
+      },
+      track: (p) => this.track(p),
+      commitPlan: (plan, opts) => this.commitPlan(plan, opts),
+    });
   }
 
   // ───────────── basics
@@ -225,11 +237,10 @@ export class ContextEngine {
     const [entries, records] = await Promise.all([this.adapter.listEntries(), this.adapter.listRecords()]);
     this.state = SessionState.from(records);
     this.setEntries(entries);
-    this.harvested = new Set();
-    for (const r of this.state.records.values()) for (const k of r.knowledge ?? []) this.harvested.add(knowledgeKey(k));
+    this.harvester.reset();
     // jobs and ephemeral turn/branch state planned against another branch are void
     this.precipJobs = [];
-    this.foldJobs.clear();
+    this.palim.reset();
     this.appliedNow = [];
     this.janusRun = null;
     this.lateJanus = null;
@@ -244,9 +255,6 @@ export class ContextEngine {
     this.lastReminderRound.clear();
     this.statsDirty = false;
     this.savedThisStep = 0;
-    this.exhaustedNotifiedAt = -1;
-    this.lastEpisode = null;
-    this.episodes.clear();
     this.indexedEntries = null;
     this.pending = emptyBatch();
     this.unresolvedDeliveries = [];
@@ -454,7 +462,7 @@ export class ContextEngine {
               }
             }
           } catch (e) {
-            this.telemetry?.event("proactive.failed", { error: String((e as Error).message) });
+            this.telemetry?.event("proactive.failed", { error: errMsg(e) });
           }
         }
         this.emit({ type: "realctx2.intent", intent: { ...kindled } });
@@ -492,11 +500,11 @@ export class ContextEngine {
       },
       (e) => {
         late.done = true;
-        this.telemetry?.event("proactive.failed", { error: String((e as Error).message) });
+        this.telemetry?.event("proactive.failed", { error: errMsg(e) });
         return null;
       },
     );
-    await Promise.race([settled, new Promise((r) => setTimeout(r, this.cfg.janus.lateWaitMs))]);
+    await raceTimeout(settled, this.cfg.janus.lateWaitMs);
     if (late.done) return late.result;
     this.lateCards = late;
     return null;
@@ -671,7 +679,7 @@ export class ContextEngine {
     if (!this.janus.slow()) return this.janus.decide(input);
     if (this.janusInFlight > 0) return null;
     const run = this.runJanus(input);
-    await Promise.race([run.promise.catch(() => null), new Promise((r) => setTimeout(r, this.cfg.janus.lateWaitMs))]);
+    await raceTimeout(run.promise.catch(() => null), this.cfg.janus.lateWaitMs);
     if (run.done) return run.plan;
     this.deferJanus(run);
     return null;
@@ -712,7 +720,7 @@ export class ContextEngine {
             if (rel) mem.paths.noteWrite(rel);
           }
         } catch (e) {
-          this.telemetry?.event("paths.track_failed", { error: String((e as Error).message) });
+          this.telemetry?.event("paths.track_failed", { error: errMsg(e) });
         }
       }
       // Nested calls skip [paths] injection, so programmatic callers are not corrupted.
@@ -790,7 +798,7 @@ export class ContextEngine {
         let plan: JanusPlan | null = null;
         let input: JanusInput | null = null;
         if (run) {
-          if (!run.done) await Promise.race([run.promise.catch(() => null), new Promise((r) => setTimeout(r, this.cfg.janus.lateWaitMs))]);
+          if (!run.done) await raceTimeout(run.promise.catch(() => null), this.cfg.janus.lateWaitMs);
           if (run.done) {
             plan = this.current(run);
             input = run.input;
@@ -826,10 +834,10 @@ export class ContextEngine {
       if (!this.light) {
         this.startPrecipJobs(false);
         if (this.level > 0) {
-          this.climb();
-          this.startOrdinaryFolds();
-          await this.pressure(signal);
-        } else this.shadowPalim();
+          this.palim.climb();
+          this.palim.startOrdinaryFolds();
+          await this.palim.pressure(signal);
+        } else this.palim.shadow();
       }
     }
     this.indexTurns();
@@ -876,7 +884,7 @@ export class ContextEngine {
     if (signal?.aborted) return;
     await this.idleHarvest(signal);
     if (signal?.aborted || this.level === 0 || !ctxOn) return;
-    this.prepareColdFolds(signal);
+    this.palim.prepareColdFolds(signal);
   }
 
   /**
@@ -890,7 +898,7 @@ export class ContextEngine {
     const lastWrite = Math.max(this.lastRequestAt, this.adapter.lastCacheWriteAt?.() ?? 0);
     const cold = lastWrite > 0 && now - lastWrite >= effectiveCacheTtlSeconds(this.cfg, this.adapter.modelName()) * 1000;
     this.lastRequestAt = now;
-    const ready = [...this.foldJobs.values()].filter((j) => j.done && j.plan);
+    const ready = [...this.palim.jobs.values()].filter((j) => j.done && j.plan);
     if (!ready.length) return null;
     const tokens = await this.adapter.requestTokens();
     const over = tokens !== null && tokens > this.window();
@@ -900,7 +908,7 @@ export class ContextEngine {
     const edits: ContextEdit[] = [];
     for (const job of pick.sort((a, b) => a.level - b.level)) {
       const plan = job.plan!;
-      this.foldJobs.delete(job.key);
+      this.palim.jobs.delete(job.key);
       if (this.invariants(plan, false)) continue;
       edits.push(...plan.edits);
       this.appliedNow.push(plan);
@@ -922,7 +930,7 @@ export class ContextEngine {
     const [from, to] = span;
     const first = this.entries[to];
     if (!first) return null;
-    const carry = this.carried(from, to);
+    const carry = this.palim.carried(from, to);
     const out = await this.consolidator.ripple({ text: renderForAux(this.entries, from, to, Math.floor(this.window() * 0.5)), carry, telos: this.state.stack.map((i) => i.label), instructions: opts.instructions, pressure: true }, opts.signal);
     if (!out) return null;
     const id = this.consolidator.newId(this.state);
@@ -946,9 +954,9 @@ export class ContextEngine {
   onCompacted(record: ConsolidationRecord, compactionEntryId?: string): CommitBatch {
     const final: ConsolidationRecord = compactionEntryId ? { ...record, anchorId: compactionEntryId } : record;
     this.emit({ type: "realctx2.consolidation", record: final });
-    this.harvest(final);
+    this.harvester.harvest(final);
     // plans made against the old projection are void
-    this.foldJobs.clear();
+    this.palim.jobs.clear();
     this.appliedNow = [];
     return this.take();
   }
@@ -981,14 +989,13 @@ export class ContextEngine {
     return this.take();
   }
 
-  /** Work that needs a model and was not done: queued for the next session's idle time (§6.6.8). */
-  leftover(): Array<{ kind: "idle-harvest"; records: string[] }> {
-    const unharvested = [...this.state.records.values()].filter((r) => r.kind === "precip" && !r.knowledge && !this.state.parentOf(r.id)).map((r) => r.id);
-    return unharvested.length ? [{ kind: "idle-harvest", records: unharvested }] : [];
-  }
-
   get requestCount(): number {
     return this.requests;
+  }
+
+  /** Idle harvest (§5.4.4) over Precip memories no fold has covered yet; returns the items found. */
+  idleHarvest(signal?: AbortSignal, budgetTokens?: number): Promise<number> {
+    return this.harvester.idleHarvest(signal, budgetTokens);
   }
 
   // ───────────── round statistics 𝓡
@@ -1074,7 +1081,7 @@ export class ContextEngine {
         },
         (e) => {
           job.done = true;
-          this.telemetry?.event("precip.failed", { error: String((e as Error)?.message ?? e) });
+          this.telemetry?.event("precip.failed", { error: errMsg(e) });
           return null;
         },
       );
@@ -1097,7 +1104,7 @@ export class ContextEngine {
       for (const rec of res.updatedRecords) this.emit({ type: "realctx2.consolidation", record: rec });
       this.actions.delete(intent.id);
     } catch (e) {
-      this.telemetry?.event("attribution.failed", { error: String((e as Error).message) });
+      this.telemetry?.event("attribution.failed", { error: errMsg(e) });
     }
     if (job.attributionOnly) return null;
     // the latest round is excluded (invariant 3); it folds into the parent region later
@@ -1158,8 +1165,8 @@ export class ContextEngine {
     this.pending.edits.push(...plan.edits);
     this.memory?.turns?.addConsolidation({ id: plan.record.id, session: this.sessionId, harness: this.adapter.harness, kind: plan.record.kind, at: plan.record.createdAt, text: plan.text });
     this.telemetry?.step({ kind: plan.record.kind, id: plan.record.id, before: plan.record.tokensBefore, after: plan.record.tokensAfter });
-    if (plan.record.kind === "precip") this.handOffEpisode(plan.record);
-    else this.harvest(plan.record);
+    if (plan.record.kind === "precip") this.harvester.handOffEpisode(plan.record);
+    else this.harvester.harvest(plan.record);
     return true;
   }
 
@@ -1172,398 +1179,18 @@ export class ContextEngine {
       if (job.plan) this.commitPlan(job.plan, { allowTail: true });
       job.committed = true;
     }
-    for (const job of [...this.foldJobs.values()]) {
+    const folds = this.palim.jobs;
+    for (const job of [...folds.values()]) {
       if (!job.done || job.kind !== "ordinary") continue;
-      this.foldJobs.delete(job.key);
+      folds.delete(job.key);
       if (job.plan) this.commitPlan(job.plan, { allowTail: false });
     }
     // prepared folds whose span changed, or whose intent closed, are dropped
-    for (const job of [...this.foldJobs.values()]) {
+    for (const job of [...folds.values()]) {
       if (!job.done || !job.plan) continue;
       const from = this.index.get(job.plan.spanIds[0]!);
-      if (from === undefined || spanFingerprint(this.entries, from, from + job.plan.spanIds.length) !== job.plan.fingerprint) this.foldJobs.delete(job.key);
+      if (from === undefined || spanFingerprint(this.entries, from, from + job.plan.spanIds.length) !== job.plan.fingerprint) folds.delete(job.key);
     }
-  }
-
-  // ───────────── memory hand-off (§5.3.4, §5.4.4)
-  private handOffEpisode(record: ConsolidationRecord): void {
-    const mem = this.memory;
-    if (!mem || !record.text || !record.sidecar) return;
-    const intentId = record.intentId;
-    const entryIds = record.children.filter((c): c is { entryId: string } => "entryId" in c).map((c) => c.entryId).slice(0, 64);
-    const body = record.text.split("\n").slice(1).join("\n");
-    const candidate: Candidate = {
-      text: body,
-      title: record.sidecar.outcome_summary || undefined,
-      kind: "episode",
-      origin: "harvest",
-      defaultScope: "personal",
-      artifacts: [...record.sidecar.artifacts, ...record.sidecar.state_changes].slice(0, 32),
-      evaluation: record.outcome === "success" ? "good" : record.outcome === "failure" ? "bad" : "neutral",
-      provenance: { sessionId: this.sessionId, turnId: record.id, entryIds },
-      after: this.lastEpisode ?? undefined,
-      sourceTexts: [body],
-    };
-    void this.track(
-      mem.writer.write([candidate]).then((res) => {
-        const r = res[0];
-        if (r?.id && r.scope && (r.status === "created" || r.status === "merged")) {
-          this.lastEpisode = { scope: r.scope, id: r.id };
-          if (intentId) this.episodes.set(intentId, this.lastEpisode);
-        }
-      }),
-    ).catch(() => undefined);
-  }
-
-  /** Each committed fold sends its knowledge items to the write path, de-duplicated by item hash. */
-  private harvest(record: ConsolidationRecord, source?: string): void {
-    const mem = this.memory;
-    const items = (record.knowledge ?? []).filter((k) => !this.harvested.has(knowledgeKey(k)) && !k.memoryId);
-    if (!mem || !items.length) return;
-    for (const k of items) this.harvested.add(knowledgeKey(k));
-    const episode = record.intentId ? this.episodes.get(record.intentId) : undefined;
-    const candidates: Candidate[] = items.map((k) => ({
-      text: k.fact,
-      kind: /^(run|use|pass|set|call|avoid|add|install|restart|always|never)\b/i.test(k.fact.replace(/^[`"']/, "")) ? "procedure" : "fact",
-      origin: "harvest",
-      evaluation: k.evaluation,
-      validFrom: k.as_of && !Number.isNaN(Date.parse(k.as_of)) ? new Date(k.as_of).toISOString() : undefined,
-      supersedesHint: k.supersedes,
-      provenance: { sessionId: this.sessionId, turnId: record.id },
-      evidence: source ? [] : [{ quote: k.fact, source: { type: "session", ref: record.id } }],
-      sourceTexts: [record.text ?? ""],
-      episode,
-    }));
-    void this.track(
-      mem.writer.write(candidates).then((res) => {
-        let any = false;
-        const knowledge = (record.knowledge ?? []).map((k) => {
-          const i = items.indexOf(k);
-          const id = i >= 0 ? res[i]?.id : undefined;
-          if (!id) return k;
-          any = true;
-          return { ...k, memoryId: id };
-        });
-        // the record learns which memories its knowledge went into (for `inspect`)
-        if (any) this.emit({ type: "realctx2.consolidation", record: { ...(this.state.records.get(record.id) ?? record), knowledge } });
-      }),
-    ).catch(() => undefined);
-  }
-
-  /** Idle harvest (§5.4.4): one ripple-style extraction over Precip memories no fold has covered yet. */
-  async idleHarvest(signal?: AbortSignal, budgetTokens = 12_000): Promise<number> {
-    const open = [...this.state.records.values()].filter((r) => r.kind === "precip" && r.text && !r.knowledge && !this.state.parentOf(r.id)).sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
-    if (!open.length) return 0;
-    const picked: ConsolidationRecord[] = [];
-    let tokens = 0;
-    for (const r of open) {
-      const t = estimateTokens(r.text!);
-      if (tokens + t > budgetTokens && picked.length) break;
-      picked.push(r);
-      tokens += t;
-    }
-    const out = await this.consolidator.ripple({ text: picked.map((r) => r.text!).join("\n\n"), carry: [], telos: [] }, signal);
-    if (!out || signal?.aborted) return 0;
-    // it edits no context: the knowledge is attached to the Precip records and harvested
-    picked.forEach((r, i) => {
-      // the first record carries the items; the others are marked as covered
-      const knowledge: KnowledgeItem[] = i === 0 ? out.knowledge : [];
-      const updated: ConsolidationRecord = { ...r, knowledge };
-      this.emit({ type: "realctx2.consolidation", record: updated });
-      if (knowledge.length) this.harvest(updated);
-    });
-    return out.knowledge.length;
-  }
-
-  // ───────────── Palim: ordinary mode (§5.4.2)
-  private occupancy(requestTokens: number | null): number {
-    const base = requestTokens ?? this.entries.reduce((s, e) => s + (e.omitted ? 0 : e.tokens), 0);
-    const q = this.state.stats.roundTokens.length ? quantile(this.state.stats.roundTokens, this.cfg.context.q) : 0;
-    return base + q;
-  }
-
-  private lastOccupancy = 0;
-
-  private fast(): boolean {
-    return this.lastOccupancy > this.cfg.context.climb.fastOccupancy * this.window();
-  }
-
-  private stable(region: Region, depth: number): boolean {
-    const c = this.cfg.context.climb;
-    const need = Math.max(1, Math.round(c.stableRounds / (this.fast() ? c.fastFactor : 1)));
-    if (region.level === depth && region.intent) {
-      // the innermost level keeps growing: it counts as stable once its intent has run long enough
-      return Janus.roundsSince(region.intent, this.entries, this.units) >= need;
-    }
-    return roundCount(this.units) - roundsBefore(this.units, region.to) >= need;
-  }
-
-  /** At most once every `roundsPerLevel` rounds, the frontier rises by one level if the next one is stable. */
-  private climb(): void {
-    const c = this.cfg.context.climb;
-    if (!c.enabled) return;
-    const regions = this.state.regions(this.entries);
-    const depth = regions.length - 1;
-    const f = Math.min(this.state.stats.frontier ?? 0, depth);
-    if (f !== this.state.stats.frontier) {
-      this.state.stats.frontier = f;
-      this.statsDirty = true;
-    }
-    if (f >= depth) return;
-    const every = Math.max(1, Math.round(c.roundsPerLevel / (this.fast() ? c.fastFactor : 1)));
-    if (this.round - (this.state.stats.lastClimbRound ?? 0) < every) return;
-    if (!this.stable(regions[f + 1]!, depth)) return;
-    this.state.stats.frontier = f + 1;
-    this.state.stats.lastClimbRound = this.round;
-    this.statsDirty = true;
-  }
-
-  /** The span a fold of a level would cover: its body before the working tail, from the last fold on. */
-  private foldSpan(region: Region, tailStart: number): FoldSpan | null {
-    // guidance messages of open intents are never folded
-    const bodyFrom = region.intent ? region.from + 1 : region.from;
-    const bodyTo = Math.min(region.to, tailStart);
-    if (bodyTo <= bodyFrom) return null;
-    // the unfolded part starts after the last Palim message of this body; that message is an input of the next fold
-    let from = bodyFrom;
-    let unfoldedFrom = bodyFrom;
-    for (let i = bodyTo - 1; i >= bodyFrom; i--) {
-      const e = this.entries[i]!;
-      const rec = !e.omitted && e.edited ? this.state.recordAt(e.id) : null;
-      if (rec && (rec.kind === "palim" || rec.kind === "compaction")) {
-        from = i;
-        unfoldedFrom = i + 1;
-        break;
-      }
-    }
-    const span = alignToUnits(this.units, from, bodyTo);
-    if (!span) return null;
-    let consolidated = 0;
-    for (let i = Math.max(span[0], unfoldedFrom); i < span[1]; i++) {
-      const e = this.entries[i]!;
-      if (!e.omitted && e.edited && this.state.recordAt(e.id)) consolidated++;
-    }
-    const tokens = sumTokens(this.entries, Math.max(span[0], unfoldedFrom), span[1]);
-    return { level: region.level, from: span[0], to: span[1], tokens, consolidated, intent: region.intent };
-  }
-
-  /** Fold only if it pays for itself: Δ̂·p_read·R̂ ≥ S·(p_write − p_read) + C_fold (§5.4.2). */
-  private costCheck(span: FoldSpan, cold: boolean): boolean {
-    const price = this.adapter.pricing();
-    const input = price?.input && price.input > 0 ? price.input : 1;
-    const pRead = price?.cacheRead && price.cacheRead > 0 ? price.cacheRead : 0.1 * input;
-    const pWrite = price?.cacheWrite && price.cacheWrite > 0 ? price.cacheWrite : 1.25 * input;
-    const output = price?.output && price.output > 0 ? price.output : 5 * input;
-    const spanTokens = sumTokens(this.entries, span.from, span.to);
-    const saving = 0.65 * spanTokens;
-    // C_fold: the aux call that writes the fold, in the same units (the main model's prices when the aux model's are unknown)
-    const auxPrice = this.adapter.auxPricing?.("palim") ?? null;
-    const auxIn = auxPrice?.input && auxPrice.input > 0 ? auxPrice.input : input;
-    const auxOut = auxPrice?.output && auxPrice.output > 0 ? auxPrice.output : output;
-    const cFold = spanTokens * auxIn + 0.35 * spanTokens * auxOut;
-    const R = this.memory ? this.memory.expectedRequests(this.requests) : 20;
-    if (cold) return saving * (pWrite + pRead * (R - 1)) >= cFold;
-    const suffix = sumTokens(this.entries, span.to, this.entries.length);
-    return saving * pRead * R >= suffix * (pWrite - pRead) + cFold;
-  }
-
-  private dueSpans(): Array<{ span: FoldSpan; passes: boolean; coldOnly: boolean }> {
-    const s = this.scaled();
-    const c = this.cfg.context.climb;
-    const regions = this.state.regions(this.entries);
-    const depth = regions.length - 1;
-    const tail = workingTail(this.entries, this.units, this.cfg, this.window(), this.state.stats.roundTokens, { modelName: this.adapter.modelName() });
-    const f = c.enabled ? Math.min(this.state.stats.frontier ?? 0, depth) : 0;
-    const out: Array<{ span: FoldSpan; passes: boolean; coldOnly: boolean }> = [];
-    for (const region of regions) {
-      if (region.level > f) break;
-      const span = this.foldSpan(region, tail.start);
-      if (!span) continue;
-      const innermost = region.level === depth && depth > 0;
-      // size: below the innermost level, E_min consolidated messages and T_min tokens; at the innermost, more
-      if (innermost ? span.tokens < s.innermostMin : span.consolidated < this.cfg.context.Emin || span.tokens < s.Tmin) continue;
-      // no closure expected: an intent about to close is consolidated whole by Precip anyway
-      if (region.intent && (this.closeProb[region.intent.id] ?? 0) >= c.skipCloseProb) continue;
-      const check = c.costCheck && !this.fast();
-      const warm = !check || this.costCheck(span, false);
-      const cold = warm || this.costCheck(span, true);
-      out.push({ span, passes: warm, coldOnly: !warm && cold });
-    }
-    return out;
-  }
-
-  private foldKey(span: FoldSpan): string {
-    return `${span.level}:${sha256(spanFingerprint(this.entries, span.from, span.to)).slice(0, 16)}`;
-  }
-
-  /** Knowledge items of earlier folds inside a span: carried forward without re-judging them. */
-  private carried(from: number, to: number): KnowledgeItem[] {
-    const out: KnowledgeItem[] = [];
-    for (let i = from; i < to; i++) {
-      const e = this.entries[i]!;
-      if (e.omitted) continue;
-      const rec = this.state.recordAt(e.id);
-      if (rec?.knowledge) out.push(...rec.knowledge);
-    }
-    return out;
-  }
-
-  private async generateFold(span: FoldSpan, opts: { pressure: boolean; signal?: AbortSignal }): Promise<ReplacePlan | null> {
-    const entries = this.entries;
-    const state = this.state;
-    const before = sumTokens(entries, span.from, span.to);
-    const telos = [...(span.intent ? state.telos(span.intent) : []), ...(span.intent ? [span.intent.label] : [])];
-    const carry = this.carried(span.from, span.to);
-    const text = renderForAux(entries, span.from, span.to, Math.max(8000, Math.floor(this.window() * 0.4)));
-    const deltaMin = this.scaled().deltaMin;
-    // keep the fold only if it saves at least Δ_min; otherwise retry with an instruction to be more concise
-    for (let attempt = 0; attempt <= this.cfg.context.foldRetries; attempt++) {
-      if (opts.signal?.aborted) return null;
-      const out = await this.consolidator.ripple({ text, carry, telos, pressure: opts.pressure, concise: attempt }, opts.signal);
-      if (!out) return null;
-      const id = this.consolidator.newId(state);
-      const rendered = renderPalim(id, out.narrative, out.knowledge);
-      if (before - estimateTokens(rendered) < deltaMin) continue;
-      return planReplace(entries, state, span.from, span.to, { id, kind: "palim", text: rendered, intent: span.intent ?? undefined, telos, model: this.adapter.modelName(), now: this.now(), knowledge: out.knowledge });
-    }
-    // a failed fold leaves its source intact
-    return null;
-  }
-
-  private startFold(span: FoldSpan, kind: FoldJob["kind"], signal?: AbortSignal): FoldJob | null {
-    const key = this.foldKey(span);
-    const have = this.foldJobs.get(key);
-    if (have) return have;
-    // one fold per level at a time
-    for (const j of this.foldJobs.values()) if (j.level === span.level && !j.done) return null;
-    const job: FoldJob = { key, level: span.level, kind, promise: Promise.resolve(null), plan: null, done: false, startedRound: this.round };
-    job.promise = this.track(this.generateFold(span, { pressure: kind === "prepared", signal })).then(
-      (plan) => {
-        job.plan = plan;
-        job.done = true;
-        if (!plan) this.foldJobs.delete(key);
-        return plan;
-      },
-      () => {
-        job.done = true;
-        this.foldJobs.delete(key);
-        return null;
-      },
-    );
-    this.foldJobs.set(key, job);
-    return job;
-  }
-
-  private startOrdinaryFolds(): void {
-    for (const d of this.dueSpans()) {
-      if (d.passes) this.startFold(d.span, "ordinary");
-      else {
-        this.state.stats.foldsSkippedByCost++;
-        this.statsDirty = true;
-      }
-    }
-  }
-
-  /** Folds that fail the warm-cache check but pay off on a cold cache are prepared during idle time. */
-  private prepareColdFolds(signal?: AbortSignal): void {
-    for (const d of this.dueSpans()) if (d.coldOnly) this.startFold(d.span, "cold", signal);
-  }
-
-  // ───────────── Palim: pressure mode (§5.4.3)
-  private sweepSpans(minimalTail: boolean): FoldSpan[] {
-    const tail = workingTail(this.entries, this.units, this.cfg, this.window(), this.state.stats.roundTokens, { minimal: minimalTail, modelName: this.adapter.modelName() });
-    const out: FoldSpan[] = [];
-    // root prefix, then open-intent regions from outermost to innermost
-    for (const region of this.state.regions(this.entries)) {
-      const span = this.foldSpan(region, tail.start);
-      if (span && sumTokens(this.entries, span.from, span.to) > this.scaled().deltaMin) out.push(span);
-    }
-    return out;
-  }
-
-  private async pressure(signal?: AbortSignal): Promise<void> {
-    const W = this.window();
-    const rho = this.cfg.context.rho * W;
-    const measure = async () => {
-      const req = await this.adapter.requestTokens();
-      // the harness reports the size before this step's edits: subtract what they save
-      return this.occupancy(req === null ? null : Math.max(0, req - this.savedThisStep));
-    };
-    let P = await measure();
-    this.lastOccupancy = P;
-    if (P <= rho) {
-      // preparing ahead: work out the folds the sweep would make, without committing them
-      if (P > this.cfg.context.prepareFraction * W) for (const span of this.sweepSpans(false).slice(0, 2)) this.startFold(span, "prepared");
-      return;
-    }
-    this.telemetry?.event("pressure", { P, W });
-    // ready folds commit at once, so the request does not wait for an aux session
-    for (const job of [...this.foldJobs.values()].sort((a, b) => a.level - b.level)) {
-      if (!job.done || !job.plan) continue;
-      this.foldJobs.delete(job.key);
-      this.commitPlan(job.plan, { allowTail: false });
-    }
-    P = await measure();
-    // SWEEP: root prefix, open-intent regions outermost to innermost; then with the tail shrunk to unfinished rounds
-    for (const minimal of [false, true]) {
-      if (P <= rho) break;
-      let progress = true;
-      while (P > rho && progress && !signal?.aborted) {
-        progress = false;
-        for (const span of this.sweepSpans(minimal)) {
-          if (P <= rho || signal?.aborted) break;
-          const pending = this.foldJobs.get(this.foldKey(span));
-          const plan = pending && !pending.done ? await pending.promise : await this.generateFold(span, { pressure: true, signal });
-          if (pending) this.foldJobs.delete(pending.key);
-          if (!plan) continue;
-          if (this.commitPlan(plan, { allowTail: false, minimalTail: minimal })) {
-            progress = true;
-            P = await measure();
-          }
-        }
-      }
-    }
-    this.lastOccupancy = P;
-    if (P > W && this.exhaustedNotifiedAt !== this.round) {
-      // capacity exhaustion: report it before the request goes out; never truncate silently
-      this.exhaustedNotifiedAt = this.round;
-      this.adapter.notify(`realctx2: the context is at capacity (${Math.round(P)} of ${W} tokens) and nothing more can be consolidated. Consider /compact or starting a new session.`, "warning");
-      this.telemetry?.event("capacity.exhausted", { P, W });
-    }
-  }
-
-  // ───────────── append-only harnesses: shadow Palim (§4.6.3)
-  /** No in-place fold: knowledge is produced incrementally, for harvest and the post-compaction injection. */
-  private shadowPalim(): void {
-    const s = this.scaled();
-    const open = [...this.state.records.values()].filter((r) => r.kind === "precip" && r.text && !this.state.parentOf(r.id));
-    const tokens = open.reduce((n, r) => n + r.tokensBefore, 0);
-    if (open.length < this.cfg.context.Emin || tokens < s.Tmin) return;
-    const key = `shadow:${open.map((r) => r.id).join(",")}`;
-    if (this.foldJobs.has(key)) return;
-    const job: FoldJob = { key, level: 0, kind: "ordinary", promise: Promise.resolve(null), plan: null, done: false, startedRound: this.round };
-    const state = this.state;
-    job.promise = this.track(
-      (async () => {
-        const out = await this.consolidator.ripple({ text: open.map((r) => r.text!).join("\n\n"), carry: open.flatMap((r) => r.knowledge ?? []), telos: state.stack.map((i) => i.label) });
-        if (!out) return null;
-        const id = this.consolidator.newId(state);
-        const text = renderPalim(id, out.narrative, out.knowledge);
-        const record: ConsolidationRecord = { id, kind: "palim", anchorId: open[0]!.anchorId, children: open.map((r) => ({ id: r.id })), telos: state.stack.map((i) => i.label), tokensBefore: tokens, tokensAfter: estimateTokens(text), model: this.adapter.modelName(), createdAt: this.now(), text, knowledge: out.knowledge, shadow: true };
-        return { record, edits: [], spanIds: [], fingerprint: "", text } satisfies ReplacePlan;
-      })(),
-    ).then(
-      (plan) => {
-        job.plan = plan;
-        job.done = true;
-        return plan;
-      },
-      () => {
-        job.done = true;
-        return null;
-      },
-    );
-    this.foldJobs.set(key, job);
   }
 
   // ───────────── the turn index (§5.6)
@@ -1585,7 +1212,7 @@ export class ContextEngine {
         });
       });
     } catch (e) {
-      this.telemetry?.event("turnindex.failed", { error: String((e as Error).message) });
+      this.telemetry?.event("turnindex.failed", { error: errMsg(e) });
     }
   }
 
@@ -1611,11 +1238,11 @@ export class ContextEngine {
       frontier: this.state.stats.frontier ?? 0,
       janusLate: this.state.stats.janusLate,
       foldsSkippedByCost: this.state.stats.foldsSkippedByCost,
-      occupancy: Math.round(this.lastOccupancy),
+      occupancy: Math.round(this.palim.lastOccupancy),
       window,
       disabled: !this.contextEnabled(),
       cacheTtlSeconds: effectiveCacheTtlSeconds(this.cfg, this.adapter.modelName()),
-      jobs: { precip: this.precipJobs.length, folds: this.foldJobs.size },
+      jobs: { precip: this.precipJobs.length, folds: this.palim.jobs.size },
       problems: this.problems.slice(-10),
     };
   }

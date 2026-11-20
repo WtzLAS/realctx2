@@ -11,6 +11,7 @@ import { join, relative } from "node:path";
 import { type ContainerID, decodeImportBlobMeta, type ImportBatchDetail, LoroDoc, LoroMap, VersionVector } from "loro-crdt";
 import type { Config } from "../core/config.ts";
 import type { Clock, ScopeName } from "../core/types.ts";
+import { errMsg } from "../util/errors.ts";
 import { ensureDir, fileSize, listFiles, readJson, removeFile, tryLock, withLockSync, writeFileAtomic, writeJson } from "../util/fs.ts";
 import { type Git, runSync } from "../util/git.ts";
 import { stableId8 } from "../util/ids.ts";
@@ -64,7 +65,8 @@ export interface StoreProblem {
 export interface FlushResult {
   file: string | null;
   bytes: number;
-  kind: "update" | "snapshot" | "journal" | "none";
+  /** `deferred`: another process held the store lock and the caller asked not to wait for it. */
+  kind: "update" | "snapshot" | "journal" | "deferred" | "none";
 }
 
 const LFS_HEADER = "version https://git-lfs.github.com/spec/v1";
@@ -315,7 +317,7 @@ export class ScopeStore {
     try {
       return new Uint8Array(readFileSync(path));
     } catch (e) {
-      this.problems.push({ file: label, problem: `unreadable: ${(e as Error).message}` });
+      this.problems.push({ file: label, problem: `unreadable: ${errMsg(e)}` });
       return null;
     }
   }
@@ -512,7 +514,7 @@ export class ScopeStore {
       // what kind of changes wait here: the next process to open the store needs to know
       writeJson(`${file}.json`, { kind: this.sd.dirty, deltas: this.sd.counterDeltas });
     } catch (e) {
-      this.problems.push({ file: "pending-shared.loro", problem: `journal write failed: ${(e as Error).message}` });
+      this.problems.push({ file: "pending-shared.loro", problem: `journal write failed: ${errMsg(e)}` });
     }
   }
 
@@ -520,8 +522,12 @@ export class ScopeStore {
    * Write pending changes as one immutable update file.
    * Shared scope: only substantive changes flush on their own; counter-only deltas wait in the
    * journal until `force`, or until `shared.counterFlushThreshold` deltas are buffered (§7.5).
+   *
+   * `wait: false` never blocks the thread on the store lock: while another process holds it (a
+   * compaction in the worker), the changes stay unflushed (shared ones journaled) and the result
+   * is `deferred`. In-session flushes use it; session end and the worker wait.
    */
-  flush(opts: { force?: boolean; keepPurges?: boolean } = {}): FlushResult {
+  flush(opts: { force?: boolean; keepPurges?: boolean; wait?: boolean } = {}): FlushResult {
     const none: FlushResult = { file: null, bytes: 0, kind: "none" };
     if (this.readOnly || this.unloaded || !this.opened) return none;
     this.sd.commit();
@@ -534,21 +540,36 @@ export class ScopeStore {
       return { file: this.opts.journalFile ?? null, bytes: 0, kind: "journal" };
     }
     if (!this.exists()) this.create();
-    return this.withLock(() => {
-      const doc = this.sd.doc;
-      const bytes = doc.export({ mode: "update", from: this.flushedVV });
-      if (bytes.length > this.opts.cfg.storage.maxUpdateBytes) {
-        // an update this large would be skipped by every loader: fold it into a snapshot instead
-        const snap = this.compactLocked({ reason: "oversized-update" });
-        if (snap) return snap;
+    if (opts.wait === false) {
+      const lock = tryLock(this.opts.lockFile);
+      if (!lock) {
+        this.journal();
+        return { file: null, bytes: 0, kind: "deferred" };
       }
-      const name = `${stamp(this.clock())}-${doc.peerIdStr}-${sha256(bytes).slice(0, 8)}.loro`;
-      ensureDir(this.updatesDir);
-      writeFileAtomic(join(this.updatesDir, name), bytes);
-      this.seen.add(`updates/${name}`);
-      this.markFlushed();
-      return { file: join(this.updatesDir, name), bytes: bytes.length, kind: "update" as const };
-    });
+      try {
+        return this.flushLocked();
+      } finally {
+        lock.release();
+      }
+    }
+    return this.withLock(() => this.flushLocked());
+  }
+
+  /** Write the pending changes as one update file; the caller holds the store lock. */
+  private flushLocked(): FlushResult {
+    const doc = this.sd.doc;
+    const bytes = doc.export({ mode: "update", from: this.flushedVV });
+    if (bytes.length > this.opts.cfg.storage.maxUpdateBytes) {
+      // an update this large would be skipped by every loader: fold it into a snapshot instead
+      const snap = this.compactLocked({ reason: "oversized-update" });
+      if (snap) return snap;
+    }
+    const name = `${stamp(this.clock())}-${doc.peerIdStr}-${sha256(bytes).slice(0, 8)}.loro`;
+    ensureDir(this.updatesDir);
+    writeFileAtomic(join(this.updatesDir, name), bytes);
+    this.seen.add(`updates/${name}`);
+    this.markFlushed();
+    return { file: join(this.updatesDir, name), bytes: bytes.length, kind: "update" };
   }
 
   private markFlushed(): void {
@@ -726,7 +747,7 @@ export class ScopeStore {
           this.recovered.push({ ...report, source: "local changes carried over a reload" });
           carried = true;
         } catch (e) {
-          this.problems.push({ problem: `local changes could not be carried over a reload: ${(e as Error).message}` });
+          this.problems.push({ problem: `local changes could not be carried over a reload: ${errMsg(e)}` });
         }
       }
     }
@@ -980,7 +1001,7 @@ export class ScopeStore {
         }
       }
     } catch (e) {
-      this.moveToStranded(names, `recovery failed: ${(e as Error).message}`);
+      this.moveToStranded(names, `recovery failed: ${errMsg(e)}`);
     }
   }
 
@@ -1036,7 +1057,7 @@ export class ScopeStore {
     try {
       res = this.flush(opts);
     } catch (e) {
-      this.problems.push({ problem: `flush at close failed: ${(e as Error).message}` });
+      this.problems.push({ problem: `flush at close failed: ${errMsg(e)}` });
     }
     this.releasePeer();
     this.listeners.clear();

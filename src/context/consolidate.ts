@@ -226,7 +226,7 @@ function strings(v: unknown, max = 24): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((x) => sanitize(x.trim())).slice(0, max) : [];
 }
 
-export function cleanKnowledge(items: unknown): KnowledgeItem[] {
+function cleanKnowledge(items: unknown): KnowledgeItem[] {
   if (!Array.isArray(items)) return [];
   const out: KnowledgeItem[] = [];
   const seen = new Set<string>();

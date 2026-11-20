@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, posix } from "node:path";
 
 /** Shared store directory relative to the project root, in POSIX form. */
-export const SHARED_REL = ".pi/realctx2";
+const SHARED_REL = ".pi/realctx2";
 /** Representative paths inside the shared store (both metadata and CRDT update files). */
 const PROBES = [`${SHARED_REL}/store.json`, `${SHARED_REL}/updates/probe.loro`];
 

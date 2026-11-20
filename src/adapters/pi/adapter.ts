@@ -10,6 +10,7 @@ import { type Config, effectiveMaxWindow } from "../../core/config.ts";
 import type { Telemetry } from "../../core/telemetry.ts";
 import type { AuxRole, AuxSessionRunner, CommandDef, CommitBatch, ContextEdit, EntryView, HarnessAdapter, ModelPricing, SessionRecord, ToolDef } from "../../core/types.ts";
 import type { MemoryRuntime, SessionEntry as RegisteredSession } from "../../memory/runtime.ts";
+import { errMsg } from "../../util/errors.ts";
 import { PiAuxRunner } from "./aux.ts";
 import { archiveEntries, branchRecords, projectedEntries, replacementFor } from "./entries.ts";
 import { toolRenderers } from "./tool-renderers.ts";
@@ -220,7 +221,7 @@ export class PiAdapter implements HarnessAdapter {
         pi.appendEntry(type, data);
       } catch (e) {
         this.deferred.records.push(r);
-        this.telemetry?.event("pi.append_failed", { error: String((e as Error).message ?? e) });
+        this.telemetry?.event("pi.append_failed", { error: errMsg(e) });
       }
     }
     this.deferred.edits.push(...batch.edits);

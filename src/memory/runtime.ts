@@ -8,6 +8,7 @@ import { machineActorId, type ProjectInfo, resolveProject } from "../core/projec
 import type { Telemetry } from "../core/telemetry.ts";
 import type { AuxSessionRunner, Clock, DecisionClient, EmbeddingClient, ScopeName } from "../core/types.ts";
 import { TurnIndex } from "../storage/turnindex.ts";
+import { errMsg } from "../util/errors.ts";
 import { appendJsonl, ensureDir, listFiles, readJson, removeDir, removeFile, tryLock, writeJson } from "../util/fs.ts";
 import { median } from "../util/text.ts";
 import { SessionAccounting } from "./accounting.ts";
@@ -132,7 +133,7 @@ export class MemoryRuntime implements MemoryServices {
       try {
         turns = new TurnIndex(o.layout.turnIndexFile(this.project.projectKey), { fdeDims: o.cfg.index.lateInteraction.fdeDims, fdeQuant: o.cfg.index.lateInteraction.fdeQuant });
       } catch (e) {
-        o.telemetry?.event("turnindex.open_failed", { error: String((e as Error).message) });
+        o.telemetry?.event("turnindex.open_failed", { error: errMsg(e) });
       }
     }
     this.turns = turns;
@@ -189,7 +190,7 @@ export class MemoryRuntime implements MemoryServices {
         this.turns?.removeSession(s.id);
         removeDir(this.layout.sessionDir(s.id));
       } catch (e) {
-        this.telemetry?.event("sessions.drop_failed", { error: String((e as Error).message) });
+        this.telemetry?.event("sessions.drop_failed", { error: errMsg(e) });
       }
     }
     writeJson(f, all.filter((s) => !gone.includes(s)));
@@ -250,7 +251,7 @@ export class MemoryRuntime implements MemoryServices {
       this.graph.refresh();
       if (this.project.root) this.lastReconcile = this.paths.reconcile();
     } catch (e) {
-      this.telemetry?.event("session.start_failed", { error: String((e as Error).message) });
+      this.telemetry?.event("session.start_failed", { error: errMsg(e) });
     }
   }
 
@@ -265,17 +266,24 @@ export class MemoryRuntime implements MemoryServices {
     return { embedded, calibrated };
   }
 
-  /** The periodic flush of long sessions (§7.5): every `storage.flushMinutes`, checked at commit points. */
+  /**
+   * The periodic flush of long sessions (§7.5): every `storage.flushMinutes`, checked at commit
+   * points. It runs on the harness's thread, so it never waits for a store lock another process
+   * holds: such a scope stays due and is retried at the next commit point.
+   */
   flushIfDue(): number {
     const every = this.cfg.storage.flushMinutes * 60_000;
     if (!(every > 0)) return 0;
     const now = this.clock().getTime();
     if (now - this.lastPeriodicFlush < every) return 0;
+    const previous = this.lastPeriodicFlush;
     this.lastPeriodicFlush = now;
     try {
-      return this.graph.flush({ keepPurges: true }).filter((r) => r.kind === "update" || r.kind === "snapshot").length;
+      const results = this.graph.flush({ keepPurges: true, wait: false });
+      if (results.some((r) => r.kind === "deferred")) this.lastPeriodicFlush = previous;
+      return results.filter((r) => r.kind === "update" || r.kind === "snapshot").length;
     } catch (e) {
-      this.telemetry?.event("flush.failed", { error: String((e as Error).message) });
+      this.telemetry?.event("flush.failed", { error: errMsg(e) });
       return 0;
     }
   }
@@ -299,7 +307,7 @@ export class MemoryRuntime implements MemoryServices {
       try {
         return await fn();
       } catch (e) {
-        this.telemetry?.event("idle.step_failed", { step: name, error: String((e as Error).message) });
+        this.telemetry?.event("idle.step_failed", { step: name, error: errMsg(e) });
         return null;
       }
     };
@@ -370,7 +378,7 @@ export class MemoryRuntime implements MemoryServices {
           this.graph.syncIndex(scope);
         }
       } catch (e) {
-        this.telemetry?.event("compact.failed", { scope, error: String((e as Error).message) });
+        this.telemetry?.event("compact.failed", { scope, error: errMsg(e) });
       }
     }
     if (this.turns) this.turns.evict(this.cfg.index.maxBytes);
@@ -399,7 +407,7 @@ export class MemoryRuntime implements MemoryServices {
     try {
       this.accounting.flush(this.graph, this.cfg);
     } catch (e) {
-      this.telemetry?.event("accounting.flush_failed", { error: String((e as Error).message) });
+      this.telemetry?.event("accounting.flush_failed", { error: errMsg(e) });
     }
     if (this.sessionId) this.endSession(this.sessionId, opts.requests ?? 0);
     this.policy?.save();

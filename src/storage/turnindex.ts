@@ -8,7 +8,7 @@ import { type Db, ftsQuery, indexTokens, openDb } from "./sqlite.ts";
 import { type Scored, VectorTables } from "./vectors.ts";
 
 const TURN_SCHEMA = 3;
-export const CHUNK_TOKENS = 512;
+const CHUNK_TOKENS = 512;
 
 export interface TurnRow {
   id: string; // "t:…" or "r:…"

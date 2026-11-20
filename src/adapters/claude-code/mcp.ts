@@ -6,6 +6,7 @@
 import type { Readable, Writable } from "node:stream";
 import type { JSONSchema } from "../../core/types.ts";
 import { REALCTX2_VERSION } from "../../storage/schema.ts";
+import { errMsg } from "../../util/errors.ts";
 
 export interface McpTool {
   name: string;
@@ -112,7 +113,7 @@ export class McpServer {
             const res = await tool.call(args);
             reply({ content: [{ type: "text", text: res.text }], isError: res.isError === true });
           } catch (e) {
-            reply({ content: [{ type: "text", text: `${name} failed: ${String((e as Error).message ?? e)}` }], isError: true });
+            reply({ content: [{ type: "text", text: `${name} failed: ${errMsg(e)}` }], isError: true });
           }
           return;
         }
@@ -127,7 +128,7 @@ export class McpServer {
           if (id !== undefined && id !== null) fail(-32601, `Method not found: ${msg.method}`);
       }
     } catch (e) {
-      fail(-32603, String((e as Error).message ?? e));
+      fail(-32603, errMsg(e));
     }
   }
 }
