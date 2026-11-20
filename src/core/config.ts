@@ -1,4 +1,5 @@
 /** Configuration (§9.4): defaults, the global file, and restricted project overrides. */
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readJson, writeJson } from "../util/fs.ts";
@@ -10,6 +11,7 @@ export interface DecisionProviderConfig {
   model: string;
   apiKeyEnv?: string;
   apiKey?: string;
+  apiKeyFile?: string;
   maxInputTokens?: number;
   maxQuestions?: number;
   registerInPi?: boolean;
@@ -26,6 +28,7 @@ export interface EmbeddingProviderConfig {
   dimensions?: number;
   apiKeyEnv?: string;
   apiKey?: string;
+  apiKeyFile?: string;
   role?: "input_type" | "prefix" | "none";
   queryPrefix?: string;
   documentPrefix?: string;
@@ -602,7 +605,7 @@ export function loadGlobalConfig(layout: Layout): Config {
 export function saveConfig(layout: Layout, next: Config): Record<string, unknown> {
   const existingRaw = readJson<unknown>(layout.configFile, null);
   const diff = diffConfig(next, DEFAULT_CONFIG, existingRaw);
-  writeJson(layout.configFile, diff);
+  writeJson(layout.configFile, diff, configHasInlineSecrets(next) ? 0o600 : undefined);
   return diff;
 }
 
@@ -617,11 +620,178 @@ export function loadConfig(layout: Layout, sharedDir?: string | null, trusted = 
   return { config, overrides, globalFileFound: globalRaw !== null };
 }
 
-export function resolveApiKey(p: { apiKey?: string; apiKeyEnv?: string } | null | undefined): string | undefined {
-  if (!p) return undefined;
-  if (p.apiKey) return p.apiKey;
-  if (p.apiKeyEnv) return process.env[p.apiKeyEnv];
-  return undefined;
+export interface ApiKeyProviderFields {
+  apiKey?: string;
+  apiKeyEnv?: string;
+  apiKeyFile?: string;
+  headers?: Record<string, string>;
+}
+
+export interface ApiKeyInfo {
+  key?: string;
+  source: "literal" | "env" | "file" | "header" | "none";
+  envVar?: string;
+  filePath?: string;
+  warning?: string;
+}
+
+const SENSITIVE_HEADER_RE = /^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key)$|(?:^|[-_])(?:api[-_]?key|token|secret|auth)(?:$|[-_])/i;
+
+export function isSensitiveHeaderName(name: string): boolean {
+  return SENSITIVE_HEADER_RE.test(name.trim());
+}
+
+export function normalizeEnvVarName(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const cleaned = raw.trim().replace(/^\$/, "").trim();
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+export function normalizeSecret(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim().replace(/^bearer\s+/i, "").trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function expandHome(path: string): string {
+  const p = path.trim();
+  if (p === "~") return homedir();
+  if (p.startsWith("~/") || p.startsWith("~\\")) return join(homedir(), p.slice(2));
+  return p;
+}
+
+function unquoteEnvValue(raw: string): string {
+  const t = raw.trim();
+  if (t.length >= 2 && ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")))) {
+    return t.slice(1, -1);
+  }
+  return t;
+}
+
+/**
+ * Read a Bearer secret from a raw single-line token file or a `KEY=VALUE` env file
+ * (such as systemd EnvironmentFile `/etc/pplx-embed-v2-exl3/env` or `/etc/pplx-decider-v1.3-exl3/env`).
+ */
+export function readSecretFromFile(filePath: string, preferredEnvKey?: string): { key?: string; error?: string } {
+  const target = expandHome(filePath);
+  if (!target) return { error: "empty file path" };
+  let raw: string;
+  try {
+    raw = readFileSync(target, "utf8");
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return { error: code ? `${code}: cannot read ${filePath}` : `cannot read ${filePath}` };
+  }
+  const lines = raw
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith("#"));
+  if (!lines.length) return { error: `secret file is empty (${filePath})` };
+
+  const envEntries: Array<[string, string]> = [];
+  for (const line of lines) {
+    const m = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+    if (m) envEntries.push([m[1]!, unquoteEnvValue(m[2]!)]);
+  }
+  if (envEntries.length > 0) {
+    const want = normalizeEnvVarName(preferredEnvKey);
+    const matched =
+      (want ? envEntries.find(([k]) => k === want) : undefined) ??
+      (envEntries.length === 1 ? envEntries[0] : envEntries.find(([k]) => /(?:^|_)(?:API_KEY|TOKEN|SECRET)$/i.test(k)));
+    if (!matched) {
+      return {
+        error: want
+          ? `key "${want}" not found in ${filePath}`
+          : `multiple env keys in ${filePath}; set API key env var to select one`,
+      };
+    }
+    const key = normalizeSecret(matched[1]);
+    return key ? { key } : { error: `key "${matched[0]}" is empty in ${filePath}` };
+  }
+
+  const key = normalizeSecret(lines[0]);
+  return key ? { key } : { error: `secret file is empty (${filePath})` };
+}
+
+export function resolveApiKeyInfo(p: ApiKeyProviderFields | null | undefined): ApiKeyInfo {
+  if (!p) return { source: "none" };
+  const literal = normalizeSecret(p.apiKey);
+  if (literal) return { key: literal, source: "literal" };
+
+  const envVar = normalizeEnvVarName(p.apiKeyEnv);
+  if (envVar) {
+    const fromEnv = normalizeSecret(process.env[envVar]);
+    if (fromEnv) return { key: fromEnv, source: "env", envVar };
+  }
+
+  const filePath = p.apiKeyFile?.trim() || undefined;
+  let fileError: string | undefined;
+  if (filePath) {
+    const fromFile = readSecretFromFile(filePath, envVar);
+    if (fromFile.key) return { key: fromFile.key, source: "file", filePath, envVar };
+    fileError = fromFile.error;
+  }
+
+  if (p.headers) {
+    for (const [k, v] of Object.entries(p.headers)) {
+      if (k.toLowerCase() === "authorization" && typeof v === "string" && v.trim().length > 0) {
+        return { source: "header", envVar, filePath };
+      }
+    }
+  }
+
+  const warning = fileError ?? (envVar ? `Environment variable "${envVar}" is not set` : undefined);
+  return { source: "none", envVar, filePath, warning };
+}
+
+export function resolveApiKey(p: ApiKeyProviderFields | null | undefined): string | undefined {
+  return resolveApiKeyInfo(p).key;
+}
+
+/**
+ * Build request headers with custom headers and Bearer auth from `apiKey` / `apiKeyEnv` / `apiKeyFile`,
+ * avoiding case-variant duplicate `Authorization` or `Content-Type` headers.
+ */
+export function buildAuthHeaders(
+  p: ApiKeyProviderFields | null | undefined,
+  base: Record<string, string> = { "content-type": "application/json" },
+): Record<string, string> {
+  const headers: Record<string, string> = { ...base };
+  if (p?.headers) {
+    for (const [k, v] of Object.entries(p.headers)) {
+      const lower = k.toLowerCase();
+      for (const existing of Object.keys(headers)) {
+        if (existing.toLowerCase() === lower) delete headers[existing];
+      }
+      headers[k] = v;
+    }
+  }
+  const key = resolveApiKey(p);
+  if (key) {
+    for (const existing of Object.keys(headers)) {
+      if (existing.toLowerCase() === "authorization") delete headers[existing];
+    }
+    headers.authorization = `Bearer ${key}`;
+  }
+  return headers;
+}
+
+export function configHasInlineSecrets(cfg: Config): boolean {
+  const endpoints: Array<ApiKeyProviderFields | null | undefined> = [
+    cfg.providers.decision,
+    cfg.providers.embedding.late,
+    cfg.providers.embedding.dense,
+  ];
+  for (const ep of endpoints) {
+    if (!ep) continue;
+    if (normalizeSecret(ep.apiKey)) return true;
+    if (ep.headers) {
+      for (const [k, v] of Object.entries(ep.headers)) {
+        if (isSensitiveHeaderName(k) && typeof v === "string" && v.trim().length > 0) return true;
+      }
+    }
+  }
+  return false;
 }
 
 /** Scale B_min, T_min and Δ_min when W ≠ 128,000 (§5.7). */

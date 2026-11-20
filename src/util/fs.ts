@@ -1,4 +1,4 @@
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -16,15 +16,22 @@ export function readJson<T>(path: string, fallback: T): T {
 }
 
 /** Write through a temp file + rename so readers never see a partial file. */
-export function writeFileAtomic(path: string, data: string | Uint8Array): void {
+export function writeFileAtomic(path: string, data: string | Uint8Array, mode?: number): void {
   ensureDir(dirname(path));
   const tmp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  writeFileSync(tmp, data);
+  writeFileSync(tmp, data, mode !== undefined ? { mode } : undefined);
+  if (mode !== undefined) {
+    try {
+      chmodSync(tmp, mode);
+    } catch {
+      // ignore chmod failures on filesystems that don't support POSIX modes
+    }
+  }
   renameSync(tmp, path);
 }
 
-export function writeJson(path: string, value: unknown): void {
-  writeFileAtomic(path, JSON.stringify(value, null, 2) + "\n");
+export function writeJson(path: string, value: unknown, mode?: number): void {
+  writeFileAtomic(path, JSON.stringify(value, null, 2) + "\n", mode);
 }
 
 export function appendJsonl(path: string, value: unknown): void {

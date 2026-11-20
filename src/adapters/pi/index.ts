@@ -6,7 +6,7 @@
 import { resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type DecisionProviderConfig, loadGlobalConfig, saveConfig } from "../../core/config.ts";
+import { type DecisionProviderConfig, loadGlobalConfig, normalizeEnvVarName, resolveApiKey, saveConfig } from "../../core/config.ts";
 import { Host } from "../../core/host.ts";
 import { SETTINGS_CATEGORIES } from "../../core/settings-schema.ts";
 import type { CommandIO, ConsolidationRecord, ContextEdit, DecisionQuestion, SessionRecord } from "../../core/types.ts";
@@ -169,7 +169,7 @@ class PiExtension {
       this.pi.registerProvider(DECISION_PROVIDER, {
         name: "realctx2 decision endpoint",
         baseUrl: cfg!.url,
-        apiKey: cfg!.apiKeyEnv ? `$${cfg!.apiKeyEnv}` : (cfg!.apiKey ?? "none"),
+        apiKey: normalizeEnvVarName(cfg!.apiKeyEnv) ? `$${normalizeEnvVarName(cfg!.apiKeyEnv)}` : (resolveApiKey(cfg) ?? "none"),
         classifiers: { [api]: { classify } } as never,
         models: [{ type: "classifier", id: cfg!.model, name: `${cfg!.model} (realctx2)`, api, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: cfg!.maxInputTokens ?? 32_000 }] as never,
       });

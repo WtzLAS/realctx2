@@ -4,16 +4,17 @@
  * `token_embed` models).
  */
 import type { EmbeddingProviderConfig } from "../core/config.ts";
-import { resolveApiKey } from "../core/config.ts";
+import { buildAuthHeaders } from "../core/config.ts";
 import type { Telemetry } from "../core/telemetry.ts";
 import type { DenseVector, EmbeddingClient, TokenMatrix } from "../core/types.ts";
 import { clipTokens, estimateTokens, sha256 } from "../util/text.ts";
-import { CircuitBreaker, type FetchLike } from "./decision.ts";
+import { CircuitBreaker, extractHttpError, type FetchLike } from "./decision.ts";
 
 export interface EmbeddingOptions {
   fetch?: FetchLike;
   telemetry?: Telemetry;
   timeoutMs?: number;
+  retries?: number;
   now?: () => number;
 }
 
@@ -36,6 +37,7 @@ abstract class BaseClient {
   protected readonly fetchImpl: FetchLike;
   protected readonly telemetry?: Telemetry;
   protected readonly timeoutMs: number;
+  protected readonly retries: number;
   /** Set when a response had the wrong shape: the provider stays off until reconfigured. */
   disabledReason: string | undefined;
 
@@ -45,6 +47,7 @@ abstract class BaseClient {
     this.fetchImpl = opts.fetch ?? (globalThis.fetch as unknown as FetchLike);
     this.telemetry = opts.telemetry;
     this.timeoutMs = opts.timeoutMs ?? 10_000;
+    this.retries = Math.max(0, opts.retries ?? 1);
     this.breaker = new CircuitBreaker(5, 60_000, opts.now);
   }
 
@@ -68,19 +71,18 @@ abstract class BaseClient {
   protected async post(body: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     if (this.disabledReason) throw new Error(`embedding provider disabled: ${this.disabledReason}`);
     if (this.breaker.isOpen()) throw new Error("embedding circuit breaker open");
-    const headers: Record<string, string> = { "content-type": "application/json", ...(this.config.headers ?? {}) };
-    const key = resolveApiKey(this.config);
-    if (key) headers.authorization = `Bearer ${key}`;
+    const headers = buildAuthHeaders(this.config);
     const payload = JSON.stringify(body);
     const started = Date.now();
     let lastErr = "";
-    for (let attempt = 0; attempt < 2; attempt++) {
+    const attempts = 1 + this.retries;
+    for (let attempt = 0; attempt < attempts; attempt++) {
       if (attempt > 0) await new Promise((r) => setTimeout(r, 150 + Math.random() * 350));
       const timeout = AbortSignal.timeout(this.timeoutMs);
       try {
         const res = await this.fetchImpl(this.config.url, { method: "POST", headers, body: payload, signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
         if (!res.ok) {
-          lastErr = `http ${res.status}`;
+          lastErr = await extractHttpError(res);
           if (res.status === 429 || res.status >= 500) continue;
           break;
         }

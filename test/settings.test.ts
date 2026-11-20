@@ -1,7 +1,22 @@
+import { statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { Realctx2SettingsComponent, type SettingsTheme } from "../src/adapters/pi/settings-ui.ts";
 import { buildCommand, runCommand } from "../src/commands/index.ts";
-import { type Config, DEFAULT_CONFIG, diffConfig, Layout, loadConfig, loadGlobalConfig, saveConfig } from "../src/core/config.ts";
+import {
+  buildAuthHeaders,
+  type Config,
+  DEFAULT_CONFIG,
+  diffConfig,
+  Layout,
+  loadConfig,
+  loadGlobalConfig,
+  readSecretFromFile,
+  resolveApiKey,
+  resolveApiKeyInfo,
+  saveConfig,
+} from "../src/core/config.ts";
+import { type EndpointFetchLike, testEndpoint } from "../src/providers/test-endpoint.ts";
 import { Host } from "../src/core/host.ts";
 import {
   AUX_ROLES,
@@ -56,6 +71,7 @@ describe("settings schema completeness & descriptions", () => {
       model: "jev-latest",
       apiKeyEnv: "API_KEY",
       apiKey: "secret",
+      apiKeyFile: "/tmp/decider.env",
       maxInputTokens: 30000,
       maxQuestions: 100,
       registerInPi: true,
@@ -69,6 +85,7 @@ describe("settings schema completeness & descriptions", () => {
       dimensions: 128,
       apiKeyEnv: "EMB_KEY",
       apiKey: "secret",
+      apiKeyFile: "/tmp/embed.env",
       role: "prefix",
       queryPrefix: "[Q] ",
       documentPrefix: "[D] ",
@@ -85,6 +102,7 @@ describe("settings schema completeness & descriptions", () => {
       dimensions: 1024,
       apiKeyEnv: "OPENAI_API_KEY",
       apiKey: "secret",
+      apiKeyFile: "/tmp/dense.key",
       role: "none",
       queryPrefix: "",
       documentPrefix: "",
@@ -408,8 +426,8 @@ describe("Realctx2SettingsComponent TUI interactions", () => {
     expect(enabledView).toContain("── Connection & Authentication");
     expect(enabledView).toContain("── Limits & Pi Integration");
 
-    // Move to Endpoint URL (down from Enabled -> format -> url)
-    sendKeys(comp, [DOWN, DOWN, ENTER]);
+    // Move to Endpoint URL (down from Enabled -> Test endpoint -> format -> url)
+    sendKeys(comp, [DOWN, DOWN, DOWN, ENTER]);
     for (const ch of "https://api.example/v1/systemone") comp.handleInput(ch);
     sendKeys(comp, [ENTER]);
     expect(saved.providers.decision?.url).toBe("https://api.example/v1/systemone");
@@ -417,14 +435,18 @@ describe("Realctx2SettingsComponent TUI interactions", () => {
     // Move to API key (literal): down past model & apiKeyEnv -> apiKey
     sendKeys(comp, [DOWN, DOWN, DOWN, ENTER]);
     for (const ch of "super-secret-9999") comp.handleInput(ch);
+    // Secret modal must NOT echo typed secret in plaintext
+    const modalView = renderText(comp);
+    expect(modalView).not.toContain("super-secret-9999");
+    expect(modalView).toContain("••••••••");
     sendKeys(comp, [ENTER]);
     expect(saved.providers.decision?.apiKey).toBe("super-secret-9999");
     const maskedOut = renderText(comp);
     expect(maskedOut).toContain("••••9999");
     expect(maskedOut).not.toContain("super-secret-9999");
 
-    // Move to Custom HTTP headers and add "X-Env: prod"
-    sendKeys(comp, [DOWN, ENTER]);
+    // Move to Custom HTTP headers (past apiKeyFile -> headers) and add "X-Env: prod"
+    sendKeys(comp, [DOWN, DOWN, ENTER]);
     expect(renderText(comp)).toContain("+ Add header…");
     sendKeys(comp, [ENTER]);
     for (const ch of "X-Env: prod") comp.handleInput(ch);
@@ -659,7 +681,7 @@ describe("/realctx2 settings command & Host.reloadConfig", () => {
             expect(homeView).toContain("Endpoints & Providers");
             // Open Endpoints & Providers (first category), enable decision endpoint, set URL + model, then close
             sendKeys(comp, [ENTER, ENTER, ENTER]); // enter Providers, enter Decision endpoint, enable it
-            sendKeys(comp, [DOWN, DOWN, ENTER]); // URL
+            sendKeys(comp, [DOWN, DOWN, DOWN, ENTER]); // URL (past Test endpoint & Wire format)
             for (const ch of "https://dec.local/v1/systemone") comp.handleInput(ch);
             sendKeys(comp, [ENTER, DOWN, ENTER]); // model
             for (const ch of "jev-2") comp.handleInput(ch);
@@ -688,5 +710,345 @@ describe("/realctx2 settings command & Host.reloadConfig", () => {
       else process.env.REALCTX2_NO_WORKER = prevNoWorker;
       cleanupTmp();
     }
+  });
+});
+
+describe("endpoint secrets & auth resolution (pplx-embed-v2 / pplx-decider-v1.3)", () => {
+  it("resolves literal, env var (including $VAR), raw token file, and KEY=VALUE env file secrets", () => {
+    const dir = tmp("settings-secrets-");
+    const envFile = join(dir, "pplx-embed.env");
+    const rawFile = join(dir, "raw.key");
+    const multiEnvFile = join(dir, "multi.env");
+    writeFileSync(envFile, "# systemd EnvironmentFile\nEMBED_API_KEY=\"secret-from-env-file\"\n", "utf8");
+    writeFileSync(rawFile, "Bearer   raw-file-token-777  \n", "utf8");
+    writeFileSync(multiEnvFile, "HOST=0.0.0.0\nDECIDER_API_KEY='decider-secret-123'\n", "utf8");
+
+    const prevEmbed = process.env.TEST_EMBED_SECRET_ENV;
+    process.env.TEST_EMBED_SECRET_ENV = "  Bearer env-token-42  ";
+    try {
+      // Literal secret trims & strips accidental "Bearer " prefix
+      expect(resolveApiKey({ apiKey: "  Bearer lit-key-1 " })).toBe("lit-key-1");
+      expect(resolveApiKeyInfo({ apiKey: "lit-key-1" })).toEqual({ key: "lit-key-1", source: "literal" });
+
+      // Env var tolerates optional leading $
+      expect(resolveApiKey({ apiKeyEnv: "$TEST_EMBED_SECRET_ENV" })).toBe("env-token-42");
+      expect(resolveApiKeyInfo({ apiKeyEnv: "$TEST_EMBED_SECRET_ENV" })).toEqual({
+        key: "env-token-42",
+        source: "env",
+        envVar: "TEST_EMBED_SECRET_ENV",
+      });
+
+      // Unset env var reports clear warning
+      const missingInfo = resolveApiKeyInfo({ apiKeyEnv: "REALCTX2_DEFINITELY_UNSET_KEY" });
+      expect(missingInfo.source).toBe("none");
+      expect(missingInfo.key).toBeUndefined();
+      expect(missingInfo.warning).toContain("REALCTX2_DEFINITELY_UNSET_KEY");
+
+      // Secret file: systemd EnvironmentFile (KEY=VALUE) and raw single-line file
+      expect(readSecretFromFile(envFile)).toEqual({ key: "secret-from-env-file" });
+      expect(readSecretFromFile(rawFile)).toEqual({ key: "raw-file-token-777" });
+      expect(readSecretFromFile(multiEnvFile)).toEqual({ key: "decider-secret-123" });
+      expect(readSecretFromFile(multiEnvFile, "DECIDER_API_KEY")).toEqual({ key: "decider-secret-123" });
+      expect(resolveApiKeyInfo({ apiKeyFile: envFile })).toMatchObject({
+        key: "secret-from-env-file",
+        source: "file",
+      });
+
+      // Custom Authorization header deduplication (never emits both Authorization and authorization)
+      const h = buildAuthHeaders({
+        apiKey: "winner-key",
+        headers: { Authorization: "Bearer stale", "X-Custom": "yes" },
+      });
+      expect(h.authorization).toBe("Bearer winner-key");
+      expect(h.Authorization).toBeUndefined();
+      expect(h["X-Custom"]).toBe("yes");
+
+      // Custom Authorization header recognized when no apiKey/apiKeyEnv/apiKeyFile
+      expect(resolveApiKeyInfo({ headers: { Authorization: "Bearer custom-hdr" } }).source).toBe("header");
+
+      // Saving inline secrets writes config.json with mode 0600
+      const layout = new Layout(join(dir, "home"));
+      const cfg = structuredClone(DEFAULT_CONFIG);
+      cfg.providers.decision = { format: "systemone", url: "http://127.0.0.1:8891/v1/systemone", model: "pplx-decider-v1.3", apiKey: "top-secret-key" };
+      saveConfig(layout, cfg);
+      const mode = statSync(layout.configFile).mode & 0o777;
+      expect(mode).toBe(0o600);
+    } finally {
+      if (prevEmbed === undefined) delete process.env.TEST_EMBED_SECRET_ENV;
+      else process.env.TEST_EMBED_SECRET_ENV = prevEmbed;
+      cleanupTmp();
+    }
+  });
+});
+
+describe("live endpoint testing (testEndpoint) & settings Test buttons", () => {
+  it("tests decision, late-interaction, and dense endpoints with Bearer auth, 401 diagnostics, and 404 /v1/models discovery", async () => {
+    const dir = tmp("endpoint-test-");
+    const embedEnvFile = join(dir, "embed.env");
+    writeFileSync(embedEnvFile, "EMBED_API_KEY=embed-secret-xyz\n", "utf8");
+
+    const prevDecider = process.env.TEST_DECIDER_API_KEY;
+    process.env.TEST_DECIDER_API_KEY = "decider-secret-abc";
+    try {
+      const seenHeaders: Array<{ url: string; method: string; headers: Record<string, string> }> = [];
+      const mockFetch: EndpointFetchLike = async (url, init) => {
+        seenHeaders.push({ url, method: init.method, headers: init.headers });
+        const auth = init.headers.authorization ?? init.headers.Authorization;
+
+        // Simulate pplx-decider-v1.3-server
+        if (url.includes(":8891/v1/systemone")) {
+          if (auth !== "Bearer decider-secret-abc") {
+            return {
+              ok: false,
+              status: 401,
+              text: async () => JSON.stringify({ error: { type: "invalid_api_key", message: "Missing or invalid Authorization: Bearer <key> header", code: 401 } }),
+              json: async () => ({ error: { type: "invalid_api_key", message: "Missing or invalid Authorization: Bearer <key> header", code: 401 } }),
+            };
+          }
+          const body = JSON.parse(init.body ?? "{}");
+          if (body.model !== "pplx-decider-v1.3") {
+            return {
+              ok: false,
+              status: 404,
+              text: async () => JSON.stringify({ error: { message: `model '${body.model}' is not served here; see GET /v1/models`, code: "model_not_found" } }),
+              json: async () => ({}),
+            };
+          }
+          return {
+            ok: true,
+            status: 200,
+            text: async () => "",
+            json: async () => ({ answers: { probe: { type: "noul", noul: 0.94 } }, usage: { input_tokens: 12, output_tokens: 0 } }),
+          };
+        }
+        if (url.includes(":8891/v1/models")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => "",
+            json: async () => ({ object: "list", data: [{ id: "pplx-decider-v1.3" }, { id: "perplexity/pplx-decider-latest" }] }),
+          };
+        }
+
+        // Simulate pplx-embed-v2-server (multivector 128d)
+        if (url.includes(":8890/v1/embeddings")) {
+          if (auth !== "Bearer embed-secret-xyz") {
+            return {
+              ok: false,
+              status: 401,
+              text: async () => JSON.stringify({ error: { type: "authentication_error", message: "missing or invalid API key", code: "invalid_api_key" } }),
+              json: async () => ({}),
+            };
+          }
+          const row = Array.from({ length: 128 }, (_, i) => (i === 0 ? 1 : 0));
+          return {
+            ok: true,
+            status: 200,
+            text: async () => "",
+            json: async () => ({ data: [{ index: 0, shape: [4, 128], embedding: [row, row, row, row] }] }),
+          };
+        }
+
+        // Simulate dense embedding server
+        if (url.includes(":8892/v1/embeddings")) {
+          if (auth !== "Bearer dense-literal-key") {
+            return { ok: false, status: 401, text: async () => '{"error":{"message":"invalid api key"}}', json: async () => ({}) };
+          }
+          return {
+            ok: true,
+            status: 200,
+            text: async () => "",
+            json: async () => ({ data: [{ index: 0, embedding: [0.6, 0.8, 0] }] }),
+          };
+        }
+
+        return { ok: false, status: 404, text: async () => "not found", json: async () => ({}) };
+      };
+
+      const cfg = structuredClone(DEFAULT_CONFIG);
+      // 1. Decision endpoint: 401 when secret missing
+      cfg.providers.decision = {
+        format: "systemone",
+        url: "http://127.0.0.1:8891/v1/systemone",
+        model: "pplx-decider-v1.3",
+      };
+      const decFail = await testEndpoint("decision", cfg, { fetch: mockFetch });
+      expect(decFail.ok).toBe(false);
+      expect(decFail.status).toBe(401);
+      expect(decFail.summary).toContain("401");
+      expect(decFail.detail).toContain("DECIDER_API_KEY");
+
+      // 2. Decision endpoint: 200 with apiKeyEnv
+      cfg.providers.decision.apiKeyEnv = "TEST_DECIDER_API_KEY";
+      const decOk = await testEndpoint("decision", cfg, { fetch: mockFetch });
+      expect(decOk.ok).toBe(true);
+      expect(decOk.summary).toContain("p=0.94");
+      expect(decOk.authSummary).toBe("Bearer via $TEST_DECIDER_API_KEY");
+      expect(decOk.detail).not.toContain("decider-secret-abc");
+
+      // 3. Decision endpoint: 404 discovers served models via authenticated GET /v1/models
+      cfg.providers.decision.model = "wrong-model";
+      const dec404 = await testEndpoint("decision", cfg, { fetch: mockFetch });
+      expect(dec404.ok).toBe(false);
+      expect(dec404.status).toBe(404);
+      expect(dec404.availableModels).toEqual(["pplx-decider-v1.3", "perplexity/pplx-decider-latest"]);
+      expect(dec404.detail).toContain("Served models: pplx-decider-v1.3");
+
+      // 4. Late-interaction embedding endpoint: 200 with apiKeyFile (systemd env file)
+      cfg.providers.embedding.late = {
+        url: "http://127.0.0.1:8890/v1/embeddings",
+        model: "perplexity-ai/pplx-embed-v2-late-9b",
+        kind: "multivector",
+        dims: 128,
+        role: "input_type",
+        apiKeyFile: embedEnvFile,
+      };
+      const lateOk = await testEndpoint("late", cfg, { fetch: mockFetch });
+      expect(lateOk.ok).toBe(true);
+      expect(lateOk.summary).toContain("4×128");
+      expect(lateOk.detail).not.toContain("embed-secret-xyz");
+
+      // 5. Dense embedding endpoint: 200 with literal apiKey (never echoed)
+      cfg.providers.embedding.dense = {
+        url: "http://127.0.0.1:8892/v1/embeddings",
+        model: "text-embedding-3-small",
+        kind: "dense",
+        dimensions: 3,
+        apiKey: "dense-literal-key",
+      };
+      const denseOk = await testEndpoint("dense", cfg, { fetch: mockFetch });
+      expect(denseOk.ok).toBe(true);
+      expect(denseOk.summary).toContain("3 dims");
+      expect(denseOk.authSummary).toBe("Bearer (••••-key)");
+      expect(denseOk.detail).not.toContain("dense-literal-key");
+    } finally {
+      if (prevDecider === undefined) delete process.env.TEST_DECIDER_API_KEY;
+      else process.env.TEST_DECIDER_API_KEY = prevDecider;
+      cleanupTmp();
+    }
+  });
+
+  it("renders Test buttons on all three endpoint screens, runs tests via Enter and 't', masks sensitive headers, and clears stale results on edit", async () => {
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.providers.decision = {
+      format: "systemone",
+      url: "http://127.0.0.1:8891/v1/systemone",
+      model: "pplx-decider-v1.3",
+      apiKeyEnv: "REALCTX2_TEST_UNSET_VAR",
+      headers: { Authorization: "Bearer super-header-secret-5555", "X-Env": "dev" },
+    };
+    cfg.providers.embedding.late = {
+      url: "http://127.0.0.1:8890/v1/embeddings",
+      model: "perplexity-ai/pplx-embed-v2-late-9b",
+      kind: "multivector",
+      dims: 128,
+    };
+    cfg.providers.embedding.dense = {
+      url: "https://api.openai.com/v1/embeddings",
+      model: "text-embedding-3-small",
+      kind: "dense",
+      dimensions: 1024,
+    };
+
+    const tested: string[] = [];
+    let resolveTest!: (res: Awaited<ReturnType<typeof testEndpoint>>) => void;
+    let saved = structuredClone(cfg);
+    let renders = 0;
+
+    const comp = new Realctx2SettingsComponent({
+      config: saved,
+      configPath: "/tmp/config.json",
+      initialCategory: "providers",
+      onSave: (next) => {
+        saved = next;
+      },
+      onTestEndpoint: (endpoint) => {
+        tested.push(endpoint);
+        return new Promise((r) => {
+          resolveTest = r;
+        });
+      },
+      onClose: () => undefined,
+      theme: plainTheme,
+      tui: { requestRender: () => { renders++; } },
+    });
+
+    // Enter Decision endpoint screen -> see Test endpoint button & unset env indicator
+    sendKeys(comp, [ENTER]);
+    const decView = renderText(comp);
+    expect(decView).toContain("Test endpoint");
+    expect(decView).toContain("[ Test endpoint ]");
+    expect(decView).toContain("t test");
+    expect(decView).toContain("REALCTX2_TEST_UNSET_VAR (unset)");
+
+    // Select Test endpoint row and press Enter -> enters running state
+    sendKeys(comp, [DOWN, ENTER]);
+    expect(tested).toEqual(["decision"]);
+    expect(renderText(comp)).toContain("⟳ Testing…");
+
+    // Resolve test with success -> shows checkmark, summary, and detail
+    resolveTest({
+      endpoint: "decision",
+      ok: true,
+      latencyMs: 31,
+      summary: "OK · 31ms (p=0.95)",
+      detail: 'Decision endpoint (systemone, model "pplx-decider-v1.3") answered probe with p=0.95 in 31ms.',
+      authSummary: "custom Authorization header",
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(renders).toBeGreaterThan(0);
+    const doneView = renderText(comp);
+    expect(doneView).toContain("✓ OK · 31ms (p=0.95)");
+    expect(doneView).toContain("answered probe with p=0.95");
+
+    // Check parent Endpoints & Providers screen reflects the test result
+    sendKeys(comp, [ESC]);
+    expect(renderText(comp)).toContain("✓ OK · 31ms (p=0.95)");
+
+    // Re-enter Decision endpoint, open Custom HTTP headers -> Authorization value is masked!
+    sendKeys(comp, [ENTER, TAB, DOWN, DOWN, DOWN, DOWN, DOWN, DOWN, ENTER]);
+    const hdrView = renderText(comp);
+    expect(hdrView).toContain("Authorization: Bearer ••••5555");
+    expect(hdrView).not.toContain("super-header-secret-5555");
+    expect(hdrView).toContain("X-Env: dev");
+
+    // Back to Decision endpoint -> Providers -> Late-interaction embedding endpoint, trigger test via 't' hotkey
+    sendKeys(comp, [ESC, ESC, DOWN, ENTER]);
+    expect(renderText(comp)).toContain("Late-interaction embedding endpoint");
+    expect(renderText(comp)).toContain("[ Test endpoint ]");
+    sendKeys(comp, ["t"]);
+    expect(tested).toEqual(["decision", "late"]);
+    resolveTest({
+      endpoint: "late",
+      ok: false,
+      latencyMs: 12,
+      status: 401,
+      summary: "401 Unauthorized (secret required/invalid)",
+      detail: "Probe failed: http 401: missing or invalid API key. Set EMBED_API_KEY.",
+      authSummary: "none",
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(renderText(comp)).toContain("✗ 401 Unauthorized");
+
+    // Check Dense embedding endpoint also has Test endpoint button and responds to 't'
+    sendKeys(comp, [ESC, DOWN, ENTER]);
+    expect(renderText(comp)).toContain("Dense embedding endpoint");
+    expect(renderText(comp)).toContain("[ Test endpoint ]");
+    sendKeys(comp, ["t"]);
+    expect(tested).toEqual(["decision", "late", "dense"]);
+    resolveTest({
+      endpoint: "dense",
+      ok: true,
+      latencyMs: 45,
+      summary: "OK · 45ms (1024 dims)",
+      detail: "Dense embedding endpoint returned a 1024-dim vector in 45ms.",
+      authSummary: "none",
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(renderText(comp)).toContain("✓ OK · 45ms (1024 dims)");
+
+    // Editing a setting on Dense endpoint clears its cached test result
+    sendKeys(comp, [TAB, ENTER, "x", ENTER]); // edit URL
+    expect(renderText(comp)).not.toContain("✓ OK · 45ms (1024 dims)");
   });
 });

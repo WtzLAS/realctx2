@@ -3,7 +3,7 @@
  * request splitting, reliability, and the aux-emulated fallback.
  */
 import type { DecisionProviderConfig } from "../core/config.ts";
-import { resolveApiKey } from "../core/config.ts";
+import { buildAuthHeaders } from "../core/config.ts";
 import type { Telemetry } from "../core/telemetry.ts";
 import type { AuxSessionRunner, DecideOptions, DecisionAnswer, DecisionClient, DecisionQuestion } from "../core/types.ts";
 import { estimateTokens, headTail } from "../util/text.ts";
@@ -14,6 +14,34 @@ export type FetchLike = (url: string, init: { method: string; headers: Record<st
   text(): Promise<string>;
   json(): Promise<unknown>;
 }>;
+
+/** Extract a concise, human-readable HTTP error message from an error response body. */
+export async function extractHttpError(res: { status: number; text(): Promise<string> }): Promise<string> {
+  const prefix = `http ${res.status}`;
+  try {
+    const raw = (await res.text()).trim();
+    if (!raw || raw === "{}") return prefix;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const rec = parsed as Record<string, unknown>;
+        const errObj = rec.error && typeof rec.error === "object" && !Array.isArray(rec.error) ? (rec.error as Record<string, unknown>) : null;
+        const msg =
+          (typeof errObj?.message === "string" && errObj.message.trim()) ||
+          (typeof rec.message === "string" && rec.message.trim()) ||
+          (typeof rec.detail === "string" && rec.detail.trim()) ||
+          "";
+        if (msg) return `${prefix}: ${msg.slice(0, 240)}`;
+        return prefix;
+      }
+    } catch {
+      // plain-text error body
+    }
+    return `${prefix}: ${raw.replace(/\s+/g, " ").slice(0, 200)}`;
+  } catch {
+    return prefix;
+  }
+}
 
 /** Opens after `threshold` consecutive failures, for `openMs` (§9.1.5, §9.2.5). */
 export class CircuitBreaker {
@@ -305,9 +333,7 @@ export class HttpDecisionClient implements DecisionClient {
     const { format, model, url } = this.config;
     const body = format === "systemone" ? buildSystemOneRequest(model, evidence, questions) : buildDecisionsRequest(model, evidence, questions, opts.cacheKey);
     const payload = JSON.stringify(body);
-    const headers: Record<string, string> = { "content-type": "application/json", ...(this.config.headers ?? {}) };
-    const key = resolveApiKey(this.config);
-    if (key) headers.authorization = `Bearer ${key}`;
+    const headers = buildAuthHeaders(this.config);
     const started = Date.now();
     const attempts = opts.noRetry ? 1 : 2;
     let lastErr = "";
@@ -323,7 +349,7 @@ export class HttpDecisionClient implements DecisionClient {
       try {
         const res = await this.fetchImpl(url, { method: "POST", headers, body: payload, signal });
         if (!res.ok) {
-          lastErr = `http ${res.status}`;
+          lastErr = await extractHttpError(res);
           if (res.status === 429 || res.status >= 500) continue;
           break;
         }

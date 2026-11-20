@@ -3,6 +3,7 @@
  * every configuration parameter, endpoints, aux harness/role overrides, validation,
  * formatting, and human-readable descriptions grounded in docs/realctx2-design.md.
  */
+import { describeEndpointAuth, type EndpointKind, type EndpointTestResult } from "../providers/test-endpoint.ts";
 import { ROLE_DEFAULTS } from "./aux.ts";
 import { type Config, DEFAULT_CONFIG, type DecisionProviderConfig, type EmbeddingProviderConfig } from "./config.ts";
 import type { AuxRole, AuxTools, ThinkingLevel } from "./types.ts";
@@ -40,6 +41,10 @@ export interface ScalarSetting {
   restart?: boolean;
   /** True when pi's model registry picker should be offered for this field. */
   modelPicker?: boolean;
+  /** True when the string holds an environment variable name whose presence should be shown live. */
+  envVar?: boolean;
+  /** True when the string holds a path to a secret/env file whose readability should be shown live. */
+  secretFile?: boolean;
   /** Optional custom getter/setter for special virtual fields (e.g. endpoint enabled toggle). */
   get?: (cfg: Config) => unknown;
   set?: (cfg: Config, value: unknown) => Config;
@@ -75,8 +80,18 @@ export interface SubscreenEntry {
   build: (cfg: Config, ctx?: SettingsDisplayContext) => SettingScreenSpec;
 }
 
+export interface ActionEntry {
+  kind: "action";
+  id: string;
+  action: "test-endpoint";
+  endpoint: EndpointKind;
+  label: string;
+  buttonText?: string;
+  description: string;
+}
+
 export type EditableSetting = ScalarSetting | StringListSetting | StringMapSetting;
-export type SettingEntry = EditableSetting | SubscreenEntry;
+export type SettingEntry = EditableSetting | SubscreenEntry | ActionEntry;
 
 export interface SettingSection {
   id: string;
@@ -108,6 +123,7 @@ export interface SettingsDisplayContext {
     dense: { configured: boolean; healthy: boolean; model?: string } | null;
     aux: { available: boolean };
   };
+  endpointTests?: Partial<Record<EndpointKind, { status: "running" } | { status: "done"; result: EndpointTestResult }>>;
 }
 
 export const AUX_ROLES: Array<{ role: AuxRole; label: string; description: string; transcriptOnly: boolean }> = [
@@ -268,7 +284,7 @@ function formatNum(n: number): string {
 }
 
 export function isScalarSetting(entry: SettingEntry): entry is ScalarSetting {
-  return entry.kind !== "subscreen" && entry.kind !== "string-list" && entry.kind !== "multi-enum" && entry.kind !== "string-map";
+  return entry.kind !== "subscreen" && entry.kind !== "action" && entry.kind !== "string-list" && entry.kind !== "multi-enum" && entry.kind !== "string-map";
 }
 
 export function formatSettingValue(entry: EditableSetting, value: unknown): string {
@@ -405,10 +421,11 @@ function defaultEmbeddingEndpoint(kind: "late" | "dense"): EmbeddingProviderConf
 export function buildDecisionEndpointScreen(cfg: Config, ctx?: SettingsDisplayContext): SettingScreenSpec {
   const d = cfg.providers.decision;
   const h = ctx?.health?.decision;
+  const authNote = d ? ` · Auth: ${describeEndpointAuth(d).summary}` : "";
   const statusNote = d
     ? h
-      ? `Status: ${h.healthy ? "healthy" : h.emulated ? "unavailable (aux emulated)" : "configured"}`
-      : "Configured"
+      ? `Status: ${h.healthy ? "healthy" : h.emulated ? "unavailable (aux emulated)" : "configured"}${authNote}`
+      : `Configured${authNote}`
     : "Disabled — aux LLM emulation or fail-safe defaults will be used";
 
   const enabledEntry: ScalarSetting = {
@@ -434,6 +451,16 @@ export function buildDecisionEndpointScreen(cfg: Config, ctx?: SettingsDisplayCo
     };
   }
 
+  const testEntry: ActionEntry = {
+    kind: "action",
+    id: "providers.decision.test",
+    action: "test-endpoint",
+    endpoint: "decision",
+    label: "Test endpoint",
+    buttonText: "[ Test endpoint ]",
+    description: "Send a live decision probe using the current URL, wire format, model ID, Bearer secret (apiKey / apiKeyEnv / apiKeyFile), and custom headers to verify connectivity and authentication.",
+  };
+
   return {
     id: "providers.decision",
     title: "Decision Model Endpoint",
@@ -442,7 +469,7 @@ export function buildDecisionEndpointScreen(cfg: Config, ctx?: SettingsDisplayCo
       {
         id: "status",
         title: "Endpoint Status",
-        items: [enabledEntry],
+        items: [enabledEntry, testEntry],
       },
       {
         id: "connection",
@@ -454,8 +481,8 @@ export function buildDecisionEndpointScreen(cfg: Config, ctx?: SettingsDisplayCo
             label: "Wire format",
             description: "HTTP wire protocol spoken by the decision endpoint: SystemOne (POST …/v1/systemone) or OpenAI-style Decisions API (POST …/v1/decisions).",
             options: [
-              { value: "systemone", label: "systemone", description: "SystemOne wire format (e.g. Jev / POST …/v1/systemone)" },
-              { value: "decisions", label: "decisions", description: "Decisions API wire format (e.g. POST …/v1/decisions)" },
+              { value: "systemone", label: "systemone", description: "SystemOne wire format (e.g. pplx-decider / Jev / POST …/v1/systemone)" },
+              { value: "decisions", label: "decisions", description: "Decisions API wire format (e.g. pplx-decider / POST …/v1/decisions)" },
             ],
             defaultValue: "systemone",
           },
@@ -463,39 +490,49 @@ export function buildDecisionEndpointScreen(cfg: Config, ctx?: SettingsDisplayCo
             kind: "string",
             path: "providers.decision.url",
             label: "Endpoint URL",
-            description: "Full HTTP(S) URL for decision requests (for example https://api.typesafe.ai/v1/systemone or a local vLLM/proxy endpoint). Applies immediately on save.",
-            placeholder: "https://api.typesafe.ai/v1/systemone",
+            description: "Full HTTP(S) URL for decision requests (for example http://127.0.0.1:8891/v1/systemone or https://api.typesafe.ai/v1/systemone). Applies immediately on save.",
+            placeholder: "http://127.0.0.1:8891/v1/systemone",
             defaultValue: "",
           },
           {
             kind: "string",
             path: "providers.decision.model",
             label: "Model ID",
-            description: "Model identifier sent to the decision endpoint (for example jev-latest or gpt-6-luna).",
-            placeholder: "jev-latest",
+            description: "Model identifier sent to the decision endpoint (for example pplx-decider-v1.3 or jev-latest).",
+            placeholder: "pplx-decider-v1.3",
             defaultValue: "",
           },
           {
             kind: "optional-string",
             path: "providers.decision.apiKeyEnv",
             label: "API key env var",
-            description: "Environment variable name holding the Bearer token for this endpoint (for example TYPESAFE_API_KEY). Preferred over storing a literal key in config.json.",
-            placeholder: "TYPESAFE_API_KEY",
+            description: "Environment variable name holding the Bearer token for this endpoint (for example DECIDER_API_KEY or TYPESAFE_API_KEY). Preferred over storing a literal key in config.json.",
+            placeholder: "DECIDER_API_KEY",
             nullLabel: "(none)",
+            envVar: true,
           },
           {
             kind: "secret",
             path: "providers.decision.apiKey",
             label: "API key (literal)",
-            description: "Literal API key sent as Bearer auth. Prefer apiKeyEnv so secrets stay out of config.json. Masked on screen.",
-            placeholder: "sk-...",
+            description: "Literal Bearer secret sent in the Authorization header. Masked on screen and while typing; config.json is saved mode 0600. Prefer apiKeyEnv or apiKeyFile to keep secrets out of config.json.",
+            placeholder: "Bearer token or secret",
             nullLabel: "(not set)",
+          },
+          {
+            kind: "optional-string",
+            path: "providers.decision.apiKeyFile",
+            label: "API key file",
+            description: "Optional path to a secret file holding a raw token or KEY=VALUE env assignment (for example /etc/pplx-decider-v1.3-exl3/env or ~/.secrets/decider.key). Used if literal apiKey and apiKeyEnv are unset.",
+            placeholder: "/etc/pplx-decider-v1.3-exl3/env",
+            nullLabel: "(none)",
+            secretFile: true,
           },
           {
             kind: "string-map",
             path: "providers.decision.headers",
             label: "Custom HTTP headers",
-            description: "Additional HTTP headers sent with every decision request (e.g. custom auth or proxy routing headers).",
+            description: "Additional HTTP headers sent with every decision request (e.g. custom auth or proxy routing headers). Sensitive header values are masked on screen.",
             keyPlaceholder: "X-Custom-Header",
             valuePlaceholder: "header value",
           },
@@ -545,10 +582,11 @@ export function buildEmbeddingEndpointScreen(kind: "late" | "dense", cfg: Config
   const ep = cfg.providers.embedding[kind];
   const labelTitle = kind === "late" ? "Late-Interaction Embedding Endpoint" : "Dense Embedding Endpoint";
   const h = kind === "late" ? ctx?.health?.late : ctx?.health?.dense;
+  const authNote = ep ? ` · Auth: ${describeEndpointAuth(ep).summary}` : "";
   const statusNote = ep
     ? h
-      ? `Status: ${h.healthy ? "healthy" : "down"} · changes take effect next session`
-      : "Configured · changes take effect next session"
+      ? `Status: ${h.healthy ? "healthy" : "down"}${authNote} · changes take effect next session`
+      : `Configured${authNote} · changes take effect next session`
     : kind === "late"
       ? "Disabled — dense embeddings or BM25 will be used"
       : "Disabled — late-interaction embeddings or BM25 will be used";
@@ -580,12 +618,25 @@ export function buildEmbeddingEndpointScreen(kind: "late" | "dense", cfg: Config
     };
   }
 
+  const testEntry: ActionEntry = {
+    kind: "action",
+    id: `${basePath}.test`,
+    action: "test-endpoint",
+    endpoint: kind,
+    label: "Test endpoint",
+    buttonText: "[ Test endpoint ]",
+    description:
+      kind === "late"
+        ? "Send a live multi-vector embedding probe using the current URL, model ID, Bearer secret, role, and transport settings to verify connectivity, auth, and token-matrix shape."
+        : "Send a live dense embedding probe using the current URL, model ID, Bearer secret, dimensions, and custom headers to verify connectivity, auth, and vector shape.",
+  };
+
   return {
     id: basePath,
     title: labelTitle,
     subtitle: statusNote,
     sections: [
-      { id: "status", title: "Endpoint Status", items: [enabledEntry] },
+      { id: "status", title: "Endpoint Status", items: [enabledEntry, testEntry] },
       {
         id: "connection",
         title: "Connection & Authentication",
@@ -594,8 +645,11 @@ export function buildEmbeddingEndpointScreen(kind: "late" | "dense", cfg: Config
             kind: "string",
             path: `${basePath}.url`,
             label: "Endpoint URL",
-            description: "Full HTTP(S) URL for embedding requests (for example http://127.0.0.1:8000/v1/embeddings or https://api.openai.com/v1/embeddings).",
-            placeholder: kind === "late" ? "http://127.0.0.1:8000/v1/embeddings" : "https://api.openai.com/v1/embeddings",
+            description:
+              kind === "late"
+                ? "Full HTTP(S) URL for multi-vector embedding requests (for example http://127.0.0.1:8890/v1/embeddings or /pooling)."
+                : "Full HTTP(S) URL for embedding requests (for example https://api.openai.com/v1/embeddings).",
+            placeholder: kind === "late" ? "http://127.0.0.1:8890/v1/embeddings" : "https://api.openai.com/v1/embeddings",
             restart: true,
             defaultValue: "",
           },
@@ -603,8 +657,11 @@ export function buildEmbeddingEndpointScreen(kind: "late" | "dense", cfg: Config
             kind: "string",
             path: `${basePath}.model`,
             label: "Model ID",
-            description: "Embedding model identifier requested from the server (e.g. lightonai/GTE-ModernColBERT-v1 or text-embedding-3-small).",
-            placeholder: kind === "late" ? "lightonai/GTE-ModernColBERT-v1" : "text-embedding-3-small",
+            description:
+              kind === "late"
+                ? "Multi-vector model identifier requested from the server (e.g. perplexity-ai/pplx-embed-v2-late-9b or lightonai/GTE-ModernColBERT-v1)."
+                : "Embedding model identifier requested from the server (e.g. text-embedding-3-small).",
+            placeholder: kind === "late" ? "perplexity-ai/pplx-embed-v2-late-9b" : "text-embedding-3-small",
             restart: true,
             defaultValue: "",
           },
@@ -636,25 +693,42 @@ export function buildEmbeddingEndpointScreen(kind: "late" | "dense", cfg: Config
             kind: "optional-string",
             path: `${basePath}.apiKeyEnv`,
             label: "API key env var",
-            description: "Environment variable containing the API key for this embedding endpoint (e.g. OPENAI_API_KEY).",
-            placeholder: "OPENAI_API_KEY",
+            description:
+              kind === "late"
+                ? "Environment variable containing the Bearer token for this embedding endpoint (e.g. EMBED_API_KEY)."
+                : "Environment variable containing the API key for this embedding endpoint (e.g. OPENAI_API_KEY).",
+            placeholder: kind === "late" ? "EMBED_API_KEY" : "OPENAI_API_KEY",
             nullLabel: "(none)",
             restart: true,
+            envVar: true,
           },
           {
             kind: "secret",
             path: `${basePath}.apiKey`,
             label: "API key (literal)",
-            description: "Literal Bearer token for this embedding endpoint. Prefer apiKeyEnv to keep credentials out of config.json.",
-            placeholder: "sk-...",
+            description: "Literal Bearer token for this embedding endpoint. Masked on screen and while typing; config.json is saved mode 0600. Prefer apiKeyEnv or apiKeyFile to keep credentials out of config.json.",
+            placeholder: "Bearer token or secret",
             nullLabel: "(not set)",
             restart: true,
+          },
+          {
+            kind: "optional-string",
+            path: `${basePath}.apiKeyFile`,
+            label: "API key file",
+            description:
+              kind === "late"
+                ? "Optional path to a secret file holding a raw token or KEY=VALUE env assignment (for example /etc/pplx-embed-v2-exl3/env or ~/.secrets/embed.key). Used if literal apiKey and apiKeyEnv are unset."
+                : "Optional path to a secret file holding a raw token or KEY=VALUE env assignment (for example ~/.secrets/openai.key). Used if literal apiKey and apiKeyEnv are unset.",
+            placeholder: kind === "late" ? "/etc/pplx-embed-v2-exl3/env" : "~/.secrets/openai.key",
+            nullLabel: "(none)",
+            restart: true,
+            secretFile: true,
           },
           {
             kind: "string-map",
             path: `${basePath}.headers`,
             label: "Custom HTTP headers",
-            description: "Extra HTTP headers included on every embedding request.",
+            description: "Extra HTTP headers included on every embedding request. Sensitive header values are masked on screen.",
             keyPlaceholder: "X-Custom-Header",
             valuePlaceholder: "header value",
             restart: true,
@@ -890,9 +964,15 @@ export function buildAuxHarnessScreen(harness: "pi" | "claudeCode", cfg: Config)
 
 // ───────────────────────────── Top-level Categories
 
-function endpointShortSummary(ep: { model?: string; url?: string } | null, health?: { healthy: boolean; emulated?: boolean } | null): string {
+function endpointShortSummary(
+  ep: { model?: string; url?: string } | null,
+  health?: { healthy: boolean; emulated?: boolean } | null,
+  testState?: { status: "running" } | { status: "done"; result: EndpointTestResult },
+): string {
   if (!ep) return "off";
   const name = ep.model || ep.url || "configured";
+  if (testState?.status === "running") return `${name} · testing…`;
+  if (testState?.status === "done") return `${name} · ${testState.result.ok ? "✓" : "✗"} ${testState.result.summary}`;
   if (!health) return name;
   return `${name} · ${health.healthy ? "healthy" : health.emulated ? "emulated" : "down"}`;
 }
@@ -925,7 +1005,7 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
               id: "providers.decision",
               label: "Decision model endpoint",
               description: "Fast classifier/decision endpoint (SystemOne or Decisions API) used for Janus intent tracking, proactive gating, attribution, routing, and conflict checks. Applies immediately.",
-              summary: (c, x) => endpointShortSummary(c.providers.decision, x?.health?.decision ?? null),
+              summary: (c, x) => endpointShortSummary(c.providers.decision, x?.health?.decision ?? null, x?.endpointTests?.decision),
               build: (c, x) => buildDecisionEndpointScreen(c, x),
             },
             {
@@ -933,7 +1013,7 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
               id: "providers.embedding.late",
               label: "Late-interaction embedding endpoint",
               description: "Multi-vector ColBERT embedding endpoint (/v1/embeddings with token vectors) for MaxSim first-stage retrieval and calibrated similarity checks.",
-              summary: (c, x) => endpointShortSummary(c.providers.embedding.late, x?.health?.late ?? null),
+              summary: (c, x) => endpointShortSummary(c.providers.embedding.late, x?.health?.late ?? null, x?.endpointTests?.late),
               build: (c, x) => buildEmbeddingEndpointScreen("late", c, x),
             },
             {
@@ -941,7 +1021,7 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
               id: "providers.embedding.dense",
               label: "Dense embedding endpoint",
               description: "Standard dense embedding endpoint (/v1/embeddings). Used for cosine search when late-interaction is absent or unavailable.",
-              summary: (c, x) => endpointShortSummary(c.providers.embedding.dense, x?.health?.dense ?? null),
+              summary: (c, x) => endpointShortSummary(c.providers.embedding.dense, x?.health?.dense ?? null, x?.endpointTests?.dense),
               build: (c, x) => buildEmbeddingEndpointScreen("dense", c, x),
             },
           ],
@@ -2480,6 +2560,8 @@ export function flattenAllSettings(cfg: Config, ctx?: SettingsDisplayContext): S
       for (const item of sec.items) {
         if (item.kind === "subscreen") {
           visitScreen(categoryId, categoryTitle, item.build(cfg, ctx), prefix ? `${prefix} › ${item.label}` : item.label);
+        } else if (item.kind === "action") {
+          continue;
         } else {
           out.push({
             categoryId,

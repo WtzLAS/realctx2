@@ -10,8 +10,9 @@
  */
 import type { Component, Focusable, TUI, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { fuzzyFilter, fuzzyMatch, getKeybindings, Input, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import type { Config } from "../../core/config.ts";
+import { type Config, isSensitiveHeaderName, normalizeEnvVarName, readSecretFromFile } from "../../core/config.ts";
 import {
+  type ActionEntry,
   type EditableSetting,
   type EnumOption,
   findCategory,
@@ -22,6 +23,7 @@ import {
   getSettingValue,
   isScalarSetting,
   isSettingModified,
+  maskSecret,
   parseSettingInput,
   rawInputValue,
   type ScalarSetting,
@@ -35,6 +37,7 @@ import {
   type StringListSetting,
   type StringMapSetting,
 } from "../../core/settings-schema.ts";
+import { type EndpointKind, type EndpointTestResult, testEndpoint } from "../../providers/test-endpoint.ts";
 
 export interface SettingsTheme {
   fg(color: "accent" | "border" | "borderMuted" | "success" | "error" | "warning" | "muted" | "dim" | "text", text: string): string;
@@ -64,6 +67,8 @@ export interface Realctx2SettingsOptions {
   initialCategory?: string;
   /** Persist updated global config and reload live host state. */
   onSave: (next: Config) => void;
+  /** Optional custom endpoint tester (defaults to live HTTP probe via testEndpoint). */
+  onTestEndpoint?: (endpoint: EndpointKind, cfg: Config, signal: AbortSignal) => Promise<EndpointTestResult>;
   /** Called when the user closes the settings screen. */
   onClose: () => void;
   theme: SettingsTheme;
@@ -100,6 +105,8 @@ type ActiveModal =
       hint: string;
       input: Input;
       error?: string;
+      secret?: boolean;
+      placeholder?: string;
       onCommit: (raw: string) => string | null;
     }
   | {
@@ -128,6 +135,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
   private readonly displayCtx?: SettingsDisplayContext;
   private readonly availableModels: ModelChoice[];
   private readonly onSave: (next: Config) => void;
+  private readonly onTestEndpoint?: (endpoint: EndpointKind, cfg: Config, signal: AbortSignal) => Promise<EndpointTestResult>;
   private readonly onClose: () => void;
   private readonly theme: SettingsTheme;
   private readonly tui?: Pick<TUI, "requestRender"> & { terminal?: { rows?: number } };
@@ -135,6 +143,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
   private stack: ViewState[] = [];
   private modal: ActiveModal | null = null;
   private flash: { text: string; tone: "success" | "warning" | "error" | "muted" } | null = null;
+  private endpointTests: Partial<Record<EndpointKind, { status: "running"; abort: AbortController } | { status: "done"; result: EndpointTestResult }>> = {};
   private lastViewportRowOffset = 0;
   private lastVisibleSelectableIndices: Array<{ rowY: number; index: number }> = [];
 
@@ -146,6 +155,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
     this.displayCtx = opts.displayContext;
     this.availableModels = opts.availableModels ?? [];
     this.onSave = opts.onSave;
+    this.onTestEndpoint = opts.onTestEndpoint;
     this.onClose = opts.onClose;
     this.theme = opts.theme;
     this.tui = opts.tui;
@@ -191,8 +201,98 @@ export class Realctx2SettingsComponent implements Component, Focusable {
     return Math.max(8, Math.min(18, rows - 14));
   }
 
+  private effectiveDisplayContext(): SettingsDisplayContext | undefined {
+    const testEntries = Object.entries(this.endpointTests);
+    if (!testEntries.length) return this.displayCtx;
+    const mapped: NonNullable<SettingsDisplayContext["endpointTests"]> = {};
+    for (const [k, st] of testEntries) {
+      if (!st) continue;
+      mapped[k as EndpointKind] = st.status === "running" ? { status: "running" } : { status: "done", result: st.result };
+    }
+    return { ...(this.displayCtx ?? {}), endpointTests: mapped };
+  }
+
+  private clearEndpointTest(endpoint: EndpointKind): void {
+    const cur = this.endpointTests[endpoint];
+    if (cur?.status === "running") cur.abort.abort();
+    delete this.endpointTests[endpoint];
+  }
+
+  private abortAllTests(): void {
+    for (const ep of ["decision", "late", "dense"] as const) {
+      const cur = this.endpointTests[ep];
+      if (cur?.status === "running") cur.abort.abort();
+    }
+  }
+
+  private close(): void {
+    this.abortAllTests();
+    this.onClose();
+  }
+
+  private invalidateEndpointTests(prev: Config, next: Config): void {
+    if (JSON.stringify(prev.providers.decision) !== JSON.stringify(next.providers.decision)) {
+      this.clearEndpointTest("decision");
+    }
+    if (JSON.stringify(prev.providers.embedding.late) !== JSON.stringify(next.providers.embedding.late)) {
+      this.clearEndpointTest("late");
+    }
+    if (JSON.stringify(prev.providers.embedding.dense) !== JSON.stringify(next.providers.embedding.dense)) {
+      this.clearEndpointTest("dense");
+    }
+  }
+
+  private runEndpointTest(endpoint: EndpointKind): void {
+    const prev = this.endpointTests[endpoint];
+    if (prev?.status === "running") prev.abort.abort();
+    const abort = new AbortController();
+    this.endpointTests[endpoint] = { status: "running", abort };
+    const label = endpoint === "decision" ? "Decision" : endpoint === "late" ? "Late embedding" : "Dense embedding";
+    this.flash = { text: `Testing ${label} endpoint…`, tone: "muted" };
+    this.tui?.requestRender();
+
+    const snapshot = structuredClone(this.cfg);
+    const runner = this.onTestEndpoint ?? ((ep: EndpointKind, c: Config, sig: AbortSignal) => testEndpoint(ep, c, { signal: sig }));
+    let runPromise: Promise<EndpointTestResult>;
+    try {
+      runPromise = Promise.resolve(runner(endpoint, snapshot, abort.signal));
+    } catch (e) {
+      runPromise = Promise.reject(e);
+    }
+    void runPromise.then(
+        (result) => {
+          const cur = this.endpointTests[endpoint];
+          if (!cur || cur.status !== "running" || cur.abort !== abort) return;
+          this.endpointTests[endpoint] = { status: "done", result };
+          this.flash = {
+            text: result.ok ? `✓ ${label}: ${result.summary}` : `✗ ${label}: ${result.summary}`,
+            tone: result.ok ? "success" : "error",
+          };
+          this.tui?.requestRender();
+        },
+        (e: unknown) => {
+          const cur = this.endpointTests[endpoint];
+          if (!cur || cur.status !== "running" || cur.abort !== abort) return;
+          const msg = String((e as Error)?.message ?? e);
+          const result: EndpointTestResult = {
+            endpoint,
+            ok: false,
+            latencyMs: 0,
+            summary: msg.length > 48 ? `${msg.slice(0, 45)}…` : msg || "Test failed",
+            detail: `Endpoint test threw an unexpected error: ${msg}`,
+            authSummary: "unknown",
+          };
+          this.endpointTests[endpoint] = { status: "done", result };
+          this.flash = { text: `✗ ${label}: ${result.summary}`, tone: "error" };
+          this.tui?.requestRender();
+        },
+      );
+  }
+
   private commitConfig(next: Config, message: string): void {
+    const prev = this.cfg;
     this.cfg = next;
+    this.invalidateEndpointTests(prev, next);
     try {
       this.onSave(structuredClone(next));
       this.flash = { text: message, tone: "success" };
@@ -300,7 +400,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
 
   private popOrClose(): void {
     if (this.stack.length > 1) this.stack.pop();
-    else this.onClose();
+    else this.close();
   }
 
   private openGlobalSearch(): void {
@@ -330,7 +430,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
   }
 
   private filterSettingsList(query: string): SearchableSetting[] {
-    const all = flattenAllSettings(this.cfg, this.displayCtx);
+    const all = flattenAllSettings(this.cfg, this.effectiveDisplayContext());
     const q = query.trim().toLowerCase();
     if (!q) return all;
     const tokens = q.split(/\s+/).filter(Boolean);
@@ -382,7 +482,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
         view.input.setValue("");
         view.selected = 0;
       } else {
-        this.onClose();
+        this.close();
       }
       return;
     }
@@ -427,7 +527,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
   // ── Category / Subscreen input
 
   private screenRows(view: Extract<ViewState, { kind: "screen" }>): { spec: SettingScreenSpec; rows: ScreenRow[]; entryIndices: number[] } {
-    const spec = view.build(this.cfg, this.displayCtx);
+    const spec = view.build(this.cfg, this.effectiveDisplayContext());
     const rows: ScreenRow[] = [];
     const entryIndices: number[] = [];
     spec.sections.forEach((sec, si) => {
@@ -506,9 +606,12 @@ export class Realctx2SettingsComponent implements Component, Focusable {
       }
     } else if (this.isConfirm(data) || data === " ") {
       this.activateEntry(entries[view.selected]!);
+    } else if (data === "t") {
+      const testAction = entries.find((e): e is ActionEntry => e.kind === "action" && e.action === "test-endpoint");
+      if (testAction) this.runEndpointTest(testAction.endpoint);
     } else if (data === "r" || matchesKey(data, Key.backspace)) {
       const entry = entries[view.selected]!;
-      if (entry.kind !== "subscreen") this.resetEntry(entry);
+      if (entry.kind !== "subscreen" && entry.kind !== "action") this.resetEntry(entry);
     }
   }
 
@@ -735,15 +838,18 @@ export class Realctx2SettingsComponent implements Component, Focusable {
   }
 
   private openMapEditValueModal(entry: StringMapSetting, key: string, currentVal: string): void {
-    const input = new Input({ prompt: `${key}: `, placeholder: entry.valuePlaceholder ?? "header value" });
-    this.prefillInput(input, currentVal);
+    const sensitive = isSensitiveHeaderName(key);
+    const input = new Input({ prompt: `${key}: `, placeholder: sensitive ? "enter secret header value" : (entry.valuePlaceholder ?? "header value") });
+    this.prefillInput(input, sensitive ? "" : currentVal);
     this.modal = {
       kind: "text",
       title: `Header value · ${key}`,
-      subtitle: `${entry.path}.${key}`,
+      subtitle: sensitive && currentVal ? `${entry.path}.${key} (current: ${this.maskHeaderValue(key, currentVal)})` : `${entry.path}.${key}`,
       description: entry.description,
-      hint: "Enter to save · Esc to cancel",
+      hint: sensitive ? "Enter to save · Esc to keep current value" : "Enter to save · Esc to cancel",
       input,
+      secret: sensitive,
+      placeholder: sensitive ? "enter secret header value" : (entry.valuePlaceholder ?? "header value"),
       onCommit: (raw) => {
         const nextMap = Object.fromEntries(this.getMapEntries(entry));
         nextMap[key] = raw.trim();
@@ -751,6 +857,15 @@ export class Realctx2SettingsComponent implements Component, Focusable {
         return null;
       },
     };
+  }
+
+  private maskHeaderValue(key: string, value: string): string {
+    if (!isSensitiveHeaderName(key)) return value;
+    const trimmed = value.trim();
+    if (/^bearer\s+/i.test(trimmed)) {
+      return `Bearer ${maskSecret(trimmed.replace(/^bearer\s+/i, "").trim())}`;
+    }
+    return maskSecret(trimmed);
   }
 
   // ── Entry activation, quick-step, reset
@@ -769,6 +884,10 @@ export class Realctx2SettingsComponent implements Component, Focusable {
   }
 
   private activateEntry(entry: SettingEntry): void {
+    if (entry.kind === "action") {
+      if (entry.action === "test-endpoint") this.runEndpointTest(entry.endpoint);
+      return;
+    }
     if (entry.kind === "subscreen") {
       this.stack.push({ kind: "screen", title: entry.label, build: entry.build, selected: 0 });
       return;
@@ -846,17 +965,19 @@ export class Realctx2SettingsComponent implements Component, Focusable {
 
   private openTextModal(entry: ScalarSetting): void {
     const cur = getSettingValue(this.cfg, entry);
+    const isSecret = entry.kind === "secret";
     const input = new Input({ prompt: "> ", placeholder: entry.placeholder ?? "" });
     // For secrets, prefill empty so existing secret is not exposed in clear text unless re-typed
-    this.prefillInput(input, entry.kind === "secret" ? "" : rawInputValue(entry, cur));
+    this.prefillInput(input, isSecret ? "" : rawInputValue(entry, cur));
 
     const bounds: string[] = [];
     if (entry.min !== undefined) bounds.push(`min ${entry.min}`);
     if (entry.max !== undefined) bounds.push(`max ${entry.max}`);
     if (entry.unit) bounds.push(`unit: ${entry.unit}`);
+    if (isSecret && typeof cur === "string" && cur.trim()) bounds.push(`current: ${maskSecret(cur)}`);
     if (entry.kind === "nullable-number") bounds.push("blank = default/null");
     else if (entry.kind === "number-or-auto") bounds.push('number or "auto"');
-    else if (entry.kind === "optional-string" || entry.kind === "secret") bounds.push("blank = clear");
+    else if (entry.kind === "optional-string" || isSecret) bounds.push("blank = clear");
     const def = getSettingDefault(entry);
     bounds.push(`default: ${formatSettingValue(entry, def)}`);
 
@@ -865,8 +986,10 @@ export class Realctx2SettingsComponent implements Component, Focusable {
       title: entry.label,
       subtitle: `${entry.path} (${bounds.join(" · ")})`,
       description: entry.description,
-      hint: "Enter to save · Esc to cancel",
+      hint: isSecret ? "Enter to save (blank clears) · Esc to keep" : "Enter to save · Esc to cancel",
       input,
+      secret: isSecret,
+      placeholder: entry.placeholder,
       onCommit: (raw) => {
         const parsed = parseSettingInput(entry, raw);
         if (!parsed.ok) return parsed.error;
@@ -1036,6 +1159,31 @@ export class Realctx2SettingsComponent implements Component, Focusable {
     return out;
   }
 
+  private siblingEnvVarFor(path: string): string | undefined {
+    const dot = path.lastIndexOf(".");
+    if (dot < 0) return undefined;
+    const sibling = getConfigPath(this.cfg, `${path.slice(0, dot)}.apiKeyEnv`);
+    return typeof sibling === "string" ? normalizeEnvVarName(sibling) : undefined;
+  }
+
+  private formatEntryDisplayValue(entry: EditableSetting): string {
+    const val = getSettingValue(this.cfg, entry);
+    const base = formatSettingValue(entry, val);
+    if (!isScalarSetting(entry)) return base;
+    if (entry.envVar && typeof val === "string") {
+      const envName = normalizeEnvVarName(val);
+      if (envName) {
+        const present = Boolean(process.env[envName]?.trim());
+        return `${base} (${present ? "set" : "unset"})`;
+      }
+    }
+    if (entry.secretFile && typeof val === "string" && val.trim()) {
+      const res = readSecretFromFile(val.trim(), this.siblingEnvVarFor(entry.path));
+      return `${base} (${res.key ? "ok" : "unreadable"})`;
+    }
+    return base;
+  }
+
   private renderSettingMeta(entry: EditableSetting): string {
     const t = this.theme;
     const parts: string[] = [t.fg("accent", entry.path)];
@@ -1043,6 +1191,21 @@ export class Realctx2SettingsComponent implements Component, Focusable {
     parts.push(t.fg("dim", `default: ${formatSettingValue(entry, def)}`));
     if (isSettingModified(this.cfg, entry)) {
       parts.push(t.fg("warning", "modified"));
+    }
+    if (isScalarSetting(entry) && entry.envVar) {
+      const val = getSettingValue(this.cfg, entry);
+      const envName = typeof val === "string" ? normalizeEnvVarName(val) : undefined;
+      if (envName) {
+        const present = Boolean(process.env[envName]?.trim());
+        parts.push(present ? t.fg("success", `$${envName} set`) : t.fg("warning", `$${envName} not set in env`));
+      }
+    }
+    if (isScalarSetting(entry) && entry.secretFile) {
+      const val = getSettingValue(this.cfg, entry);
+      if (typeof val === "string" && val.trim()) {
+        const res = readSecretFromFile(val.trim(), this.siblingEnvVarFor(entry.path));
+        parts.push(res.key ? t.fg("success", "secret file readable") : t.fg("warning", `secret file: ${res.error}`));
+      }
     }
     if (this.projectOverrides.has(entry.path) && this.effectiveConfig) {
       const eff = getConfigPath(this.effectiveConfig, entry.path);
@@ -1079,7 +1242,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
         const cursor = sel ? t.fg("accent", "▸ ") : "  ";
         const label = cat.title + " ".repeat(Math.max(0, labelCol - visibleWidth(cat.title)));
         const styledLabel = sel ? t.bold(t.fg("accent", label)) : t.fg("text", label);
-        const summary = cat.summary(this.cfg, this.displayCtx);
+        const summary = cat.summary(this.cfg, this.effectiveDisplayContext());
         const valMax = Math.max(8, width - 4 - labelCol - 2);
         const styledVal = sel ? t.fg("accent", truncateToWidth(`${summary} ›`, valMax)) : t.fg("muted", truncateToWidth(`${summary} ›`, valMax));
         this.lastVisibleSelectableIndices.push({ rowY: baseY + lines.length, index: idx });
@@ -1146,7 +1309,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
         const cat = vr.match.category;
         const pad = " ".repeat(Math.max(0, maxLabel - visibleWidth(cat.title)));
         const lbl = sel ? t.bold(t.fg("accent", cat.title + pad)) : t.fg("text", cat.title + pad);
-        const right = `${cat.summary(this.cfg, this.displayCtx)} ›`;
+        const right = `${cat.summary(this.cfg, this.effectiveDisplayContext())} ›`;
         const rightMax = Math.max(10, width - 6 - maxLabel);
         lines.push(truncateToWidth(`  ${cursor}${lbl}  ${sel ? t.fg("accent", truncateToWidth(right, rightMax)) : t.fg("muted", truncateToWidth(right, rightMax))}`, width));
       } else {
@@ -1238,25 +1401,37 @@ export class Realctx2SettingsComponent implements Component, Focusable {
       const entry = vr.row.entry;
       const sel = vr.entryIdx === view.selected;
       const cursor = sel ? t.fg("accent", "▸ ") : "  ";
-      const modDot = entry.kind !== "subscreen" && isSettingModified(this.cfg, entry) ? t.fg("warning", "•") : " ";
+      const modDot = entry.kind !== "subscreen" && entry.kind !== "action" && isSettingModified(this.cfg, entry) ? t.fg("warning", "•") : " ";
       const pad = " ".repeat(Math.max(0, maxLabel - visibleWidth(entry.label)));
       const labelStr = sel ? t.bold(t.fg("accent", entry.label + pad)) : t.fg("text", entry.label + pad);
 
-      let valueRaw: string;
-      if (entry.kind === "subscreen") {
-        valueRaw = `${entry.summary(this.cfg, this.displayCtx)} ›`;
-      } else {
-        valueRaw = formatSettingValue(entry, getSettingValue(this.cfg, entry));
-      }
       const valMax = Math.max(8, width - 6 - maxLabel - 3);
-      const valTrunc = truncateToWidth(valueRaw, valMax);
-      const valStyled = sel
-        ? t.fg("accent", valTrunc)
-        : entry.kind === "subscreen"
-          ? t.fg("muted", valTrunc)
+      let valStyled: string;
+      if (entry.kind === "action") {
+        const st = this.endpointTests[entry.endpoint];
+        const btn = entry.buttonText ?? "[ Run ]";
+        if (st?.status === "running") {
+          const txt = truncateToWidth("⟳ Testing…", valMax);
+          valStyled = sel ? t.bold(t.fg("accent", txt)) : t.fg("warning", txt);
+        } else if (st?.status === "done") {
+          const icon = st.result.ok ? "✓" : "✗";
+          const txt = truncateToWidth(`${btn}  ${icon} ${st.result.summary}`, valMax);
+          valStyled = st.result.ok ? t.fg("success", txt) : t.fg("error", txt);
+        } else {
+          const txt = truncateToWidth(btn, valMax);
+          valStyled = sel ? t.bold(t.fg("accent", txt)) : t.fg("success", txt);
+        }
+      } else if (entry.kind === "subscreen") {
+        const valTrunc = truncateToWidth(`${entry.summary(this.cfg, this.effectiveDisplayContext())} ›`, valMax);
+        valStyled = sel ? t.fg("accent", valTrunc) : t.fg("muted", valTrunc);
+      } else {
+        const valTrunc = truncateToWidth(this.formatEntryDisplayValue(entry), valMax);
+        valStyled = sel
+          ? t.fg("accent", valTrunc)
           : isSettingModified(this.cfg, entry)
             ? t.fg("warning", valTrunc)
             : t.fg("muted", valTrunc);
+      }
 
       this.lastVisibleSelectableIndices.push({ rowY: baseY + lines.length, index: vr.entryIdx! });
       lines.push(truncateToWidth(`  ${cursor}${labelStr} ${modDot} ${valStyled}`, width));
@@ -1268,16 +1443,39 @@ export class Realctx2SettingsComponent implements Component, Focusable {
 
     const selectedEntry = (rows[selectedRowIdx] as Extract<ScreenRow, { kind: "entry" }>).entry;
     lines.push("");
-    const meta =
-      selectedEntry.kind === "subscreen"
-        ? t.fg("accent", selectedEntry.id) + t.fg("dim", " · press Enter to configure")
-        : this.renderSettingMeta(selectedEntry);
-    lines.push(...this.renderDescriptionBox(meta, selectedEntry.description, width));
+    let meta: string;
+    let descText = selectedEntry.description;
+    if (selectedEntry.kind === "subscreen") {
+      meta = t.fg("accent", selectedEntry.id) + t.fg("dim", " · press Enter to configure");
+    } else if (selectedEntry.kind === "action") {
+      const st = this.endpointTests[selectedEntry.endpoint];
+      if (st?.status === "running") {
+        meta = t.fg("accent", selectedEntry.id) + t.fg("warning", " · running live probe…");
+        descText = "Sending probe request to endpoint with current URL, model, and authentication settings…";
+      } else if (st?.status === "done") {
+        const tone = st.result.ok ? "success" : "error";
+        meta =
+          t.fg("accent", selectedEntry.id) +
+          t.fg("dim", " · ") +
+          t.fg(tone, st.result.ok ? `✓ ${st.result.summary}` : `✗ ${st.result.summary}`) +
+          t.fg("dim", ` · auth: ${st.result.authSummary}`);
+        descText = st.result.detail;
+      } else {
+        meta = t.fg("accent", selectedEntry.id) + t.fg("dim", " · press Enter or t to test");
+      }
+    } else {
+      meta = this.renderSettingMeta(selectedEntry);
+    }
+    lines.push(...this.renderDescriptionBox(meta, descText, width));
 
     const multiSec = spec.sections.length > 1;
-    const hint = multiSec
-      ? "  ↑↓ navigate · Tab next section · ←→ adjust · Enter edit · r reset · / search · Esc back"
-      : "  ↑↓ navigate · ←→ adjust · Enter edit · r reset · / search · Esc back";
+    const hasTest = allEntries.some((e) => e.kind === "action" && e.action === "test-endpoint");
+    const parts = ["↑↓ navigate"];
+    if (multiSec) parts.push("Tab next section");
+    parts.push("←→ adjust", "Enter edit");
+    if (hasTest) parts.push("t test");
+    parts.push("r reset", "/ search", "Esc back");
+    const hint = `  ${parts.join(" · ")}`;
     lines.push("");
     lines.push(truncateToWidth(t.fg("dim", hint), width));
     return lines;
@@ -1420,7 +1618,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
       this.lastVisibleSelectableIndices.push({ rowY: baseY + lines.length, index: i });
       if (i < pairs.length) {
         const [k, v] = pairs[i]!;
-        const text = `${k}: ${v}`;
+        const text = `${k}: ${this.maskHeaderValue(k, v)}`;
         lines.push(truncateToWidth(`  ${cursor}${sel ? t.bold(t.fg("accent", text)) : t.fg("text", text)}`, width));
       } else {
         const add = "+ Add header…";
@@ -1447,8 +1645,17 @@ export class Realctx2SettingsComponent implements Component, Focusable {
         truncateToWidth(`  ${t.fg("dim", modal.subtitle)}`, width),
         "",
       ];
-      for (const l of modal.input.render(Math.max(20, width - 4))) {
-        lines.push(`  ${l}`);
+      if (modal.secret) {
+        const raw = modal.input.getValue();
+        const maskedLine =
+          raw.length > 0
+            ? `  > ${"•".repeat(Math.min(raw.length, Math.max(8, width - 18)))} ${t.fg("dim", `(${raw.length} char${raw.length === 1 ? "" : "s"})`)}`
+            : `  > ${t.fg("dim", modal.placeholder || "(enter secret)")}`;
+        lines.push(truncateToWidth(maskedLine, width));
+      } else {
+        for (const l of modal.input.render(Math.max(20, width - 4))) {
+          lines.push(`  ${l}`);
+        }
       }
       if (modal.error) {
         lines.push("");

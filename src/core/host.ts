@@ -15,7 +15,7 @@ import { EmulatedDecisionClient, type FetchLike, HttpDecisionClient, ResilientDe
 import { createEmbeddingClients } from "../providers/embedding.ts";
 import { buildTools, promptSection, type ToolEnv, type ToolKey } from "../tools/index.ts";
 import { ensureDir } from "../util/fs.ts";
-import { type Config, type DecisionProviderConfig, Layout, loadConfig, type ProjectOverrideReport, resolveApiKey } from "./config.ts";
+import { type Config, type DecisionProviderConfig, Layout, loadConfig, type ProjectOverrideReport } from "./config.ts";
 import { type ProjectInfo, resolveProject } from "./project.ts";
 import { Telemetry } from "./telemetry.ts";
 import type { AuxSessionRunner, Clock, CommandDef, CommitBatch, DecisionClient, EmbeddingClient, EntryView, HarnessAdapter, SessionRecord, ToolDef } from "./types.ts";
@@ -183,7 +183,7 @@ export class Host {
 
   private makeHttp(cfg: DecisionProviderConfig | null): HttpDecisionClient | null {
     if (!cfg?.url) return null;
-    return new HttpDecisionClient({ ...cfg, apiKey: resolveApiKey(cfg) }, { fetch: this.fetchImpl, telemetry: this.telemetry, dailyTokenBudget: this.cfg.budgets.dailyDecisionTokens });
+    return new HttpDecisionClient(cfg, { fetch: this.fetchImpl, telemetry: this.telemetry, dailyTokenBudget: this.cfg.budgets.dailyDecisionTokens });
   }
 
   /**
