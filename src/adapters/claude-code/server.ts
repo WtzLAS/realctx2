@@ -19,6 +19,7 @@ import type { PathEvent } from "../../memory/delivery.ts";
 import { AUX_TOOL_KEYS, buildTools, type ToolKey, toolNames } from "../../tools/index.ts";
 import { existsSync, readJson, removeFile, writeJson } from "../../util/fs.ts";
 import { clipTokens } from "../../util/text.ts";
+import { checkAuxBash } from "../guard.ts";
 import { pathEventOf } from "../pathevents.ts";
 import { loadAnySession } from "../sessions.ts";
 import { ClaudeAdapter, responseText } from "./adapter.ts";
@@ -327,6 +328,25 @@ export class ClaudeServer {
       if (!AUX_TOOL_KEYS.includes(key)) return { text: `${key} is not available to helper sessions.`, isError: true };
       const res = await this.callTool(key, (req.params ?? {}) as Record<string, unknown>, true);
       return { text: res.text, isError: res.isError === true };
+    }
+    if (req.kind === "aux-bash") {
+      const command = typeof req.command === "string" ? req.command : "";
+      const cwd = typeof req.cwd === "string" && req.cwd ? req.cwd : (this.session?.cwd ?? this.o.cwd ?? process.cwd());
+      const role = typeof req.role === "string" && req.role ? req.role : "aux";
+      const s = this.session;
+      const cfg = s?.host.cfg ?? this.cfg;
+      const root = s?.host.project.root ?? null;
+      const memory = s?.host.memory ?? null;
+      const reason = checkAuxBash(command, { cfg, cwd, root, memory });
+      if (!reason) return null;
+      memory?.noteAuxBlocked(role, command, reason);
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: `Blocked by realctx2 aux policy: ${reason}`,
+        },
+      };
     }
     if (req.kind === "ping") return { ok: true, session: this.session?.id ?? null };
     return null;

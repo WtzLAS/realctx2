@@ -170,12 +170,15 @@ export class MemoryWriter {
     const text = scan.redacted.replace(/\n{3,}/g, "\n\n");
     const kind: Kind = c.kind && KINDS.includes(c.kind) ? c.kind : "fact";
     const titleScan = scanSecrets(sanitize(c.title?.trim() || makeTitle(text)));
+    if (titleScan.findings.length > 0 || titleScan.pii.length > 0) personal = true;
     const title = makeTitle(titleScan.redacted);
     // 2. evidence: verbatim quotes, verified with a normalized substring match
     const evidence: Evidence[] = [];
+    let evidenceRedacted = false;
     for (const e of c.evidence ?? []) {
       const q = scanSecrets(sanitize(e.quote).trim());
       if (!q.redacted) continue;
+      if (q.findings.length > 0) evidenceRedacted = true;
       if (q.findings.length || q.pii.length) personal = true;
       const verified = q.findings.length === 0 && (c.sourceTexts ?? []).some((src) => verifyQuote(e.quote, src));
       evidence.push({ quote: q.redacted, source: { type: e.source.type, ref: sanitize(e.source.ref) }, time: e.time, verified });
@@ -195,7 +198,7 @@ export class MemoryWriter {
       evidence,
       signature,
       sensitivity: personal ? "personal" : "normal",
-      redacted: scan.findings.length > 0 || titleScan.findings.length > 0,
+      redacted: scan.findings.length > 0 || titleScan.findings.length > 0 || evidenceRedacted,
       anchors: [],
       triggers: triggers.on || triggers.commands ? triggers : undefined,
       urgency: c.urgency,
@@ -267,7 +270,7 @@ export class MemoryWriter {
           if (fb) p.scope = fb;
           else p.discard = "no writable scope";
         } else if (!p.c.keep && (probs.discard ?? 0) >= cfg.discard) p.discard = "not worth remembering";
-        else if ((probs.project_shared ?? 0) >= (answers[`scope.${id}`]?.calibrated === false ? Math.max(cfg.shared, UNCALIBRATED.sharedRouting) : cfg.shared) && p.sensitivity === "normal" && (sensitive ?? 0) < 0.2 && g.has("shared") && g.writable("shared")) p.scope = "shared";
+        else if ((probs.project_shared ?? 0) >= (answers[`scope.${id}`]?.calibrated === false ? Math.max(cfg.shared, UNCALIBRATED.sharedRouting) : cfg.shared) && p.sensitivity === "normal" && sensitive !== null && sensitive < 0.2 && g.has("shared") && g.writable("shared")) p.scope = "shared";
         else if (p.kind !== "episode" && (probs.global ?? 0) >= cfg.global && !hasRepoPaths && g.writable("global")) p.scope = "global";
         else if (inProject && g.writable("personal")) p.scope = "personal";
         else if ((probs.global ?? 0) >= 0.5 && g.writable("global")) p.scope = "global";

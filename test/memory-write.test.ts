@@ -126,12 +126,22 @@ describe("write path (§6.3)", () => {
     w.decision.on("write.route", route("project_shared"));
     const writer = new MemoryWriter(w);
     const key = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
-    const [r, named] = await writer.write([
+    const [r, named, titleSecret, evSecret] = await writer.write([
       { text: `The deploy token is ${key}; rotate it monthly.`, origin: "harvest", evidence: [{ quote: `token: "${key}"`, source: { type: "session", ref: "x" } }] },
       { text: `CI uses ${key} for publishing.`, origin: "explicit", scope: "shared" },
+      { title: "Contact alice@acme.io about deploy", text: "Deployments run on Tuesdays.", origin: "explicit", scope: "shared" },
+      { text: "Rotate the CI token monthly.", origin: "explicit", scope: "shared", evidence: [{ quote: `export TOKEN=${key}`, source: { type: "session", ref: "x" } }] },
     ]);
     expect(r).toMatchObject({ status: "created", scope: "personal", redacted: true, sensitivity: "personal" });
     expect(named).toMatchObject({ status: "created", scope: "personal", reroutedFrom: "shared" });
+    expect(titleSecret).toMatchObject({ status: "created", scope: "personal", reroutedFrom: "shared", sensitivity: "personal" });
+    expect(evSecret).toMatchObject({ status: "created", scope: "personal", reroutedFrom: "shared", redacted: true, sensitivity: "personal" });
+    // Missing/refused sensitivity answer must fail closed (never auto-route to shared).
+    w.decision.on("write.route", (_e, qs) =>
+      Object.fromEntries(qs.filter((q) => !q.name.startsWith("sensitive.")).map((q): [string, Record<string, number>] => [q.name, q.name.startsWith("scope.") ? { project_shared: 0.99 } : { caption: 0.9 }])),
+    );
+    const [missingSens] = await writer.write([{ text: "Team convention without sensitivity verdict.", origin: "harvest" }]);
+    expect(missingSens).toMatchObject({ status: "created", scope: "personal" });
     const n = w.graph.get(r!.id!)!.node;
     expect(n.text).toContain("[secret:redacted]");
     expect(n.text).not.toContain(key);

@@ -5,7 +5,7 @@
  * persisted edits) and append-only harnesses (L0, shadow consolidation).
  */
 import type { Config } from "../core/config.ts";
-import { scaledContext } from "../core/config.ts";
+import { effectiveCacheTtlSeconds, isContextEngineEnabled, scaledContext } from "../core/config.ts";
 import type { Telemetry } from "../core/telemetry.ts";
 import type { Clock, CommitBatch, ConsolidationRecord, ContextEdit, DecisionClient, Delivery, DeliveryChannel, EntryView, GuidanceMessage, HarnessAdapter, Intent, IntentOutcome, KnowledgeItem, ScopedNode, ScopeName, SessionRecord } from "../core/types.ts";
 import { emptyBatch } from "../core/types.ts";
@@ -199,12 +199,17 @@ export class ContextEngine {
     return this.adapter.capabilities.level;
   }
 
+  /** Whether the context engine is enabled for the active model (`maxWindow === 0` disables it). */
+  contextEnabled(): boolean {
+    return isContextEngineEnabled(this.cfg, this.adapter.modelName());
+  }
+
   window(): number {
-    return scaledContext(this.cfg, this.adapter.maxContextTokens()).W;
+    return scaledContext(this.cfg, this.adapter.maxContextTokens(), this.adapter.modelName()).W;
   }
 
   private scaled() {
-    return scaledContext(this.cfg, this.adapter.maxContextTokens());
+    return scaledContext(this.cfg, this.adapter.maxContextTokens(), this.adapter.modelName());
   }
 
   private now(): string {
@@ -220,10 +225,9 @@ export class ContextEngine {
     const [entries, records] = await Promise.all([this.adapter.listEntries(), this.adapter.listRecords()]);
     this.state = SessionState.from(records);
     this.setEntries(entries);
-    this.resolveIds();
     this.harvested = new Set();
     for (const r of this.state.records.values()) for (const k of r.knowledge ?? []) this.harvested.add(knowledgeKey(k));
-    // jobs planned against another branch are void
+    // jobs and ephemeral turn/branch state planned against another branch are void
     this.precipJobs = [];
     this.foldJobs.clear();
     this.appliedNow = [];
@@ -231,8 +235,22 @@ export class ContextEngine {
     this.lateJanus = null;
     this.lateCards = null;
     this.janusGen++;
+    this.janusStartedThisTurn = false;
+    this.closeProb = {};
+    this.actions.clear();
+    this.turnPathTokens = 0;
+    this.gatedThisTurn.clear();
+    this.shownThisTurn.clear();
+    this.lastReminderRound.clear();
+    this.statsDirty = false;
+    this.savedThisStep = 0;
+    this.exhaustedNotifiedAt = -1;
+    this.lastEpisode = null;
+    this.episodes.clear();
+    this.indexedEntries = null;
     this.pending = emptyBatch();
     this.unresolvedDeliveries = [];
+    this.resolveIds();
   }
 
   private setEntries(entries: EntryView[]): void {
@@ -557,7 +575,7 @@ export class ContextEngine {
       }
     }
     let msg: GuidanceMessage | null = null;
-    if (!this.light) {
+    if (!this.light && this.contextEnabled()) {
       const input = { ...this.janusInput("full", text), signal };
       let plan = await this.janusNow(input);
       let from: JanusInput = input;
@@ -575,7 +593,7 @@ export class ContextEngine {
       if (mention && msg.content.includes(mention)) this.deliverShown(mentionShown, "path", { guidanceKey: String(msg.details?.key ?? "") });
       batch.messages.push(msg);
     }
-    this.startPrecipJobs(false);
+    if (this.contextEnabled()) this.startPrecipJobs(false);
     const taken = this.take();
     batch.records.push(...taken.records);
     batch.edits.push(...taken.edits);
@@ -587,7 +605,7 @@ export class ContextEngine {
    * start Janus in the background, while the tools run.
    */
   async onToolCall(call: ToolCallInfo): Promise<{ block: string } | null> {
-    if (!this.janusStartedThisTurn && !call.nested && !call.subagent && !this.light) {
+    if (!this.janusStartedThisTurn && !call.nested && !call.subagent && !this.light && this.contextEnabled()) {
       this.janusStartedThisTurn = true;
       void this.startJanus();
     }
@@ -711,7 +729,7 @@ export class ContextEngine {
     }
     // the oversize guard works on the tool's own output; the path block (≤ paths.perResultTokens) follows it
     let body: string | undefined;
-    if (!res.nested) {
+    if (!res.nested && this.contextEnabled()) {
       const guarded = guardToolResult(text, this.scaled().maxToolResult, this.blobs, { tool: res.toolName, toolCallId: res.toolCallId, at: this.now() });
       if (guarded) {
         text = guarded.text;
@@ -760,49 +778,59 @@ export class ContextEngine {
     this.savedThisStep = 0;
     this.noteRound();
     const batch = emptyBatch();
+    const ctxOn = this.contextEnabled();
     if (!this.light) {
-      // an answer that came too late last step applies now
-      const late = this.lateJanus;
-      this.lateJanus = null;
-      const run = this.janusRun;
-      this.janusRun = null;
-      this.janusStartedThisTurn = false;
-      let plan: JanusPlan | null = null;
-      let input: JanusInput | null = null;
-      if (run) {
-        if (!run.done) await Promise.race([run.promise.catch(() => null), new Promise((r) => setTimeout(r, this.cfg.janus.lateWaitMs))]);
-        if (run.done) {
-          plan = this.current(run);
-          input = run.input;
-        } else {
-          // the answer applies at the next commit point; a late closure only delays consolidation
-          this.deferJanus(run);
+      if (ctxOn) {
+        // an answer that came too late last step applies now
+        const late = this.lateJanus;
+        this.lateJanus = null;
+        const run = this.janusRun;
+        this.janusRun = null;
+        this.janusStartedThisTurn = false;
+        let plan: JanusPlan | null = null;
+        let input: JanusInput | null = null;
+        if (run) {
+          if (!run.done) await Promise.race([run.promise.catch(() => null), new Promise((r) => setTimeout(r, this.cfg.janus.lateWaitMs))]);
+          if (run.done) {
+            plan = this.current(run);
+            input = run.input;
+          } else {
+            // the answer applies at the next commit point; a late closure only delays consolidation
+            this.deferJanus(run);
+          }
         }
-      }
-      if (!plan && late) {
-        plan = this.current(late);
-        input = late.input;
-      }
-      if (plan && input) {
-        const fresh = { ...input, entries: this.entries, units: this.units, round: this.round, state: this.state, signal };
-        const msg = await this.applyPlan(plan, fresh);
-        if (msg) batch.messages.push(msg);
+        if (!plan && late) {
+          plan = this.current(late);
+          input = late.input;
+        }
+        if (plan && input) {
+          const fresh = { ...input, entries: this.entries, units: this.units, round: this.round, state: this.state, signal };
+          const msg = await this.applyPlan(plan, fresh);
+          if (msg) batch.messages.push(msg);
+        } else {
+          const r = this.reminder();
+          if (r) batch.messages.push(r);
+        }
+        const cards = this.takeLateCards();
+        if (cards) batch.messages.push(cards);
       } else {
-        const r = this.reminder();
-        if (r) batch.messages.push(r);
+        this.janusRun = null;
+        this.lateJanus = null;
+        this.lateCards = null;
+        this.janusStartedThisTurn = false;
       }
-      const cards = this.takeLateCards();
-      if (cards) batch.messages.push(cards);
       await this.windowAttribution(signal);
     }
-    this.commitReady();
-    if (!this.light) {
-      this.startPrecipJobs(false);
-      if (this.level > 0) {
-        this.climb();
-        this.startOrdinaryFolds();
-        await this.pressure(signal);
-      } else this.shadowPalim();
+    if (ctxOn) {
+      this.commitReady();
+      if (!this.light) {
+        this.startPrecipJobs(false);
+        if (this.level > 0) {
+          this.climb();
+          this.startOrdinaryFolds();
+          await this.pressure(signal);
+        } else this.shadowPalim();
+      }
     }
     this.indexTurns();
     this.flushStats(false);
@@ -817,6 +845,7 @@ export class ContextEngine {
   async onBeforeSettle(signal?: AbortSignal): Promise<CommitBatch> {
     await this.refresh();
     const batch = emptyBatch();
+    if (!this.contextEnabled()) return batch;
     if (!this.light && this.cfg.context.settleConsolidation && this.state.stack.length) {
       const input = { ...this.janusInput("closure"), signal };
       const plan = await this.janusNow(input);
@@ -839,11 +868,14 @@ export class ContextEngine {
   async onIdle(signal?: AbortSignal): Promise<void> {
     if (this.light) return;
     await this.refresh();
-    this.startPrecipJobs(true, signal);
-    await Promise.allSettled(this.precipJobs.map((j) => j.promise).filter(Boolean));
+    const ctxOn = this.contextEnabled();
+    if (ctxOn) {
+      this.startPrecipJobs(true, signal);
+      await Promise.allSettled(this.precipJobs.map((j) => j.promise).filter(Boolean));
+    }
     if (signal?.aborted) return;
     await this.idleHarvest(signal);
-    if (signal?.aborted || this.level === 0) return;
+    if (signal?.aborted || this.level === 0 || !ctxOn) return;
     this.prepareColdFolds(signal);
   }
 
@@ -853,9 +885,9 @@ export class ContextEngine {
    * and a cost-deferred fold is ready. They are persisted at the next commit point.
    */
   async onContext(): Promise<ContextEdit[] | null> {
-    if (this.light || this.level === 0) return null;
+    if (this.light || this.level === 0 || !this.contextEnabled()) return null;
     const now = this.clock().getTime();
-    const cold = this.lastRequestAt > 0 && now - this.lastRequestAt >= this.cfg.context.cacheTtlSeconds * 1000;
+    const cold = this.lastRequestAt > 0 && now - this.lastRequestAt >= effectiveCacheTtlSeconds(this.cfg, this.adapter.modelName()) * 1000;
     this.lastRequestAt = now;
     const ready = [...this.foldJobs.values()].filter((j) => j.done && j.plan);
     if (!ready.length) return null;
@@ -881,8 +913,9 @@ export class ContextEngine {
    * (cancelling an overflow compaction would suppress the harness's retry, §5.4.5).
    */
   async onBeforeCompact(opts: { instructions?: string; tokensBefore?: number; signal?: AbortSignal }): Promise<{ summary: string; firstKeptEntryId: string; tokensBefore: number; record: ConsolidationRecord } | null> {
+    if (!this.contextEnabled()) return null;
     await this.refresh();
-    const tail = workingTail(this.entries, this.units, this.cfg, this.window(), this.state.stats.roundTokens);
+    const tail = workingTail(this.entries, this.units, this.cfg, this.window(), this.state.stats.roundTokens, { modelName: this.adapter.modelName() });
     const span = alignToUnits(this.units, 0, tail.start);
     if (!span) return null;
     const [from, to] = span;
@@ -921,11 +954,12 @@ export class ContextEngine {
 
   /** Append-only harnesses: the consolidated state to inject after the harness compacted (§4.6.3). */
   reinjection(): string {
+    if (!this.contextEnabled()) return "";
     return renderReinjection(this.state, this.cfg.context.reinjectTokens);
   }
 
   /** Session end: attribute what is still open with deterministic signals, and hand back the last records. */
-  async onShutdown(): Promise<CommitBatch> {
+  async onShutdown(opts: { reload?: boolean } = {}): Promise<CommitBatch> {
     try {
       await this.refresh();
     } catch {
@@ -933,7 +967,7 @@ export class ContextEngine {
     }
     // a session that ended before its last round completed is still searchable (§5.6)
     this.indexTurns();
-    if (!this.light) {
+    if (!this.light && !opts.reload) {
       const open = this.state.deliveries.filter((d) => !this.state.attributed.has(d.deliveryId) && !d.subagent);
       if (open.length) {
         const res = await this.attributor.attribute({ deliveries: open, entries: this.entries, from: 0, to: this.entries.length, intent: null, state: this.state, actions: [], deterministicOnly: true });
@@ -1087,7 +1121,7 @@ export class ContextEngine {
   // ───────────── committing plans
   private invariants(plan: ReplacePlan, allowTail: boolean, minimalTail = false): string | null {
     if (plan.record.shadow) return null;
-    const tail = workingTail(this.entries, this.units, this.cfg, this.window(), this.state.stats.roundTokens, { minimal: minimalTail });
+    const tail = workingTail(this.entries, this.units, this.cfg, this.window(), this.state.stats.roundTokens, { minimal: minimalTail, modelName: this.adapter.modelName() });
     return checkInvariants(plan, { entries: this.entries, units: this.units, tailStart: tail.start, latestRoundStart: latestRoundStart(this.units, this.entries.length), allowTail });
   }
 
@@ -1337,7 +1371,7 @@ export class ContextEngine {
     const c = this.cfg.context.climb;
     const regions = this.state.regions(this.entries);
     const depth = regions.length - 1;
-    const tail = workingTail(this.entries, this.units, this.cfg, this.window(), this.state.stats.roundTokens);
+    const tail = workingTail(this.entries, this.units, this.cfg, this.window(), this.state.stats.roundTokens, { modelName: this.adapter.modelName() });
     const f = c.enabled ? Math.min(this.state.stats.frontier ?? 0, depth) : 0;
     const out: Array<{ span: FoldSpan; passes: boolean; coldOnly: boolean }> = [];
     for (const region of regions) {
@@ -1436,7 +1470,7 @@ export class ContextEngine {
 
   // ───────────── Palim: pressure mode (§5.4.3)
   private sweepSpans(minimalTail: boolean): FoldSpan[] {
-    const tail = workingTail(this.entries, this.units, this.cfg, this.window(), this.state.stats.roundTokens, { minimal: minimalTail });
+    const tail = workingTail(this.entries, this.units, this.cfg, this.window(), this.state.stats.roundTokens, { minimal: minimalTail, modelName: this.adapter.modelName() });
     const out: FoldSpan[] = [];
     // root prefix, then open-intent regions from outermost to innermost
     for (const region of this.state.regions(this.entries)) {
@@ -1564,7 +1598,8 @@ export class ContextEngine {
     return this.memory?.graph.get(id) ?? null;
   }
 
-  status(): { round: number; requests: number; stack: Intent[]; records: number; deliveries: number; attributed: number; frontier: number; janusLate: number; foldsSkippedByCost: number; occupancy: number; window: number; jobs: { precip: number; folds: number }; problems: string[] } {
+  status(): { round: number; requests: number; stack: Intent[]; records: number; deliveries: number; attributed: number; frontier: number; janusLate: number; foldsSkippedByCost: number; occupancy: number; window: number; disabled: boolean; cacheTtlSeconds: number; jobs: { precip: number; folds: number }; problems: string[] } {
+    const window = this.window();
     return {
       round: this.round,
       requests: this.requests,
@@ -1576,7 +1611,9 @@ export class ContextEngine {
       janusLate: this.state.stats.janusLate,
       foldsSkippedByCost: this.state.stats.foldsSkippedByCost,
       occupancy: Math.round(this.lastOccupancy),
-      window: this.window(),
+      window,
+      disabled: !this.contextEnabled(),
+      cacheTtlSeconds: effectiveCacheTtlSeconds(this.cfg, this.adapter.modelName()),
       jobs: { precip: this.precipJobs.length, folds: this.foldJobs.size },
       problems: this.problems.slice(-10),
     };

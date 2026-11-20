@@ -5,7 +5,8 @@
  */
 import { readFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { Config } from "../../core/config.ts";
+import { catalogContextWindow } from "../../core/catalog.ts";
+import { type Config, effectiveMaxWindow } from "../../core/config.ts";
 import type { Telemetry } from "../../core/telemetry.ts";
 import type { AuxRole, AuxSessionRunner, CommandDef, CommitBatch, ContextEdit, EntryView, HarnessAdapter, ModelPricing, SessionRecord, ToolDef } from "../../core/types.ts";
 import type { MemoryRuntime, SessionEntry as RegisteredSession } from "../../memory/runtime.ts";
@@ -13,7 +14,6 @@ import { PiAuxRunner } from "./aux.ts";
 import { archiveEntries, branchRecords, projectedEntries, replacementFor } from "./entries.ts";
 
 export const STATUS_KEY = "realctx2";
-export const OUTPUT_ENTRY = "realctx2.output";
 
 /** Entry drafts a boundary handler returns (pi `SessionBoundaryDraft`). */
 export type Draft =
@@ -52,7 +52,11 @@ export class PiAdapter implements HarnessAdapter {
     this.runner = null;
     this.registered.clear();
     this.conflicts.clear();
-    this.ownSource = null;
+    this.deferred = { records: [], edits: [], messages: [] };
+  }
+
+  /** Drop records, edits and messages queued for a branch or session that is no longer active. */
+  clearDeferred(): void {
     this.deferred = { records: [], edits: [], messages: [] };
   }
 
@@ -67,7 +71,28 @@ export class PiAdapter implements HarnessAdapter {
 
   // ───────────── reading
   maxContextTokens(): number {
-    return this.ctx?.model?.contextWindow ?? 0;
+    const ctx = this.ctx;
+    if (!ctx) return 0;
+    // Context usage carries the resolved physical model's contextWindow (including routed virtual models).
+    try {
+      const usageWindow = ctx.getContextUsage()?.contextWindow;
+      if (typeof usageWindow === "number" && usageWindow > 0) return usageWindow;
+    } catch {
+      // ignore
+    }
+    const model = ctx.model;
+    if (model && typeof model.contextWindow === "number" && model.contextWindow > 0) return model.contextWindow;
+    if (model?.provider && model?.id) {
+      try {
+        const reg = ctx.modelRegistry.find(model.provider, model.id);
+        if (reg && typeof reg.contextWindow === "number" && reg.contextWindow > 0) return reg.contextWindow;
+      } catch {
+        // ignore
+      }
+      const fromCatalog = catalogContextWindow(model.id, model.provider);
+      if (fromCatalog > 0) return fromCatalog;
+    }
+    return 0;
   }
 
   async listEntries(): Promise<EntryView[]> {
@@ -115,11 +140,16 @@ export class PiAdapter implements HarnessAdapter {
       const { type, ...data } = r;
       out.push({ type: "custom", customType: type, data });
     }
-    // the latest edit per target wins; a target that is not on the session is skipped, so one
-    // bad edit cannot make pi reject the whole proposal
+    // the latest edit per target wins; a target that is not on the active branch is skipped, so
+    // one bad or stale-branch edit cannot make pi reject the whole proposal or mutate another branch
+    const branchIds = new Set(sm.getBranch().map((x) => x.id));
     const edits = new Map<string, ContextEdit>();
     for (const e of all.edits) edits.set(e.targetId, e);
     for (const e of edits.values()) {
+      if (!branchIds.has(e.targetId)) {
+        this.telemetry?.event("pi.edit_skipped", { reason: "target not on active branch" });
+        continue;
+      }
       const target = sm.getEntry(e.targetId) as SessionEntry | undefined;
       const role = target?.type === "message" ? (target.message as { role: string }).role : null;
       const editable = target?.type === "custom_message" || role === "user" || role === "assistant" || role === "toolResult";
@@ -172,8 +202,11 @@ export class PiAdapter implements HarnessAdapter {
     const tool = this.allTools()?.find((t) => t.name === name);
     if (!tool) return null;
     const path = tool.sourceInfo?.path ?? "";
+    // If we already know our own extension source path, a tool registered under that same path is ours
+    // (e.g. if `session_start` runs again on the same extension instance).
+    if (this.ownSource !== null && path === this.ownSource) return null;
     // before we register a name, whoever holds it is someone else; afterwards, a different source replaced ours
-    if (registeredByUs && (this.ownSource === null || path === this.ownSource)) return null;
+    if (registeredByUs && this.ownSource === null) return null;
     return tool.sourceInfo?.source === "builtin" ? `pi's built-in tool (${path})` : `another extension (${path || tool.sourceInfo?.source || "unknown"})`;
   }
 
@@ -270,7 +303,8 @@ export class PiAdapter implements HarnessAdapter {
     }
     if (settings.compaction?.enabled === false) return null;
     const threshold = window - (settings.compaction?.reserveTokens ?? 16384);
-    const W = Math.min(window, cfg.context.maxWindow);
+    const W = effectiveMaxWindow(cfg, window, this.modelName());
+    if (W <= 0) return null;
     const pressure = cfg.context.rho * W;
     return threshold < pressure ? `pi's auto-compaction starts at ${threshold} tokens, below realctx2's pressure threshold of ${Math.round(pressure)} (ρW): pi would compact before realctx2 folds. Lower context.maxWindow or context.rho, or raise pi's compaction.reserveTokens headroom.` : null;
   }

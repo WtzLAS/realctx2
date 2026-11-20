@@ -161,9 +161,11 @@ export class Git {
     return r.code === 0 && r.stdout.trim().length > 0;
   }
 
-  /** Whether the working-tree copy of a file differs from HEAD. */
+  /** Whether the working-tree copy of a file differs from HEAD (exit code 1 with no stderr; errors return false). */
   differsFromHead(path: string): boolean {
-    return this.git(["diff", "--quiet", "HEAD", "--", path]).code !== 0;
+    if (!this.isRepo()) return false;
+    const r = this.git(["diff", "--quiet", "HEAD", "--", path]);
+    return r.code === 1 && r.stderr.trim() === "";
   }
 
   diffSince(blobOrRev: string, path: string): string | null {

@@ -73,7 +73,10 @@ export interface Config {
     };
   };
   context: {
-    maxWindow: number;
+    /** Upper cap on the effective window W, "auto" to use the active model's catalog contextWindow, or 0 to disable the context engine. */
+    maxWindow: "auto" | number;
+    /** Per-model overrides for maxWindow (`"provider/model-id"` or `"model-id"` -> `"auto"` | `0` (disable) | tokens). */
+    modelMaxWindows: Record<string, "auto" | number>;
     rho: number;
     K: number;
     Bmin: number;
@@ -100,6 +103,8 @@ export interface Config {
       expectedRequests: "auto" | number;
     };
     cacheTtlSeconds: number;
+    /** Per-model overrides for cacheTtlSeconds (`"provider/model-id"` or `"model-id"` -> `"auto"` | seconds). */
+    modelCacheTtlSeconds: Record<string, "auto" | number>;
     prepareFraction: number;
     /** Claude Code post-compaction injection budget (§4.6.3). */
     reinjectTokens: number;
@@ -220,7 +225,8 @@ export const DEFAULT_CONFIG: Config = {
     },
   },
   context: {
-    maxWindow: 128000,
+    maxWindow: "auto",
+    modelMaxWindows: {},
     rho: 0.8,
     K: 2,
     Bmin: 4096,
@@ -247,10 +253,11 @@ export const DEFAULT_CONFIG: Config = {
       expectedRequests: "auto",
     },
     cacheTtlSeconds: 300,
+    modelCacheTtlSeconds: {},
     prepareFraction: 0.7,
     reinjectTokens: 8000,
   },
-  janus: { timeoutMs: 1500, lateWaitMs: 200, maxInputTokens: 8000, remindEvery: 8, maxDepth: 6 },
+  janus: { timeoutMs: 30_000, lateWaitMs: 10_000, maxInputTokens: 8000, remindEvery: 8, maxDepth: 6 },
   attribution: { rootWindowRounds: 6 },
   memory: {
     kappaShortToLong: 0.25,
@@ -357,7 +364,7 @@ export function applyProjectOverrides(base: Config, project: unknown): { config:
     for (const [k, v] of Object.entries(obj)) {
       const p = [...path, k];
       const key = p.join(".");
-      if (isObject(v) && !["tools.names"].includes(key)) {
+      if (isObject(v) && !["tools.names", "context.modelMaxWindows", "context.modelCacheTtlSeconds"].includes(key)) {
         walk(v, p);
         continue;
       }
@@ -396,6 +403,54 @@ function applyOne(cfg: Config, key: string, v: unknown): boolean {
     if (!stricter) return false;
     cfg.memory.routing[name] = v;
     return true;
+  }
+  if (key === "context.maxWindow") {
+    if (v === "auto") {
+      cfg.context.maxWindow = "auto";
+      return true;
+    }
+    if (num(v) && (v === 0 || v >= 8192)) {
+      cfg.context.maxWindow = Math.round(v);
+      return true;
+    }
+    return false;
+  }
+  if (key === "context.modelMaxWindows") {
+    if (!isObject(v)) return false;
+    const next: Record<string, "auto" | number> = { ...cfg.context.modelMaxWindows };
+    for (const [modelKey, val] of Object.entries(v)) {
+      const k = modelKey.trim();
+      if (!k) return false;
+      if (val === "auto") delete next[k];
+      else if (num(val) && (val === 0 || val >= 8192)) next[k] = Math.round(val);
+      else return false;
+    }
+    cfg.context.modelMaxWindows = next;
+    return true;
+  }
+  if (key === "context.modelCacheTtlSeconds") {
+    if (!isObject(v)) return false;
+    const next: Record<string, "auto" | number> = { ...cfg.context.modelCacheTtlSeconds };
+    for (const [modelKey, val] of Object.entries(v)) {
+      const k = modelKey.trim();
+      if (!k) return false;
+      if (val === "auto") delete next[k];
+      else if (num(val) && val >= 0) next[k] = Math.round(val);
+      else return false;
+    }
+    cfg.context.modelCacheTtlSeconds = next;
+    return true;
+  }
+  if (key === "context.climb.expectedRequests") {
+    if (v === "auto") {
+      cfg.context.climb.expectedRequests = "auto";
+      return true;
+    }
+    if (num(v) && v >= 1) {
+      cfg.context.climb.expectedRequests = Math.round(v);
+      return true;
+    }
+    return false;
   }
   if (key.startsWith("context.") || key.startsWith("memory.")) return (num(v) || typeof v === "boolean" || typeof v === "string") && setPath(cfg, path, v);
   if (key === "shared.review") {
@@ -544,6 +599,8 @@ function cleanValue(v: unknown): unknown {
 }
 
 const DYNAMIC_PATHS = new Set([
+  "context.modelMaxWindows",
+  "context.modelCacheTtlSeconds",
   "providers.decision",
   "providers.embedding.late",
   "providers.embedding.dense",
@@ -794,9 +851,58 @@ export function configHasInlineSecrets(cfg: Config): boolean {
   return false;
 }
 
-/** Scale B_min, T_min and Δ_min when W ≠ 128,000 (§5.7). */
-export function scaledContext(cfg: Config, modelWindow: number): { W: number; Bmin: number; Tmin: number; deltaMin: number; innermostMin: number; maxToolResult: number } {
-  const W = Math.min(modelWindow > 0 ? modelWindow : cfg.context.maxWindow, cfg.context.maxWindow);
+export const FALLBACK_CONTEXT_WINDOW = 128000;
+
+/** Look up a per-model override by exact `"provider/id"` first, then bare `"id"`. */
+function lookupModelOverride<T>(map: Record<string, T> | undefined, modelName?: string): T | undefined {
+  if (!map || !modelName) return undefined;
+  const trimmed = modelName.trim();
+  if (!trimmed || trimmed === "unknown") return undefined;
+  if (Object.prototype.hasOwnProperty.call(map, trimmed)) return map[trimmed];
+  const slash = trimmed.indexOf("/");
+  if (slash > 0) {
+    const bare = trimmed.slice(slash + 1);
+    if (Object.prototype.hasOwnProperty.call(map, bare)) return map[bare];
+  }
+  return undefined;
+}
+
+/** Resolve the active maxWindow setting (`"auto"`, `0` = disabled, or token cap) for `modelName`. */
+export function resolveMaxWindowSetting(cfg: Config, modelName?: string): "auto" | number {
+  const over = lookupModelOverride(cfg.context.modelMaxWindows, modelName);
+  if (typeof over === "number" && Number.isFinite(over) && over >= 0) return over;
+  return cfg.context.maxWindow;
+}
+
+/** Whether the context engine is enabled for `modelName` (`maxWindow === 0` disables it). */
+export function isContextEngineEnabled(cfg: Config, modelName?: string): boolean {
+  return resolveMaxWindowSetting(cfg, modelName) !== 0;
+}
+
+/**
+ * Resolve the effective working window W from the active model's catalog metadata (`modelWindow`)
+ * and optional user cap (`cfg.context.maxWindow` / `cfg.context.modelMaxWindows`).
+ * Returns `0` when the resolved maxWindow setting is `0` (context engine disabled).
+ * When `"auto"`, W follows the model's contextWindow directly (falling back to 128,000 only if unknown).
+ */
+export function effectiveMaxWindow(cfg: Config, modelWindow: number, modelName?: string): number {
+  const cap = resolveMaxWindowSetting(cfg, modelName);
+  if (cap === 0) return 0;
+  if (typeof cap === "number" && cap > 0) return modelWindow > 0 ? Math.min(modelWindow, cap) : cap;
+  return modelWindow > 0 ? modelWindow : FALLBACK_CONTEXT_WINDOW;
+}
+
+/** Resolve the effective provider prompt-cache TTL in seconds for `modelName`. */
+export function effectiveCacheTtlSeconds(cfg: Config, modelName?: string): number {
+  const over = lookupModelOverride(cfg.context.modelCacheTtlSeconds, modelName);
+  if (typeof over === "number" && Number.isFinite(over) && over >= 0) return over;
+  return cfg.context.cacheTtlSeconds;
+}
+
+/** Scale B_min, T_min and Δ_min when W ≠ 128,000 (§5.7). Returns all zeros when W === 0 (disabled). */
+export function scaledContext(cfg: Config, modelWindow: number, modelName?: string): { W: number; Bmin: number; Tmin: number; deltaMin: number; innermostMin: number; maxToolResult: number } {
+  const W = effectiveMaxWindow(cfg, modelWindow, modelName);
+  if (W <= 0) return { W: 0, Bmin: 0, Tmin: 0, deltaMin: 0, innermostMin: 0, maxToolResult: 0 };
   const f = W / 128000;
   const Bmin = Math.max(2048, Math.round(cfg.context.Bmin * f));
   const Tmin = Math.max(8192, Math.round(cfg.context.Tmin * f));

@@ -67,8 +67,8 @@ export function roundsBefore(units: Unit[], idx: number): number {
 }
 
 /** B = min{ αW, max{ B_min, K · Quantile_q(𝓡) } }. */
-export function tailBudget(cfg: Config, window: number, roundTokens: number[]): number {
-  const s = scaledContext(cfg, window);
+export function tailBudget(cfg: Config, window: number, roundTokens: number[], modelName?: string): number {
+  const s = scaledContext(cfg, window, modelName);
   const q = roundTokens.length ? quantile(roundTokens, cfg.context.q) : 0;
   return Math.min(cfg.context.alpha * s.W, Math.max(s.Bmin, cfg.context.K * q));
 }
@@ -85,9 +85,9 @@ export interface Tail {
  * Unfinished rounds and the latest round are always protected.
  * `minimal` shrinks it to unfinished rounds and the latest round only (pressure step 3).
  */
-export function workingTail(entries: EntryView[], units: Unit[], cfg: Config, window: number, roundTokens: number[], opts: { minimal?: boolean } = {}): Tail {
+export function workingTail(entries: EntryView[], units: Unit[], cfg: Config, window: number, roundTokens: number[], opts: { minimal?: boolean; modelName?: string } = {}): Tail {
   if (!units.length) return { start: entries.length, tokens: 0, rounds: 0 };
-  const B = opts.minimal ? 0 : tailBudget(cfg, window, roundTokens);
+  const B = opts.minimal ? 0 : tailBudget(cfg, window, roundTokens, opts.modelName);
   const K = opts.minimal ? 1 : cfg.context.K;
   let start = entries.length;
   let tokens = 0;

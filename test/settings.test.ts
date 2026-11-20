@@ -1,6 +1,7 @@
 import { statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { Realctx2ReportComponent } from "../src/adapters/pi/report-ui.ts";
 import { Realctx2SettingsComponent, type SettingsTheme } from "../src/adapters/pi/settings-ui.ts";
 import { buildCommand, runCommand } from "../src/commands/index.ts";
 import {
@@ -28,8 +29,11 @@ import {
   AUX_ROLES,
   findCategory,
   flattenAllSettings,
+  formatModelOverrideValue,
   formatSettingValue,
   getConfigPath,
+  type ModelOverridesSetting,
+  parseModelOverrideInput,
   parseSettingInput,
   SETTINGS_CATEGORIES,
   setConfigPath,
@@ -139,7 +143,7 @@ describe("settings schema completeness & descriptions", () => {
     // Collect every leaf path of `populated`
     const expectedPaths: string[] = [];
     const walk = (obj: unknown, prefix: string) => {
-      if (prefix.endsWith(".headers")) {
+      if (prefix.endsWith(".headers") || prefix === "context.modelMaxWindows" || prefix === "context.modelCacheTtlSeconds") {
         expectedPaths.push(prefix);
         return;
       }
@@ -212,6 +216,18 @@ describe("settings schema completeness & descriptions", () => {
     expect(parseSettingInput({ kind: "nullable-number", path: "reverify.maxPerDay", label: "m", description: "d", min: 0 }, "25")).toEqual({ ok: true, value: 25 });
     expect(parseSettingInput({ kind: "number-or-auto", path: "context.climb.expectedRequests", label: "e", description: "d", min: 1 }, "auto")).toEqual({ ok: true, value: "auto" });
     expect(parseSettingInput({ kind: "number-or-auto", path: "context.climb.expectedRequests", label: "e", description: "d", min: 1 }, "42")).toEqual({ ok: true, value: 42 });
+    // Janus defaults (30s timeout, 10s commit-boundary wait) and expanded settings ranges
+    expect(DEFAULT_CONFIG.janus.timeoutMs).toBe(30_000);
+    expect(DEFAULT_CONFIG.janus.lateWaitMs).toBe(10_000);
+    const allItems = flattenAllSettings(DEFAULT_CONFIG);
+    const janusTimeout = allItems.find((i) => i.entry.path === "janus.timeoutMs")!.entry;
+    const janusWait = allItems.find((i) => i.entry.path === "janus.lateWaitMs")!.entry;
+    expect(janusTimeout.kind === "integer" && janusTimeout.max).toBe(300_000);
+    expect(janusWait.kind === "integer" && janusWait.max).toBe(120_000);
+    expect(janusTimeout.kind === "integer" && parseSettingInput(janusTimeout, "120000")).toEqual({ ok: true, value: 120_000 });
+    expect(janusWait.kind === "integer" && parseSettingInput(janusWait, "30000")).toEqual({ ok: true, value: 30_000 });
+    expect(janusTimeout.kind === "integer" && parseSettingInput(janusTimeout, "300001").ok).toBe(false);
+    expect(janusWait.kind === "integer" && parseSettingInput(janusWait, "120001").ok).toBe(false);
     expect(formatSettingValue({ kind: "secret", path: "providers.decision.apiKey", label: "k", description: "d" }, "sk-12345678")).toBe("••••5678");
   });
 });
@@ -307,12 +323,12 @@ describe("Realctx2SettingsComponent TUI interactions", () => {
     sendKeys(comp, [RIGHT]);
     expect(saved.context.maxWindow).toBe(128000 + 8192);
 
-    // Press 'r' to reset maxWindow back to default
+    // Press 'r' to reset maxWindow back to default ("auto")
     sendKeys(comp, ["r"]);
-    expect(saved.context.maxWindow).toBe(128000);
+    expect(saved.context.maxWindow).toBe("auto");
 
-    // Move to rho and verify project override indicator is displayed
-    sendKeys(comp, [DOWN]);
+    // Move past Per-model maxWindow overrides to rho and verify project override indicator is displayed
+    sendKeys(comp, [DOWN, DOWN]);
     const onRho = renderText(comp);
     expect(onRho).toContain("context.rho");
     expect(onRho).toContain("[project override: 0.7]");
@@ -374,6 +390,12 @@ describe("Realctx2SettingsComponent TUI interactions", () => {
     expect(filteredCat).toContain("── Categories");
     expect(filteredCat).toContain("Memory");
     expect(filteredCat).toContain("── Settings (");
+    // Moving down then moving the cursor inside the search input preserves the highlighted row
+    sendKeys(comp, [DOWN]);
+    const beforeCursorMove = renderText(comp);
+    sendKeys(comp, [LEFT, RIGHT]);
+    expect(renderText(comp)).toBe(beforeCursorMove);
+    sendKeys(comp, [UP]);
     // Enter on top matching category opens Memory screen
     sendKeys(comp, [ENTER]);
     expect(renderText(comp)).toContain("realctx2 settings › Memory");
@@ -716,6 +738,254 @@ describe("/realctx2 settings command & Host.reloadConfig", () => {
       else process.env.REALCTX2_NO_WORKER = prevNoWorker;
       cleanupTmp();
     }
+  });
+
+  it("reports all /realctx2 commands in scrollable ESC-dismissible screens in TUI mode without appending chat entries", async () => {
+    // 1. Unit tests for Realctx2ReportComponent scrolling, caching, mouse wheel, and exit keys
+    const longBody = Array.from({ length: 40 }, (_, i) => (i === 0 ? "✓ ok line 0" : i === 1 ? "! warn line 1" : i === 2 ? "✗ err line 2" : `line ${i}`)).join("\n");
+    let closedCount = 0;
+    let renderRequests = 0;
+    const report = new Realctx2ReportComponent({
+      title: "realctx2 doctor",
+      content: longBody,
+      onClose: () => {
+        closedCount++;
+      },
+      theme: plainTheme,
+      tui: { requestRender: () => void renderRequests++, terminal: { rows: 20 } },
+    });
+    const firstRender = report.render(80);
+    expect(report.render(80)).toBe(firstRender); // cached when unchanged (pi 1.6.0 Component contract)
+    const firstText = firstRender.map(stripAnsi).join("\n");
+    expect(firstText).toContain("realctx2 doctor");
+    expect(firstText).toContain("lines 1–10 of 40");
+    expect(firstText).toContain("✓ ok line 0");
+    expect(firstText).toContain("Esc / q / Enter close");
+    // Scroll down, page down, bottom, top, mouse wheel
+    report.handleInput(DOWN);
+    const afterDown = report.render(80);
+    expect(afterDown).not.toBe(firstRender);
+    expect(afterDown.map(stripAnsi).join("\n")).toContain("lines 2–11 of 40");
+    report.handleInput("G");
+    expect(report.render(80).map(stripAnsi).join("\n")).toContain("lines 31–40 of 40");
+    expect(report.render(80).map(stripAnsi).join("\n")).toContain("line 39");
+    report.handleInput("g");
+    expect(report.render(80).map(stripAnsi).join("\n")).toContain("lines 1–10 of 40");
+    report.handleMouse({ type: "wheel", button: "none", x: 0, y: 0, screenX: 0, screenY: 0, width: 80, height: 16, shift: false, alt: false, ctrl: false, wheelDelta: 3 });
+    expect(report.render(80).map(stripAnsi).join("\n")).toContain("lines 4–13 of 40");
+    expect(renderRequests).toBeGreaterThanOrEqual(4);
+    // Exit keys: Esc, q, Enter, Ctrl+C
+    report.handleInput(ESC);
+    report.handleInput("q");
+    report.handleInput(ENTER);
+    report.handleInput("\x03");
+    expect(closedCount).toBe(4);
+
+    // 2. Integration with PiExtension in TUI mode: no registerEntryRenderer, no appendEntry, no chat notify
+    const cwd = tmp("pi-ext-report-cwd-");
+    const home = tmp("pi-ext-report-home-");
+    const prevHome = process.env.REALCTX2_HOME;
+    const prevNoWorker = process.env.REALCTX2_NO_WORKER;
+    process.env.REALCTX2_HOME = home;
+    process.env.REALCTX2_NO_WORKER = "1";
+    try {
+      const { default: realctx2 } = await import("../src/adapters/pi/index.ts");
+      const handlers = new Map<string, (...args: any[]) => any>();
+      const commands = new Map<string, any>();
+      let entryRendererCalls = 0;
+      const appended: Array<{ type: string; data: unknown }> = [];
+      const notifications: Array<{ text: string; level?: string }> = [];
+      const statuses: Array<string | undefined> = [];
+      const screens: string[] = [];
+
+      const piMock = {
+        on: (ev: string, fn: any) => {
+          handlers.set(ev, fn);
+          return () => undefined;
+        },
+        registerTool: () => undefined,
+        registerCommand: (name: string, def: any) => commands.set(name, def),
+        registerEntryRenderer: () => {
+          entryRendererCalls++;
+        },
+        registerProvider: () => undefined,
+        unregisterProvider: () => undefined,
+        getAllTools: () => [],
+        getSettings: () => ({}),
+        appendEntry: (type: string, data: unknown) => appended.push({ type, data }),
+        sendMessage: () => undefined,
+      };
+
+      await realctx2(piMock as any);
+      expect(entryRendererCalls).toBe(0);
+
+      const sessionCtx = {
+        cwd,
+        hasUI: true,
+        mode: "tui",
+        isProjectTrusted: () => false,
+        sessionManager: {
+          getSessionId: () => "pi-report-sess",
+          getSessionFile: () => undefined,
+          getBranch: () => [],
+          getEntry: () => undefined,
+          buildSessionProjection: () => ({ entries: [] }),
+        },
+        modelRegistry: { getAvailable: () => [], getAll: () => [] },
+        model: { provider: "anthropic", id: "claude-sonnet-4-5", contextWindow: 200000 },
+        getContextUsage: () => ({ tokens: 1000 }),
+        ui: {
+          notify: (text: string, level?: string) => void notifications.push({ text, level }),
+          setStatus: (_key: string, text: string | undefined) => void statuses.push(text),
+          confirm: async () => false,
+          editor: async () => undefined,
+          custom: async (factory: any) => {
+            let resolveDone!: () => void;
+            const donePromise = new Promise<void>((r) => {
+              resolveDone = r;
+            });
+            const comp = await factory(
+              { requestRender: () => undefined, terminal: { rows: 36 } },
+              plainTheme,
+              {},
+              () => resolveDone(),
+            );
+            screens.push(comp.render(100).map(stripAnsi).join("\n"));
+            comp.handleInput(ESC);
+            await donePromise;
+          },
+        },
+      };
+
+      await handlers.get("session_start")!({ reason: "new" }, sessionCtx);
+      const cmdDef = commands.get("realctx2");
+
+      // Run multiple commands: status, doctor, help, maintain, remember, search
+      await cmdDef.handler("status", sessionCtx);
+      await cmdDef.handler("doctor", sessionCtx);
+      await cmdDef.handler("", sessionCtx);
+      await cmdDef.handler("maintain", sessionCtx);
+      await cmdDef.handler('remember "Always run tests before merging." --scope global', sessionCtx);
+
+      expect(appended).toEqual([]);
+      expect(notifications).toEqual([]);
+      expect(screens.length).toBe(5);
+      expect(screens[0]).toContain("realctx2 status");
+      expect(screens[0]).toContain("Context: W = 200,000 tokens");
+      expect(screens[1]).toContain("realctx2 doctor");
+      expect(screens[2]).toContain("realctx2 help");
+      expect(screens[3]).toContain("realctx2 maintain");
+      expect(screens[4]).toContain("realctx2 remember");
+      expect(screens[4]).toContain("[m:");
+      // Transient progress notice from `maintain` went to status bar, not chat notifications
+      expect(statuses).toContain("Running maintenance…");
+
+      await handlers.get("session_shutdown")!({}, sessionCtx);
+    } finally {
+      if (prevHome === undefined) delete process.env.REALCTX2_HOME;
+      else process.env.REALCTX2_HOME = prevHome;
+      if (prevNoWorker === undefined) delete process.env.REALCTX2_NO_WORKER;
+      else process.env.REALCTX2_NO_WORKER = prevNoWorker;
+      cleanupTmp();
+    }
+  });
+
+  it("opens dedicated per-model override screens for maxWindow and cacheTTL, lists known models with auto defaults, adds new entries, and supports 0 to disable", () => {
+    let saved: Config = structuredClone(DEFAULT_CONFIG);
+    const knownModels = [
+      { provider: "anthropic", id: "claude-opus-5-5", name: "Claude Opus 5.5", contextWindow: 1_000_000 },
+      { provider: "openai", id: "gpt-6.2-sol", name: "GPT-6.2 Sol", contextWindow: 272_000 },
+      { provider: "openai-codex", id: "gpt-6.2-astra", name: "GPT-6.2 Astra", contextWindow: 272_000 },
+    ];
+    const comp = new Realctx2SettingsComponent({
+      config: saved,
+      configPath: "/tmp/config.json",
+      availableModels: knownModels.slice(0, 2),
+      knownModels,
+      initialCategory: "context",
+      onSave: (next) => {
+        saved = structuredClone(next);
+      },
+      onClose: () => undefined,
+      theme: plainTheme,
+    });
+
+    // Global maxWindow accepts 0 (disabled) and rejects 1..8191
+    const all = flattenAllSettings(saved);
+    const maxWinEntry = all.find((x) => x.entry.path === "context.maxWindow")!.entry;
+    const modelMaxWinEntry = all.find((x) => x.entry.path === "context.modelMaxWindows")!.entry as ModelOverridesSetting;
+    const modelTtlEntry = all.find((x) => x.entry.path === "context.modelCacheTtlSeconds")!.entry as ModelOverridesSetting;
+    expect(parseSettingInput(maxWinEntry as any, "0")).toEqual({ ok: true, value: 0 });
+    expect(formatSettingValue(maxWinEntry, 0)).toBe("0 (disabled)");
+    expect(parseSettingInput(maxWinEntry as any, "500").ok).toBe(false);
+    expect(parseModelOverrideInput(modelMaxWinEntry, "0")).toEqual({ ok: true, value: 0 });
+    expect(parseModelOverrideInput(modelMaxWinEntry, "auto")).toEqual({ ok: true, value: "auto" });
+    expect(formatModelOverrideValue(modelMaxWinEntry, 0)).toBe("0 (disabled)");
+    expect(formatModelOverrideValue(modelMaxWinEntry, undefined)).toBe("auto");
+    expect(parseModelOverrideInput(modelTtlEntry, "3600")).toEqual({ ok: true, value: 3600 });
+    expect(formatModelOverrideValue(modelTtlEntry, 3600)).toBe("3600 sec");
+
+    // Enter "Per-model maxWindow overrides" (2nd item in Context -> Window & Working Tail)
+    sendKeys(comp, [DOWN, ENTER]);
+    const screen1 = renderText(comp);
+    expect(screen1).toContain("Per-model maxWindow overrides");
+    expect(screen1).toContain("Default: auto (model catalog)");
+    expect(screen1).toContain("anthropic/claude-opus-5-5");
+    expect(screen1).toContain("(1M)");
+    expect(screen1).toContain("openai/gpt-6.2-sol");
+    expect(screen1).toContain("(272k)");
+    expect(screen1).toContain("openai-codex/gpt-6.2-astra");
+    expect(screen1).toContain("auto");
+    expect(screen1).toContain("+ Add custom model…");
+
+    // Override first model (anthropic/claude-opus-5-5) to 200000
+    sendKeys(comp, [ENTER]);
+    sendKeys(comp, ["\x15", "2", "0", "0", "0", "0", "0", ENTER]);
+    expect(saved.context.modelMaxWindows["anthropic/claude-opus-5-5"]).toBe(200000);
+    expect(renderText(comp)).toContain("200,000 tokens");
+
+    // Move to openai/gpt-6.2-sol and set to 0 (disable context engine for that model)
+    sendKeys(comp, [DOWN, ENTER]);
+    sendKeys(comp, ["\x15", "0", ENTER]);
+    expect(saved.context.modelMaxWindows["openai/gpt-6.2-sol"]).toBe(0);
+    expect(renderText(comp)).toContain("0 (disabled)");
+
+    // Type a custom model ID into the input box -> "+ Add ..." row appears -> Enter opens value editor
+    for (const ch of "local/my-llama") comp.handleInput(ch);
+    const filtered = renderText(comp);
+    expect(filtered).toContain('+ Add "local/my-llama"…');
+    sendKeys(comp, [ENTER]);
+    sendKeys(comp, ["\x15", "6", "4", "0", "0", "0", ENTER]);
+    expect(saved.context.modelMaxWindows["local/my-llama"]).toBe(64000);
+    const afterAdd = renderText(comp);
+    expect(afterAdd).toContain("local/my-llama");
+    expect(afterAdd).toContain("64,000 tokens");
+
+    // Ctrl+R resets the selected overridden model back to auto and removes it from config
+    sendKeys(comp, ["\x12"]); // first sorted override is anthropic/claude-opus-5-5
+    expect(saved.context.modelMaxWindows["anthropic/claude-opus-5-5"]).toBeUndefined();
+
+    // Esc back to Context screen, open global / search for cacheTTL overrides and configure a model
+    sendKeys(comp, [ESC, "/"]);
+    for (const ch of "modelCacheTtlSeconds") comp.handleInput(ch);
+    sendKeys(comp, [ENTER]);
+    const ttlScreen = renderText(comp);
+    expect(ttlScreen).toContain("Per-model cacheTTL overrides");
+    expect(ttlScreen).toContain("Default: 300 sec");
+    expect(ttlScreen).toContain("anthropic/claude-opus-5-5");
+
+    // Override anthropic/claude-opus-5-5 to 3600 sec
+    sendKeys(comp, [ENTER]);
+    sendKeys(comp, ["\x15", "3", "6", "0", "0", ENTER]);
+    expect(saved.context.modelCacheTtlSeconds["anthropic/claude-opus-5-5"]).toBe(3600);
+    expect(renderText(comp)).toContain("3600 sec");
+
+    // Add a custom model via "+ Add custom model…" (last row: 3 known models -> 3 DOWNs)
+    sendKeys(comp, [DOWN, DOWN, DOWN, ENTER]);
+    for (const ch of "custom/fast-model") comp.handleInput(ch);
+    sendKeys(comp, [ENTER]); // step 2: value modal
+    sendKeys(comp, ["\x15", "6", "0", ENTER]);
+    expect(saved.context.modelCacheTtlSeconds["custom/fast-model"]).toBe(60);
   });
 });
 

@@ -872,6 +872,10 @@ export class ScopeStore {
       }
     }
     if (!bytes) {
+      if (opts.nonLagged && head.length > 0) {
+        this.problems.push({ problem: "non-lagged shallow snapshot failed; purge compaction aborted" });
+        return null;
+      }
       // no usable root: keep all the history the document has
       bytes = doc.export({ mode: "snapshot" });
       root = doc.isShallow() ? (doc.shallowSinceFrontiers() as Frontiers) : [];
@@ -916,8 +920,8 @@ export class ScopeStore {
       for (const id of this.pendingPurge) this.sd.deleteNode(id);
       this.sd.commit("purge");
       const result = this.compactLocked({ nonLagged: true, reason: "purge" });
-      this.pendingPurge.clear();
       if (result?.file) {
+        this.pendingPurge.clear();
         // the old document still holds the purged operations in its history
         const doc = freshDoc();
         doc.importBatch([new Uint8Array(readFileSync(result.file))]);
@@ -927,6 +931,10 @@ export class ScopeStore {
         this.flushedFrontiers = doc.frontiers() as Frontiers;
         this.ensureMeta();
         this.changed();
+      } else if (!this.liveSnapshots().length && !this.updateFiles().length && !this.hasUnflushed()) {
+        this.pendingPurge.clear();
+      } else {
+        this.problems.push({ problem: "purge could not rewrite store files; pending purge retained" });
       }
       return result ?? { file: null, bytes: 0, kind: "none" as const };
     });

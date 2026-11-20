@@ -685,6 +685,24 @@ describe("purge (§7.10)", () => {
     next.flush();
     expect(treeContains(dir, "forget me entirely please")).toEqual([]);
   });
+
+  it("retains pendingPurge and reports a problem if the purge snapshot exceeds maxSnapshotBytes", () => {
+    const dir = join(tmp(), "store");
+    const s = openStore(dir);
+    s.sd.insertNode(node({ id: "secret01", text: "sensitive value to purge" }));
+    s.sd.insertNode(node({ id: "keeper01", text: "x".repeat(400) }));
+    s.commit();
+    s.flush();
+    // Force snapshot cap below the snapshot size so compactLocked skips writing.
+    const capped = openStore(dir, { cfg: testConfig({ storage: { maxSnapshotBytes: 10 } }) });
+    capped.sd.patchNode("secret01", { status: "purged" });
+    capped.pendingPurge.add("secret01");
+    capped.commit();
+    const res = capped.flush();
+    expect(res.kind).toBe("none");
+    expect(capped.pendingPurge.has("secret01")).toBe(true);
+    expect(capped.problems.some((p) => p.problem.includes("pending purge retained"))).toBe(true);
+  });
 });
 
 describe("ID collisions (§8.1.2)", () => {

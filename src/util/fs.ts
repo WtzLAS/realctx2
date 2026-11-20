@@ -1,4 +1,4 @@
-import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -102,28 +102,63 @@ export interface LockHandle {
 }
 
 /**
- * OS-level lock file created with O_EXCL. A lock whose owner process is gone, or which is
- * older than `staleMs`, is taken over.
+ * OS-level lock file published atomically via hard-link (falling back to O_EXCL).
+ * A lock whose owner process is gone, or which is older than `staleMs`, is taken over.
+ * Only the holder whose unique token still matches the file may release it.
  */
 export function tryLock(path: string, staleMs = 10 * 60_000): LockHandle | null {
   ensureDir(dirname(path));
+  const token = randomBytes(12).toString("hex");
+  const payload = JSON.stringify({ pid: process.pid, at: Date.now(), token });
+  const initGraceMs = Math.min(staleMs, 1000);
+  const makeHandle = (): LockHandle => {
+    let released = false;
+    return {
+      release() {
+        if (released) return;
+        released = true;
+        const cur = readJson<{ token?: string }>(path, {});
+        if (cur.token === token) removeFile(path);
+      },
+    };
+  };
   for (let attempt = 0; attempt < 2; attempt++) {
+    const tmp = `${path}.${process.pid}.${token}.tmp`;
+    let created = false;
     try {
-      const fd = openSync(path, "wx");
-      writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
-      closeSync(fd);
-      let released = false;
-      return {
-        release() {
-          if (released) return;
-          released = true;
-          removeFile(path);
-        },
-      };
+      writeFileSync(tmp, payload, { mode: 0o600 });
+      try {
+        linkSync(tmp, path);
+        created = true;
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code === "EEXIST") throw e;
+        // Filesystems without hard-link support fall back to O_EXCL.
+        const fd = openSync(path, "wx", 0o600);
+        try {
+          writeSync(fd, payload);
+        } finally {
+          closeSync(fd);
+        }
+        created = true;
+      } finally {
+        removeFile(tmp);
+      }
+      if (created) return makeHandle();
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
       const owner = readJson<{ pid?: number; at?: number }>(path, {});
-      const stale = !owner.pid || !pidAlive(owner.pid) || Date.now() - (owner.at ?? 0) > staleMs;
+      let stale: boolean;
+      if (owner.pid) {
+        stale = !pidAlive(owner.pid) || Date.now() - (owner.at ?? 0) > staleMs;
+      } else {
+        // An unreadable/empty lock may be mid-initialization on the O_EXCL fallback; wait past a brief grace window.
+        try {
+          stale = Date.now() - statSync(path).mtimeMs > initGraceMs;
+        } catch {
+          stale = false;
+        }
+      }
       if (!stale) return null;
       removeFile(path);
     }

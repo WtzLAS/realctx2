@@ -4,11 +4,14 @@
  * `~/.pi/agent/realctx2/claude-code/run/` tells a hook which socket belongs to its session.
  */
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { createConnection, createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensureDir, existsSync, listFiles, readJson, removeFile, writeJson } from "../../util/fs.ts";
+
+const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
+const IDLE_TIMEOUT_MS = 30_000;
 
 export interface Registration {
   pid: number;
@@ -47,11 +50,33 @@ export function runDir(claudeCodeDir: string): string {
   return join(claudeCodeDir, "run");
 }
 
+function ensurePrivateDir(dir: string): string {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (process.platform === "win32") return dir;
+  const st = lstatSync(dir);
+  const uid = process.getuid?.();
+  if (!st.isDirectory() || st.isSymbolicLink() || (uid !== undefined && st.uid !== uid)) {
+    const safe = mkdtempSync(join(tmpdir(), "realctx2-"));
+    try {
+      chmodSync(safe, 0o700);
+    } catch {
+      // ignore on filesystems without POSIX modes
+    }
+    return safe;
+  }
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    // ignore on filesystems without POSIX modes
+  }
+  return dir;
+}
+
 /** Unix socket paths are short-lived and length-limited: prefer the plugin data directory, else tmp. */
 export function socketPath(pluginData: string | undefined, pid: number): string {
   if (process.platform === "win32") return `\\\\.\\pipe\\realctx2-${pid}`;
-  const dir = pluginData && pluginData.length < 70 ? join(pluginData, "run") : join(tmpdir(), `realctx2-${process.getuid?.() ?? 0}`);
-  ensureDir(dir);
+  const candidate = pluginData && pluginData.length < 70 ? join(pluginData, "run") : join(tmpdir(), `realctx2-${process.getuid?.() ?? 0}`);
+  const dir = ensurePrivateDir(candidate);
   return join(dir, `${pid}.sock`);
 }
 
@@ -66,8 +91,15 @@ function alive(pid: number): boolean {
 
 export function register(dir: string, reg: Registration): string {
   ensureDir(dir);
+  if (process.platform !== "win32") {
+    try {
+      chmodSync(dir, 0o700);
+    } catch {
+      // ignore on filesystems without POSIX modes
+    }
+  }
   const file = join(dir, `server-${reg.pid}.json`);
-  writeJson(file, reg);
+  writeJson(file, reg, 0o600);
   return file;
 }
 
@@ -119,20 +151,36 @@ export function listen(path: string, handler: Handler): Promise<Server> {
   if (process.platform !== "win32" && existsSync(path)) removeFile(path);
   const server = createServer({ allowHalfOpen: true }, (conn) => {
     let buf = "";
+    let bytes = 0;
     let handled = false;
     conn.setEncoding("utf8");
+    conn.setTimeout(IDLE_TIMEOUT_MS, () => {
+      if (!handled) {
+        handled = true;
+        conn.destroy();
+      }
+    });
     const run = async (line: string) => {
       if (handled) return;
       handled = true;
+      conn.setTimeout(0);
       let out: unknown = null;
       try {
         out = await handler(JSON.parse(line) as Record<string, unknown>);
       } catch (e) {
         out = { error: String((e as Error).message ?? e) };
       }
-      conn.end(`${JSON.stringify(out ?? null)}\n`);
+      if (!conn.destroyed) conn.end(`${JSON.stringify(out ?? null)}\n`);
     };
     conn.on("data", (chunk: string) => {
+      if (handled) return;
+      bytes += Buffer.byteLength(chunk, "utf8");
+      if (bytes > MAX_REQUEST_BYTES) {
+        handled = true;
+        conn.setTimeout(0);
+        conn.end(`${JSON.stringify({ error: "request too large" })}\n`, () => conn.destroy());
+        return;
+      }
       buf += chunk;
       const nl = buf.indexOf("\n");
       if (nl >= 0) void run(buf.slice(0, nl));
@@ -144,7 +192,16 @@ export function listen(path: string, handler: Handler): Promise<Server> {
   });
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(path, () => resolve(server));
+    server.listen(path, () => {
+      if (process.platform !== "win32") {
+        try {
+          chmodSync(path, 0o600);
+        } catch {
+          // ignore on non-socket transports
+        }
+      }
+      resolve(server);
+    });
   });
 }
 

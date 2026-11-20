@@ -150,8 +150,38 @@ async function locate(sessionId, cwd, waitMs) {
 
 async function main() {
   const argv = process.argv.slice(2);
-  // processes realctx2 started itself: its hooks do nothing there (design §4.6.4)
-  if (process.env.REALCTX2_CHILD === "1") return;
+  // processes realctx2 started itself: hooks stay silent except for enforcing aux Bash policy (design §4.6.4, §9.3.2)
+  if (process.env.REALCTX2_CHILD === "1") {
+    const [event] = String(argv[0] || "").split(":");
+    if (event !== "PreToolUse" || !process.env.REALCTX2_PARENT_SOCKET) return;
+    let input = {};
+    try {
+      input = JSON.parse((await readStdin()) || "{}");
+    } catch (_) {
+      input = {};
+    }
+    const tool = String(input.tool_name || "");
+    if (tool !== "Bash" && tool !== "bash") return;
+    const command = input.tool_input && typeof input.tool_input.command === "string" ? input.tool_input.command : "";
+    const budget = Number(process.env.REALCTX2_HOOK_TIMEOUT_MS) || 0;
+    const res = await ask(
+      process.env.REALCTX2_PARENT_SOCKET,
+      { kind: "aux-bash", command, cwd: input.cwd || process.cwd(), role: process.env.REALCTX2_AUX_ROLE || "aux" },
+      budget || TIMEOUT_MS.PreToolUse,
+    );
+    if (res === undefined) {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: "Blocked by realctx2 aux policy: parent session guard is unreachable.",
+        },
+      }));
+      return;
+    }
+    if (res && typeof res === "object" && !res.error) process.stdout.write(JSON.stringify(res));
+    return;
+  }
   const budget = Number(process.env.REALCTX2_HOOK_TIMEOUT_MS) || 0;
   if (argv[0] === "command") {
     let rest = argv.slice(1);

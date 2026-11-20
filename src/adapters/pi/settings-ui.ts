@@ -17,6 +17,7 @@ import {
   type EnumOption,
   findCategory,
   flattenAllSettings,
+  formatModelOverrideValue,
   formatSettingValue,
   getConfigPath,
   getSettingDefault,
@@ -24,6 +25,8 @@ import {
   isScalarSetting,
   isSettingModified,
   maskSecret,
+  type ModelOverridesSetting,
+  parseModelOverrideInput,
   parseSettingInput,
   rawInputValue,
   type ScalarSetting,
@@ -56,6 +59,7 @@ export interface ModelChoice {
   id: string;
   provider: string;
   name?: string;
+  contextWindow?: number;
 }
 
 export interface Realctx2SettingsOptions {
@@ -71,6 +75,8 @@ export interface Realctx2SettingsOptions {
   displayContext?: SettingsDisplayContext;
   /** Available models from pi's modelRegistry for aux model pickers. */
   availableModels?: ModelChoice[];
+  /** All known models (configured/available first, then catalog models) for per-model override screens. */
+  knownModels?: ModelChoice[];
   /** Optional initial category argument (e.g. "context", "memory", "providers"). */
   initialCategory?: string;
   /** Persist updated global config and reload live host state. */
@@ -104,7 +110,13 @@ type ViewState =
   | { kind: "search"; input: Input; selected: number }
   | { kind: "multi-enum"; entry: StringListSetting; selected: number }
   | { kind: "string-list"; entry: StringListSetting; selected: number }
-  | { kind: "string-map"; entry: StringMapSetting; selected: number };
+  | { kind: "string-map"; entry: StringMapSetting; selected: number }
+  | { kind: "model-overrides"; entry: ModelOverridesSetting; input: Input; selected: number };
+
+type ModelOverrideRow =
+  | { kind: "model"; key: string; name?: string; contextWindow?: number; value: "auto" | number | undefined; custom: boolean }
+  | { kind: "add-query"; key: string }
+  | { kind: "add-custom" };
 
 type ActiveModal =
   | {
@@ -157,6 +169,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
   private readonly configPath: string;
   private readonly displayCtx?: SettingsDisplayContext;
   private readonly availableModels: ModelChoice[];
+  private readonly knownModels: ModelChoice[];
   private readonly onSave: (next: Config) => void;
   private readonly onTestEndpoint?: (endpoint: EndpointKind, cfg: Config, signal: AbortSignal) => Promise<EndpointTestResult>;
   private readonly onFetchModels?: (endpoint: EndpointKind, cfg: Config, signal: AbortSignal) => Promise<EndpointModelsResult>;
@@ -179,6 +192,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
     this.configPath = opts.configPath;
     this.displayCtx = opts.displayContext;
     this.availableModels = opts.availableModels ?? [];
+    this.knownModels = opts.knownModels?.length ? opts.knownModels : this.availableModels;
     this.onSave = opts.onSave;
     this.onTestEndpoint = opts.onTestEndpoint;
     this.onFetchModels = opts.onFetchModels;
@@ -210,10 +224,11 @@ export class Realctx2SettingsComponent implements Component, Focusable {
 
   private syncInputFocus(): void {
     const top = this.topView();
+    const topHasInput = top.kind === "search" || top.kind === "home" || top.kind === "model-overrides";
     if (this.modal && (this.modal.kind === "text" || this.modal.kind === "model" || this.modal.kind === "endpoint-model")) {
       this.modal.input.focused = this._focused;
-      if (top.kind === "search" || top.kind === "home") top.input.focused = false;
-    } else if (top.kind === "search" || top.kind === "home") {
+      if (topHasInput) top.input.focused = false;
+    } else if (topHasInput) {
       top.input.focused = this._focused;
     }
   }
@@ -388,6 +403,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
     else if (view.kind === "multi-enum") this.handleMultiEnumInput(view, data);
     else if (view.kind === "string-list") this.handleStringListInput(view, data);
     else if (view.kind === "string-map") this.handleStringMapInput(view, data);
+    else if (view.kind === "model-overrides") this.handleModelOverridesInput(view, data);
     this.syncInputFocus();
     this.tui?.requestRender();
   }
@@ -434,6 +450,9 @@ export class Realctx2SettingsComponent implements Component, Focusable {
       const entries = this.getMapEntries(view.entry);
       const n = entries.length + 1;
       view.selected = (view.selected + delta + n) % n;
+    } else if (view.kind === "model-overrides") {
+      const n = this.modelOverrideRows(view).length;
+      if (n) view.selected = (view.selected + delta + n) % n;
     }
   }
 
@@ -585,8 +604,9 @@ export class Realctx2SettingsComponent implements Component, Focusable {
     // Pressing `/` while search is empty focuses search without inserting a literal `/`
     if (data === "/" && query.length === 0) return;
 
+    const prev = view.input.getValue();
     view.input.handleInput(data);
-    view.selected = 0;
+    if (view.input.getValue() !== prev) view.selected = 0;
   }
 
   // ── Category / Subscreen input
@@ -666,6 +686,8 @@ export class Realctx2SettingsComponent implements Component, Focusable {
       const entry = entries[view.selected]!;
       if (entry.kind === "subscreen") {
         this.stack.push({ kind: "screen", title: entry.label, build: entry.build, selected: 0 });
+      } else if (entry.kind === "model-overrides") {
+        this.activateEntry(entry);
       } else if (isScalarSetting(entry)) {
         this.quickStep(entry, 1);
       }
@@ -711,8 +733,9 @@ export class Realctx2SettingsComponent implements Component, Focusable {
       const item = results[view.selected];
       if (item) this.resetEntry(item.entry);
     } else {
+      const prev = view.input.getValue();
       view.input.handleInput(data);
-      view.selected = 0;
+      if (view.input.getValue() !== prev) view.selected = 0;
     }
   }
 
@@ -933,6 +956,188 @@ export class Realctx2SettingsComponent implements Component, Focusable {
     return maskSecret(trimmed);
   }
 
+  // ── Per-model override screen (maxWindow, cacheTTL)
+
+  private getModelOverrideMap(entry: ModelOverridesSetting): Record<string, "auto" | number> {
+    const raw = getSettingValue(this.cfg, entry);
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    return { ...(raw as Record<string, "auto" | number>) };
+  }
+
+  private setModelOverride(entry: ModelOverridesSetting, modelKey: string, value: "auto" | number): void {
+    const nextMap = this.getModelOverrideMap(entry);
+    if (value === "auto") delete nextMap[modelKey];
+    else nextMap[modelKey] = value;
+    const next = setSettingValue(this.cfg, entry, nextMap);
+    const label = formatModelOverrideValue(entry, value);
+    this.commitConfig(next, `${modelKey} → ${label}`);
+  }
+
+  private modelOverrideRows(view: Extract<ViewState, { kind: "model-overrides" }>): ModelOverrideRow[] {
+    const map = this.getModelOverrideMap(view.entry);
+    const query = view.input.getValue().trim();
+    const knownByKey = new Map<string, ModelChoice>();
+    for (const m of this.knownModels) {
+      knownByKey.set(`${m.provider}/${m.id}`, m);
+    }
+
+    const baseRows: Array<Extract<ModelOverrideRow, { kind: "model" }>> = [];
+    const seen = new Set<string>();
+
+    // 1. Models that already have active overrides (including custom entries not in the registry)
+    const overriddenKeys = Object.keys(map)
+      .filter((k) => map[k] !== "auto" && map[k] !== undefined)
+      .sort((a, b) => a.localeCompare(b));
+    for (const key of overriddenKeys) {
+      seen.add(key);
+      const meta = knownByKey.get(key);
+      baseRows.push({
+        kind: "model",
+        key,
+        name: meta?.name,
+        contextWindow: meta?.contextWindow,
+        value: map[key],
+        custom: !meta,
+      });
+    }
+
+    // 2. All known models from registry/catalog (configured/available first, preserving order)
+    for (const m of this.knownModels) {
+      const key = `${m.provider}/${m.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      baseRows.push({
+        kind: "model",
+        key,
+        name: m.name,
+        contextWindow: m.contextWindow,
+        value: map[key],
+        custom: false,
+      });
+    }
+
+    const matched: ModelOverrideRow[] = query
+      ? fuzzyFilter(baseRows, query, (r) => `${r.key} ${r.name ?? ""}`)
+      : [...baseRows];
+
+    if (query) {
+      const exact = baseRows.some((r) => r.key.toLowerCase() === query.toLowerCase());
+      if (!exact) matched.push({ kind: "add-query", key: query });
+    } else {
+      matched.push({ kind: "add-custom" });
+    }
+
+    if (matched.length > 0 && view.selected >= matched.length) view.selected = matched.length - 1;
+    if (matched.length === 0) view.selected = 0;
+    return matched;
+  }
+
+  private handleModelOverridesInput(view: Extract<ViewState, { kind: "model-overrides" }>, data: string): void {
+    const rows = this.modelOverrideRows(view);
+    if (this.isCancel(data)) {
+      if (view.input.getValue().length > 0) {
+        view.input.setValue("");
+        view.selected = 0;
+        return;
+      }
+      this.stack.pop();
+      return;
+    }
+    if (this.isUp(data, false)) {
+      if (rows.length) view.selected = (view.selected - 1 + rows.length) % rows.length;
+      return;
+    }
+    if (this.isDown(data, false)) {
+      if (rows.length) view.selected = (view.selected + 1) % rows.length;
+      return;
+    }
+    if (this.isPageUp(data)) {
+      if (rows.length) view.selected = Math.max(0, view.selected - Math.max(1, Math.floor(this.maxListRows() / 2)));
+      return;
+    }
+    if (this.isPageDown(data)) {
+      if (rows.length) view.selected = Math.min(rows.length - 1, view.selected + Math.max(1, Math.floor(this.maxListRows() / 2)));
+      return;
+    }
+    if (matchesKey(data, Key.ctrl("r"))) {
+      const cur = rows[view.selected];
+      if (cur?.kind === "model" && cur.value !== undefined && cur.value !== "auto") {
+        this.setModelOverride(view.entry, cur.key, "auto");
+      }
+      return;
+    }
+    if (this.isConfirm(data)) {
+      const cur = rows[view.selected];
+      if (!cur) return;
+      if (cur.kind === "model") {
+        this.openModelOverrideEditModal(view.entry, cur.key, cur.value, cur.contextWindow);
+      } else if (cur.kind === "add-query") {
+        const key = cur.key;
+        this.openModelOverrideEditModal(view.entry, key, undefined, undefined, () => {
+          view.input.setValue("");
+          view.selected = 0;
+        });
+      } else {
+        this.openModelOverrideAddModal(view.entry);
+      }
+      return;
+    }
+
+    const prev = view.input.getValue();
+    view.input.handleInput(data);
+    if (view.input.getValue() !== prev) view.selected = 0;
+  }
+
+  private openModelOverrideAddModal(entry: ModelOverridesSetting): void {
+    const input = new Input({ prompt: "Model: ", placeholder: "provider/model-id (e.g. openai/gpt-6.2-sol)" });
+    this.modal = {
+      kind: "text",
+      title: `Add model · ${entry.label}`,
+      subtitle: `${entry.path} (step 1 of 2: model identifier)`,
+      description: entry.description,
+      hint: 'Enter "provider/model-id" or bare "model-id" · Esc to cancel',
+      input,
+      onCommit: (raw) => {
+        const key = raw.trim();
+        if (!key) return "Model identifier cannot be empty";
+        const cur = this.getModelOverrideMap(entry)[key];
+        this.openModelOverrideEditModal(entry, key, cur);
+        return "__keep_modal__";
+      },
+    };
+  }
+
+  private openModelOverrideEditModal(
+    entry: ModelOverridesSetting,
+    modelKey: string,
+    currentVal: "auto" | number | undefined,
+    contextWindow?: number,
+    onSaved?: () => void,
+  ): void {
+    const placeholder = entry.zeroLabel ? 'auto, 0 (disable), or tokens' : 'auto or seconds';
+    const input = new Input({ prompt: "Value: ", placeholder });
+    this.prefillInput(input, currentVal === undefined || currentVal === "auto" ? "auto" : String(currentVal));
+    const subParts = [`${entry.path}["${modelKey}"]`, `default: ${entry.defaultSummary(this.cfg)}`];
+    if (entry.showContextWindow && contextWindow) subParts.push(`catalog: ${contextWindow.toLocaleString("en-US")} tokens`);
+    this.modal = {
+      kind: "text",
+      title: `${modelKey} · ${entry.label}`,
+      subtitle: subParts.join(" · "),
+      description: entry.description,
+      hint: entry.zeroLabel
+        ? 'Enter "auto", 0 (disable context engine), or tokens · Esc to cancel'
+        : 'Enter "auto" or seconds ≥ 0 · Esc to cancel',
+      input,
+      onCommit: (raw) => {
+        const parsed = parseModelOverrideInput(entry, raw);
+        if (!parsed.ok) return parsed.error;
+        this.setModelOverride(entry, modelKey, parsed.value);
+        onSaved?.();
+        return null;
+      },
+    };
+  }
+
   // ── Entry activation, quick-step, reset
 
   private quickStep(entry: ScalarSetting, dir: -1 | 1): void {
@@ -967,6 +1172,11 @@ export class Realctx2SettingsComponent implements Component, Focusable {
     }
     if (entry.kind === "string-map") {
       this.stack.push({ kind: "string-map", entry, selected: 0 });
+      return;
+    }
+    if (entry.kind === "model-overrides") {
+      const input = new Input({ prompt: "Model: ", placeholder: "Filter known models or type provider/model-id to add..." });
+      this.stack.push({ kind: "model-overrides", entry, input, selected: 0 });
       return;
     }
     if (!isScalarSetting(entry)) return;
@@ -1315,8 +1525,9 @@ export class Realctx2SettingsComponent implements Component, Focusable {
         this.commitConfig(next, `${m.entry.label} = ${chosen.value}`);
         this.modal = null;
       } else {
+        const prev = m.input.getValue();
         m.input.handleInput(data);
-        m.selected = 0;
+        if (m.input.getValue() !== prev) m.selected = 0;
       }
       return;
     }
@@ -1349,15 +1560,16 @@ export class Realctx2SettingsComponent implements Component, Focusable {
           this.modal = null;
         }
       } else {
+        const prev = m.input.getValue();
         m.input.handleInput(data);
-        m.selected = 0;
+        if (m.input.getValue() !== prev) m.selected = 0;
       }
     }
   }
 
   // ───────────────────────────── Rendering
 
-  render(width: number): string[] {
+  render(width: number): readonly string[] {
     const w = Math.max(30, width);
     const t = this.theme;
     const border = t.fg("border", "─".repeat(w));
@@ -1383,6 +1595,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
       else if (view.kind === "multi-enum") lines.push(...this.renderMultiEnum(view, w, lines.length));
       else if (view.kind === "string-list") lines.push(...this.renderStringList(view, w, lines.length));
       else if (view.kind === "string-map") lines.push(...this.renderStringMap(view, w, lines.length));
+      else if (view.kind === "model-overrides") lines.push(...this.renderModelOverrides(view, w, lines.length));
     }
 
     lines.push(border);
@@ -1394,7 +1607,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
     for (const v of this.stack) {
       if (v.kind === "screen") parts.push(v.title);
       else if (v.kind === "search") parts.push("Search");
-      else if (v.kind === "multi-enum" || v.kind === "string-list" || v.kind === "string-map") parts.push(v.entry.label);
+      else if (v.kind === "multi-enum" || v.kind === "string-list" || v.kind === "string-map" || v.kind === "model-overrides") parts.push(v.entry.label);
     }
     return parts.join(" › ");
   }
@@ -1450,6 +1663,7 @@ export class Realctx2SettingsComponent implements Component, Focusable {
   private formatEntryDisplayValue(entry: EditableSetting): string {
     const val = getSettingValue(this.cfg, entry);
     const base = formatSettingValue(entry, val);
+    if (entry.kind === "model-overrides") return `${base} ›`;
     if (!isScalarSetting(entry)) return base;
     if (entry.envVar && typeof val === "string") {
       const envName = normalizeEnvVarName(val);
@@ -1912,6 +2126,91 @@ export class Realctx2SettingsComponent implements Component, Focusable {
     lines.push(...this.renderDescriptionBox(this.renderSettingMeta(view.entry), view.entry.description, width));
     lines.push("");
     lines.push(truncateToWidth(t.fg("dim", "  ↑↓ navigate · Enter edit/add · a add · d delete · r clear all · Esc back"), width));
+    return lines;
+  }
+
+  // ── Render Per-Model Overrides screen (maxWindow, cacheTTL)
+
+  private formatCompactTokens(tokens: number): string {
+    if (tokens >= 1_000_000) {
+      const m = tokens / 1_000_000;
+      return `${Number.isInteger(m) ? m : Number(m.toFixed(2))}M`;
+    }
+    return `${Math.round(tokens / 1000)}k`;
+  }
+
+  private renderModelOverrides(view: Extract<ViewState, { kind: "model-overrides" }>, width: number, baseY: number): string[] {
+    const t = this.theme;
+    const map = this.getModelOverrideMap(view.entry);
+    const activeCount = Object.values(map).filter((v) => v !== "auto" && v !== undefined).length;
+    const rows = this.modelOverrideRows(view);
+
+    const lines: string[] = [
+      truncateToWidth(
+        t.fg(
+          "muted",
+          `  Default: ${view.entry.defaultSummary(this.cfg)} · ${activeCount} override${activeCount === 1 ? "" : "s"} · ${this.knownModels.length} known model${this.knownModels.length === 1 ? "" : "s"}`,
+        ),
+        width,
+      ),
+      "",
+    ];
+
+    for (const l of view.input.render(Math.max(20, width - 4))) {
+      lines.push(`  ${l}`);
+    }
+    lines.push("");
+
+    const maxVis = Math.max(5, this.maxListRows() - 3);
+    const start = Math.max(0, Math.min(view.selected - Math.floor(maxVis / 2), Math.max(0, rows.length - maxVis)));
+    const end = Math.min(rows.length, start + maxVis);
+
+    for (let i = start; i < end; i++) {
+      const row = rows[i]!;
+      const sel = i === view.selected;
+      const cursor = sel ? t.fg("accent", "▸ ") : "  ";
+      this.lastVisibleSelectableIndices.push({ rowY: baseY + lines.length, index: i });
+
+      if (row.kind === "model") {
+        const overridden = row.value !== undefined && row.value !== "auto";
+        const modDot = overridden ? t.fg("warning", "•") : " ";
+        const valText = formatModelOverrideValue(view.entry, row.value);
+        const valStyled = sel
+          ? t.bold(t.fg(overridden ? (row.value === 0 ? "warning" : "accent") : "accent", valText))
+          : overridden
+            ? t.fg(row.value === 0 ? "error" : "warning", valText)
+            : t.fg("dim", valText);
+        const ctxHint =
+          view.entry.showContextWindow && row.contextWindow
+            ? t.fg("dim", ` (${this.formatCompactTokens(row.contextWindow)})`)
+            : row.custom
+              ? t.fg("dim", " (custom)")
+              : "";
+        const leftStyled = `  ${cursor}${modDot} ${sel ? t.bold(t.fg("accent", row.key)) : t.fg("text", row.key)}${ctxHint}`;
+        lines.push(this.spreadRow(leftStyled, `${valStyled}  `, width));
+      } else if (row.kind === "add-query") {
+        const label = `+ Add "${row.key}"…`;
+        const right = t.fg("dim", "auto  ");
+        lines.push(this.spreadRow(`  ${cursor}  ${sel ? t.bold(t.fg("accent", label)) : t.fg("success", label)}`, right, width));
+      } else {
+        const label = "+ Add custom model…";
+        lines.push(truncateToWidth(`  ${cursor}  ${sel ? t.bold(t.fg("accent", label)) : t.fg("success", label)}`, width));
+      }
+    }
+
+    if (rows.length > maxVis) {
+      lines.push(t.fg("dim", `  (${view.selected + 1}/${rows.length})`));
+    }
+
+    lines.push("");
+    lines.push(...this.renderDescriptionBox(this.renderSettingMeta(view.entry), view.entry.description, width));
+    lines.push("");
+    lines.push(
+      truncateToWidth(
+        t.fg("dim", "  ↑↓ navigate · Enter edit/add · Ctrl+R reset to auto · Type to filter or add model · Esc back"),
+        width,
+      ),
+    );
     return lines;
   }
 

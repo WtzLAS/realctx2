@@ -43,28 +43,61 @@ export function rawTurnId(session: string, entryId: string, chunk = 0): string {
   return `r:${stableId8(`${session}\u0000${entryId}\u0000${chunk}`, sha256)}`;
 }
 
+function quarterTokens(text: string): number {
+  let q = 0;
+  for (let i = 0; i < text.length; i++) q += text.charCodeAt(i) > 0x7f ? 4 : 1;
+  return q;
+}
+
+function takePrefixByQuarterTokens(text: string, maxQ: number): string {
+  let q = 0;
+  let end = 0;
+  while (end < text.length) {
+    const w = text.charCodeAt(end) > 0x7f ? 4 : 1;
+    if (end > 0 && q + w > maxQ) break;
+    q += w;
+    end++;
+  }
+  if (end > 1 && end < text.length) {
+    const prev = text.charCodeAt(end - 1);
+    if (prev >= 0xd800 && prev <= 0xdbff) end--;
+  }
+  return text.slice(0, Math.max(1, end));
+}
+
 /** Split text into chunks of at most `maxTokens`, preferring line boundaries. */
 export function chunkText(text: string, maxTokens = CHUNK_TOKENS): string[] {
   if (estimateTokens(text) <= maxTokens) return [text];
-  const maxChars = maxTokens * 4;
+  const maxQ = Math.max(4, maxTokens * 4);
   const chunks: string[] = [];
   let cur = "";
+  let curQ = 0;
   const push = () => {
     if (cur.trim()) chunks.push(cur);
     cur = "";
+    curQ = 0;
   };
   for (const line of text.split("\n")) {
     let rest = line;
-    while (rest.length > maxChars) {
+    let restQ = quarterTokens(rest);
+    while (restQ > maxQ) {
       push();
-      chunks.push(rest.slice(0, maxChars));
-      rest = rest.slice(maxChars);
+      const piece = takePrefixByQuarterTokens(rest, maxQ);
+      chunks.push(piece);
+      rest = rest.slice(piece.length);
+      restQ = quarterTokens(rest);
     }
-    if (cur.length + rest.length + 1 > maxChars) push();
-    cur = cur ? `${cur}\n${rest}` : rest;
+    if (cur && curQ + 1 + restQ > maxQ) push();
+    if (cur) {
+      cur = `${cur}\n${rest}`;
+      curQ += 1 + restQ;
+    } else {
+      cur = rest;
+      curQ = restQ;
+    }
   }
   push();
-  return chunks.length ? chunks : [text.slice(0, maxChars)];
+  return chunks.length ? chunks : [takePrefixByQuarterTokens(text, maxQ)];
 }
 
 function toRow(r: Record<string, unknown>): TurnRow {
@@ -192,18 +225,20 @@ export class TurnIndex {
     return rows.length;
   }
 
-  /** Purge support (§6.5.6): drop raw-turn chunks that contain any of these quotes. */
+  /** Purge support (§6.5.6): drop indexed turns (raw or consolidated) that contain any of these quotes. */
   removeContaining(quotes: string[]): number {
     let n = 0;
-    for (const quote of quotes) {
-      const q = quote.trim();
-      if (q.length < 12) continue;
-      const rows = this.db.prepare("SELECT rid, id FROM turns WHERE instr(text, ?) > 0").all(q);
-      for (const r of rows) {
-        this.removeRid(Number(r.rid), String(r.id));
-        n++;
+    this.db.transaction(() => {
+      for (const quote of quotes) {
+        const q = quote.trim();
+        if (q.length < 12) continue;
+        const rows = this.db.prepare("SELECT rid, id FROM turns WHERE instr(text, ?) > 0").all(q);
+        for (const r of rows) {
+          this.removeRid(Number(r.rid), String(r.id));
+          n++;
+        }
       }
-    }
+    });
     return n;
   }
 

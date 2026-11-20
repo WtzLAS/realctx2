@@ -147,7 +147,8 @@ export class Reverifier {
     const git = this.s.graph.project.git?.isRepo() ? this.s.graph.project.git : null;
     // shared memories are checked against committed code, so discarded work never rewrites team memory
     if (scope === "shared" && git && this.s.cfg.reverify.sharedAgainst === "HEAD") {
-      if (git.differsFromHead(path)) return { content: null, blob: null, wait: true };
+      // Wait on both uncommitted diffs (exit 1) and git errors (exit >1) rather than misreading a file as deleted.
+      if (git.git(["diff", "--quiet", "HEAD", "--", path]).code !== 0) return { content: null, blob: null, wait: true };
       const bytes = git.showBytes("HEAD", path);
       return bytes ? { content: bytes.toString("utf8"), blob: blobHash(bytes), wait: false } : { content: null, blob: null, wait: false };
     }
@@ -176,7 +177,7 @@ export class Reverifier {
       let grp = groups.get(key);
       if (!grp) {
         // settling: a burst of edits costs one check, not one per edit
-        if (!opts.sessionEnding) {
+        if (!opts.sessionEnding && settleMs > 0) {
           try {
             if (now - statSync(this.s.paths.abs(path)).mtimeMs < settleMs) {
               waiting.push(path);

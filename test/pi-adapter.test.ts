@@ -306,4 +306,269 @@ describe("pressure, compaction and name conflicts in pi", () => {
     expect(r.ui.notes[0]!.text).toMatch(/✗ tool name "search" is already used by another extension/);
     await r.shutdown();
   }, 60_000);
+
+  it("derives W from the active model's catalog contextWindow and updates on model_select", async () => {
+    const cwd = repo();
+    const r = await piRig({
+      cwd,
+      config: { context: { maxWindow: "auto" } },
+      models: [
+        { id: "faux-200k", contextWindow: 200_000 },
+        { id: "faux-1m", contextWindow: 1_000_000 },
+        { id: "faux-64k", contextWindow: 64_000 },
+      ],
+    });
+    const statusText = async () => {
+      r.ui.notes.length = 0;
+      await r.prompt("/realctx2 status");
+      return r.ui.notes[0]!.text;
+    };
+    expect(await statusText()).toContain("Context: W = 200,000 tokens");
+    const all = r.modelRuntime.getAllModels(r.session.model!.provider);
+    const m1m = all.find((m) => m.id === "faux-1m")! as Parameters<typeof r.session.setModel>[0];
+    const m64k = all.find((m) => m.id === "faux-64k")! as Parameters<typeof r.session.setModel>[0];
+    await r.session.setModel(m1m);
+    expect(await statusText()).toContain("Context: W = 1,000,000 tokens");
+    await r.session.setModel(m64k);
+    expect(await statusText()).toContain("Context: W = 64,000 tokens");
+    expect(r.errors).toEqual([]);
+    await r.shutdown();
+  }, 60_000);
+
+  it("applies per-model maxWindow overrides and disables context engine when overridden to 0", async () => {
+    const cwd = repo();
+    const r = await piRig({
+      cwd,
+      config: {
+        context: {
+          maxWindow: "auto",
+          modelMaxWindows: {
+            "faux-1m": 150_000,
+            "faux-64k": 0,
+          },
+        },
+      },
+      models: [
+        { id: "faux-200k", contextWindow: 200_000 },
+        { id: "faux-1m", contextWindow: 1_000_000 },
+        { id: "faux-64k", contextWindow: 64_000 },
+      ],
+    });
+    const statusText = async () => {
+      r.ui.notes.length = 0;
+      await r.prompt("/realctx2 status");
+      return r.ui.notes[0]!.text;
+    };
+    // faux-200k: inherits "auto" -> 200,000
+    expect(await statusText()).toContain("Context: W = 200,000 tokens");
+    const all = r.modelRuntime.getAllModels(r.session.model!.provider);
+    const m1m = all.find((m) => m.id === "faux-1m")! as Parameters<typeof r.session.setModel>[0];
+    const m64k = all.find((m) => m.id === "faux-64k")! as Parameters<typeof r.session.setModel>[0];
+
+    // faux-1m: overridden to 150,000
+    await r.session.setModel(m1m);
+    expect(await statusText()).toContain("Context: W = 150,000 tokens");
+
+    // faux-64k: overridden to 0 -> context engine disabled & status bar shows "ctx off"
+    await r.session.setModel(m64k);
+    expect(await statusText()).toContain("Context: disabled (maxWindow = 0)");
+    expect(r.ui.status.get("realctx2")).toContain("ctx off");
+    expect(r.errors).toEqual([]);
+    await r.shutdown();
+  }, 60_000);
+
+  it("rebuilds branch-relative state cleanly on /tree navigation (mid-branch and root)", async () => {
+    const cwd = repo();
+    const r = await piRig({ cwd });
+    const labels = ["Fix auth flow", "Check token cache"];
+    r.aux.push({
+      when: '"label"',
+      reply: () => {
+        const label = labels.shift() ?? "Extra";
+        return { label, reason: `because ${label}`, success: `${label} is done`, failure: `${label} cannot be done` };
+      },
+    });
+    r.decision.handler = janus([{ kindle: true }, { kindle: true }]);
+    r.main.push({ text: "investigating auth" }, { text: "checking token cache" });
+    await r.prompt("fix the auth flow");
+    const afterFirst = r.branch();
+    const firstUser = afterFirst.find((e) => e.role === "user" && e.text === "fix the auth flow")!;
+    await r.prompt("also check the token cache");
+    const afterSecond = r.branch();
+    const secondUser = afterSecond.find((e) => e.role === "user" && e.text === "also check the token cache")!;
+    const statusText = async () => {
+      r.ui.notes.length = 0;
+      await r.prompt("/realctx2 status");
+      return r.ui.notes[0]!.text;
+    };
+    const both = await statusText();
+    expect(both).toContain("Fix auth flow");
+    expect(both).toContain("Check token cache");
+    expect(r.ui.status.get("realctx2")).toContain("2 intents");
+
+    // /tree back to before the second prompt: sub-intent must disappear, root intent stays open
+    const nav1 = await r.session.navigateTree(secondUser.id, { summarize: false });
+    expect(nav1.cancelled).toBe(false);
+    const mid = await statusText();
+    expect(mid).toContain("Fix auth flow");
+    expect(mid).not.toContain("Check token cache");
+    expect(r.ui.status.get("realctx2")).toContain("1 intent");
+
+    // Continue working on the new branch: no stale state or errors
+    r.decision.handler = janus([{}]);
+    r.main.push({ text: "continuing on new branch" });
+    await r.prompt("try another approach for auth");
+    expect(r.errors).toEqual([]);
+
+    // /tree all the way back to root (before first user prompt -> leaf = null): no open intents
+    const navRoot = await r.session.navigateTree(firstUser.id, { summarize: false });
+    expect(navRoot.cancelled).toBe(false);
+    expect(await statusText()).toContain("Open intents: none");
+    expect(r.errors).toEqual([]);
+    await r.shutdown();
+  }, 60_000);
+
+  it("handles /reload, /fork (preserving parent o: blobs), /new, and /resume via AgentSessionRuntime", async () => {
+    const cwd = repo();
+    const {
+      createAgentSessionFromServices,
+      createAgentSessionRuntime,
+      createAgentSessionServices,
+      SessionManager,
+      SettingsManager,
+    } = await import("@earendil-works/pi-coding-agent");
+    const { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } = await import("@earendil-works/pi-ai");
+    const realctx2Ext = (await import("../src/index.ts")).default;
+    const { decisionServer } = await import("./helpers/pi.ts");
+    const { ensureDir, writeJson } = await import("../src/util/fs.ts");
+    const { tmp } = await import("./helpers/fixtures.ts");
+
+    const agentDir = tmp("pi-rt-agent-");
+    const home = join(agentDir, "realctx2");
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    process.env.REALCTX2_HOME = home;
+    process.env.REALCTX2_NO_WORKER = "1";
+    const dec = await decisionServer();
+    ensureDir(home);
+    writeJson(join(home, "config.json"), {
+      providers: { decision: { format: "systemone", url: dec.url, model: "jev-test" } },
+      context: { maxWindow: 32000 },
+      janus: { lateWaitMs: 200, timeoutMs: 3000 },
+      maintenance: { idleMinutes: 600 },
+    });
+
+    const notes: Array<{ text: string; level?: string }> = [];
+    const errors: unknown[] = [];
+    const uiContext = new Proxy(
+      {
+        notify: (text: string, level?: string) => void notes.push({ text, level }),
+        setStatus: () => undefined,
+        confirm: async () => true,
+        editor: async (_t: string, p?: string) => p,
+        select: async () => undefined,
+        input: async () => undefined,
+      } as Record<string, unknown>,
+      { get: (t, k: string) => t[k] ?? (() => undefined) },
+    );
+    const scriptedMain: Array<{ text?: string; tools?: Array<{ name: string; args: Record<string, unknown> }> }> = [];
+    const faux = fauxProvider({ models: [{ id: "faux-rt", contextWindow: 200_000, maxTokens: 4000, cost: { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 } }], tokensPerSecond: 1_000_000 });
+    const dispatch = async (ctx: any) => {
+      const systems = ctx.messages.filter((m: any) => m.role === "system");
+      const system = systems.map((m: any) => `${m.content ?? ""}\n${Object.values(m.sections ?? {}).join("\n")}`).join("\n");
+      if (system.includes("helper process for realctx2")) {
+        return fauxAssistantMessage(JSON.stringify({ label: "Refactor billing", reason: "cleanup", success: "billing clean", failure: "stuck" }));
+      }
+      const step = scriptedMain.shift() ?? { text: "ok" };
+      if (step.tools?.length) return fauxAssistantMessage([...(step.text ? [fauxText(step.text)] : []), ...step.tools.map((t) => fauxToolCall(t.name, t.args as never))], { stopReason: "toolUse" });
+      return fauxAssistantMessage(step.text ?? "ok");
+    };
+    faux.setResponses(Array.from({ length: 200 }, () => dispatch));
+
+    const sessionDir = join(agentDir, "sessions");
+    const runtime = await createAgentSessionRuntime(
+      async ({ cwd: c, agentDir: ad, sessionManager, sessionStartEvent }) => {
+        const services = await createAgentSessionServices({
+          cwd: c,
+          agentDir: ad,
+          resourceLoaderOptions: {
+            noExtensions: true,
+            noSkills: true,
+            noPromptTemplates: true,
+            noThemes: true,
+            extensionFactories: [{ name: "realctx2", factory: realctx2Ext }],
+          },
+          settingsManager: SettingsManager.inMemory({ compaction: { enabled: false } } as never),
+        });
+        services.modelRuntime.registerNativeProvider(faux.provider);
+        const result = await createAgentSessionFromServices({
+          services,
+          sessionManager,
+          sessionStartEvent,
+          model: faux.getModel(),
+          thinkingLevel: "off",
+        });
+        await result.session.bindExtensions({ uiContext: uiContext as never, mode: "rpc", onError: (e: unknown) => errors.push(e) });
+        return { ...result, services, diagnostics: [] };
+      },
+      { cwd, agentDir, sessionManager: SessionManager.create(cwd, sessionDir) },
+    );
+
+    const status = async () => {
+      notes.length = 0;
+      await runtime.session.prompt("/realctx2 status");
+      return notes[0]!.text;
+    };
+
+    try {
+      expect(runtime.takeUnreportedDiagnostics()).toEqual([]);
+      // 1. Open an intent and produce an oversized tool output (archived behind o:...)
+      dec.handler = janus([{ kindle: true }, {}, {}]);
+      const huge = Array.from({ length: 1200 }, (_, i) => `BIGBLOB_UNIQUE_TOKEN_${i} padding words here`).join("\n");
+      write(cwd, "big.txt", huge);
+      scriptedMain.push({ text: "reading big file", tools: [{ name: "read", args: { path: "big.txt" } }] }, { text: "captured output" });
+      await runtime.session.prompt("refactor billing module");
+      expect(errors).toEqual([]);
+      const session1File = runtime.session.sessionFile!;
+      const toolOut = runtime.session.sessionManager.getBranch().find((e: any) => e.type === "message" && e.message.role === "toolResult") as any;
+      const toolText = toolOut.message.content.map((p: any) => p.text ?? "").join("\n");
+      const blobId = /\[(o:[0-9a-z]{8})\]/.exec(toolText)?.[1] ?? "";
+      expect(blobId).toMatch(/^o:/);
+      expect(await status()).toContain("Refactor billing");
+
+      // 2. /reload: keeps the live intent open, no tool conflicts, no errors
+      await runtime.session.reload();
+      expect(errors).toEqual([]);
+      expect(notes.filter((n) => n.level === "error")).toEqual([]);
+      expect(await status()).toContain("Refactor billing");
+
+      // 3. /fork: carries the intent and can still recall parent session's o: blob!
+      const lastEntry = runtime.session.sessionManager.getBranch().at(-1)!;
+      const forkRes = await runtime.fork(lastEntry.id, { position: "at" });
+      expect(forkRes.cancelled).toBe(false);
+      expect(runtime.session.sessionFile).not.toBe(session1File);
+      expect(await status()).toContain("Refactor billing");
+      dec.handler = janus([{}, {}]);
+      scriptedMain.push({ text: "checking parent blob", tools: [{ name: "recall", args: { id: blobId } }] }, { text: "got it" });
+      await runtime.session.prompt("recall the oversized output");
+      const recalled = runtime.session.sessionManager.getBranch().filter((e: any) => e.type === "message" && e.message.role === "toolResult").at(-1) as any;
+      expect(recalled.message.isError).toBe(false);
+      expect(recalled.message.content[0].text).toContain("BIGBLOB_UNIQUE_TOKEN_");
+
+      // 4. /new: starts a clean session with no open intents and no errors
+      const newRes = await runtime.newSession();
+      expect(newRes.cancelled).toBe(false);
+      expect(await status()).toContain("Open intents: none");
+      expect(runtime.session.getActiveToolNames()).toEqual(expect.arrayContaining(["search", "recall", "inspect", "remember", "forget"]));
+
+      // 5. /resume: switches back to session 1 and restores its open intent
+      const resumeRes = await runtime.switchSession(session1File);
+      expect(resumeRes.cancelled).toBe(false);
+      expect(runtime.takeUnreportedDiagnostics()).toEqual([]);
+      expect(await status()).toContain("Refactor billing");
+      expect(errors).toEqual([]);
+    } finally {
+      await runtime.dispose();
+      await dec.close();
+    }
+  }, 120_000);
 });

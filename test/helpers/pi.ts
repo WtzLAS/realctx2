@@ -21,6 +21,12 @@ export interface DecisionServer {
 
 /** A SystemOne-format endpoint (§9.1.2). */
 export async function decisionServer(): Promise<DecisionServer> {
+  // Ensure loopback mock requests bypass any ambient HTTP(S)_PROXY in the test environment.
+  for (const key of ["NO_PROXY", "no_proxy"] as const) {
+    const items = (process.env[key] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    for (const host of ["127.0.0.1", "localhost"]) if (!items.includes(host)) items.push(host);
+    process.env[key] = items.join(",");
+  }
   const self: DecisionServer = { url: "", requests: [], handler: () => ({}), close: async () => undefined };
   const server: Server = createServer((req, res) => {
     let body = "";
@@ -99,7 +105,7 @@ function contentText(content: unknown): string {
   return Array.isArray(content) ? content.map((p: any) => (p?.type === "text" ? p.text : p?.type === "toolCall" ? `→ ${p.name}(${JSON.stringify(p.arguments)})` : "")).join("\n") : "";
 }
 
-export async function piRig(o: { cwd: string; config?: Record<string, unknown>; home?: string; agentDir?: string; contextWindow?: number; decision?: DecisionServer; sessionFile?: string; settings?: Record<string, unknown> } = { cwd: "" }): Promise<PiRig> {
+export async function piRig(o: { cwd: string; config?: Record<string, unknown>; home?: string; agentDir?: string; contextWindow?: number; models?: Array<{ id: string; contextWindow: number; maxTokens?: number }>; decision?: DecisionServer; sessionFile?: string; settings?: Record<string, unknown> } = { cwd: "" }): Promise<PiRig> {
   const agentDir = o.agentDir ?? tmp("pi-agent-");
   const home = o.home ?? join(agentDir, "realctx2");
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -115,7 +121,13 @@ export async function piRig(o: { cwd: string; config?: Record<string, unknown>; 
     ...(o.config ?? {}),
   });
   const modelRuntime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json") });
-  const faux = fauxProvider({ models: [{ id: "faux-main", contextWindow: o.contextWindow ?? 32000, maxTokens: 4000, cost: { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 } }], tokensPerSecond: 1_000_000 });
+  const fauxModels = (o.models ?? [{ id: "faux-main", contextWindow: o.contextWindow ?? 32000, maxTokens: 4000 }]).map((m) => ({
+    id: m.id,
+    contextWindow: m.contextWindow,
+    maxTokens: m.maxTokens ?? 4000,
+    cost: { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 },
+  }));
+  const faux = fauxProvider({ models: fauxModels, tokensPerSecond: 1_000_000 });
   modelRuntime.registerNativeProvider(faux.provider);
   const rig = { main: [] as MainStep[], calls: [] as MainCall[], aux: [] as PiRig["aux"], auxCalls: [] as PiRig["auxCalls"] };
   // one dispatcher answers every request: aux sessions are recognized by their system prompt

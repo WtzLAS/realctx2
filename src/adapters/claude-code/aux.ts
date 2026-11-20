@@ -127,7 +127,7 @@ export class ClaudeAuxRunner implements AuxSessionRunner {
   /** The command line for one aux session. Exposed for tests and `doctor`. */
   args(task: AuxTask, settings: RoleSettings, system: string): { args: string[]; env: Record<string, string> } {
     const withTools = settings.tools !== "none";
-    const env: Record<string, string> = { REALCTX2_CHILD: "1" };
+    const env: Record<string, string> = { REALCTX2_CHILD: "1", REALCTX2_AUX_ROLE: task.role };
     const socket = this.env.parentSocket();
     if (socket) env.REALCTX2_PARENT_SOCKET = socket;
     const args = ["-p", "--model", settings.model ?? "haiku", "--output-format", "json", "--json-schema", JSON.stringify(task.schema), "--no-session-persistence", "--system-prompt", system];

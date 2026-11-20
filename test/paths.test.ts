@@ -382,7 +382,7 @@ describe("just-in-time delivery (§6.8.5, §6.10.2)", () => {
     expect(cmd("pnpm prisma migrate reset")!.reason).toContain("[gate] Before this command: MUST");
     expect(cmd("cd packages/api && env CI=1 prisma migrate reset --force; echo done")).not.toBeNull();
     expect(cmd("prisma migrate status")).toBeNull();
-    for (const c of ["echo x > packages/api/src/db/generated/client.ts", "sed -i 's/a/b/' packages/api/src/db/generated/client.ts", "cat a | tee packages/api/src/db/generated/client.ts", "rm packages/api/src/db/generated/client.ts", "git checkout -- packages/api/src/db/generated/client.ts", "cp x.ts packages/api/src/db/generated/client.ts", "cd packages/api/src/db && mv generated/client.ts generated/old.ts"]) {
+    for (const c of ["echo x > packages/api/src/db/generated/client.ts", "sed -i 's/a/b/' packages/api/src/db/generated/client.ts", "cat a | tee packages/api/src/db/generated/client.ts", "rm packages/api/src/db/generated/client.ts", "git checkout -- packages/api/src/db/generated/client.ts", "cp x.ts packages/api/src/db/generated/client.ts", "cd packages/api/src/db && mv generated/client.ts generated/old.ts", "mkdir -p packages/api/src/db/generated/sub"]) {
       expect(cmd(c)?.refs.map((r) => r.node.id), c).toEqual([t.never.node.id]);
     }
     expect(cmd("cat packages/api/src/db/generated/client.ts")).toBeNull();

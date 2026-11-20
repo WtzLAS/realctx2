@@ -33,10 +33,14 @@ export async function status(host: Host, io: CommandIO): Promise<void> {
   await e.rebuild().catch(() => undefined);
   const s = e.status();
   const lines: string[] = [];
-  const tail = workingTail(e.entries, e.units, host.cfg, s.window, e.state.stats.roundTokens);
-  const tailTokens = sumTokens(e.entries, tail.start, e.entries.length);
   lines.push(`realctx2 ${REALCTX2_VERSION} · ${host.adapter.harness}${host.adapter.capabilities.level === 0 ? " (append-only: consolidation takes effect at the harness's own compaction)" : ""}${host.light ? " · light mode (sub-session)" : ""}`);
-  lines.push(`Context: W = ${num(s.window)} tokens · occupancy ${num(s.occupancy)} (${pct(s.occupancy, s.window)}) · working tail ${num(tailTokens)} tokens · ${s.round} rounds · ${s.requests} requests`);
+  if (s.disabled) {
+    lines.push(`Context: disabled (maxWindow = 0) · ${s.round} rounds · ${s.requests} requests`);
+  } else {
+    const tail = workingTail(e.entries, e.units, host.cfg, s.window, e.state.stats.roundTokens, { modelName: host.adapter.modelName() });
+    const tailTokens = sumTokens(e.entries, tail.start, e.entries.length);
+    lines.push(`Context: W = ${num(s.window)} tokens · occupancy ${num(s.occupancy)} (${pct(s.occupancy, s.window)}) · working tail ${num(tailTokens)} tokens · ${s.round} rounds · ${s.requests} requests`);
+  }
   if (s.stack.length) {
     lines.push("Open intents (outermost first):");
     s.stack.forEach((i, d) => lines.push(`${"  ".repeat(d + 1)}- ${i.label} (open for ${Math.max(0, s.round - i.openedRound)} rounds) — done when: ${i.success}`));

@@ -40,11 +40,22 @@ export interface AuxTool extends Tool {
   prepareArguments?: (args: unknown) => unknown;
 }
 
-/** `reasoning` for `streamSimple`: the level clamped to what the model supports; undefined for off. */
+/** `reasoning` for `streamSimple`: the level clamped to what the model supports; undefined when off is supported or the model has no reasoning. */
 export function clampThinking(model: Model<any>, level: ThinkingLevel): Exclude<ThinkingLevel, "off"> | undefined {
-  if (level === "off" || !model.reasoning) return undefined;
+  if (!model.reasoning) return undefined;
   const map = (model.thinkingLevelMap ?? {}) as Record<string, unknown>;
-  const supported = (l: ThinkingLevel) => map[l] !== null;
+  const supported = (l: ThinkingLevel) => {
+    const mapped = map[l];
+    if (mapped === null) return false;
+    if (l === "xhigh" || l === "max") return mapped !== undefined;
+    return true;
+  };
+  if (level === "off") {
+    if (supported("off")) return undefined;
+    // Models whose thinkingLevelMap sets `off: null` (e.g. GPT-6.2 Astra/Sol in pi 1.6.0)
+    // reject reasoning effort "none": clamp up to the lowest supported thinking level.
+    return LEVELS.find(supported) as Exclude<ThinkingLevel, "off"> | undefined;
+  }
   let i = LEVELS.indexOf(level);
   // step down to the nearest supported level, then up
   for (let j = i; j >= 0; j--) if (supported(LEVELS[j]!)) return LEVELS[j] as Exclude<ThinkingLevel, "off">;

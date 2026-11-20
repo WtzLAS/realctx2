@@ -1,11 +1,18 @@
-import { describe, expect, it } from "vitest";
-import { applyProjectOverrides, DEFAULT_CONFIG, deepMerge, scaledContext } from "../src/core/config.ts";
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { afterAll, describe, expect, it } from "vitest";
+import { catalogContextWindow, warmModelCatalog } from "../src/core/catalog.ts";
+import { applyProjectOverrides, DEFAULT_CONFIG, deepMerge, diffConfig, effectiveCacheTtlSeconds, effectiveMaxWindow, isContextEngineEnabled, scaledContext } from "../src/core/config.ts";
+import { tryLock } from "../src/util/fs.ts";
 import { commandMatcher, globCompiles, pathMatcher } from "../src/util/glob.ts";
 import { findIds, parseId, randomId8 } from "../src/util/ids.ts";
 import { scanSecrets } from "../src/util/secrets.ts";
 import { analyzeCommand, normalizeCommandParts, parseShell } from "../src/util/shell.ts";
 import { estimateTokens, extractPathTokens, extractSignature, headTail, ngramOverlap, sanitize, trigramJaccard, verifyQuote } from "../src/util/text.ts";
-import { blobHash } from "../src/util/git.ts";
+import { blobHash, Git } from "../src/util/git.ts";
+import { cleanupTmp, commitAll, initRepo, tmp, write } from "./helpers/fixtures.ts";
+
+afterAll(cleanupTmp);
 
 describe("ids", () => {
   it("draws 8 base36 characters and parses bracketed forms", () => {
@@ -147,14 +154,137 @@ describe("config", () => {
     expect(config.context.rho).toBe(0.7);
     expect(report.ignored).toEqual(expect.arrayContaining(["providers.decision.url", "memory.routing.shared", "shared.ignoreActors", "evolution.policy"]));
   });
-  it("scales thresholds with the window", () => {
-    expect(scaledContext(DEFAULT_CONFIG, 200000)).toMatchObject({ W: 128000, Bmin: 4096, Tmin: 16384, deltaMin: 8192, innermostMin: 32768, maxToolResult: 19200 });
+  it("scales thresholds with the window from model catalog metadata or an explicit cap", async () => {
+    await warmModelCatalog();
+    // Default maxWindow is "auto": W follows the active model's catalog contextWindow directly.
+    expect(DEFAULT_CONFIG.context.maxWindow).toBe("auto");
+    expect(scaledContext(DEFAULT_CONFIG, 200000)).toMatchObject({ W: 200000, Bmin: 6400, Tmin: 25600, deltaMin: 12800, innermostMin: 51200, maxToolResult: 30000 });
+    expect(scaledContext(DEFAULT_CONFIG, 1000000)).toMatchObject({ W: 1000000, Bmin: 32000, Tmin: 128000, deltaMin: 64000, maxToolResult: 150000 });
     expect(scaledContext(DEFAULT_CONFIG, 32000)).toMatchObject({ W: 32000, Bmin: 2048, Tmin: 8192, deltaMin: 4096 });
+    // Unknown model window (0) falls back to 128,000.
+    expect(scaledContext(DEFAULT_CONFIG, 0)).toMatchObject({ W: 128000, Bmin: 4096, Tmin: 16384, deltaMin: 8192, innermostMin: 32768, maxToolResult: 19200 });
+    // Explicit numeric maxWindow caps W at min(modelWindow, maxWindow).
+    const capped = { ...DEFAULT_CONFIG, context: { ...DEFAULT_CONFIG.context, maxWindow: 128000 as const } };
+    expect(scaledContext(capped, 200000)).toMatchObject({ W: 128000, Bmin: 4096, Tmin: 16384, deltaMin: 8192, innermostMin: 32768, maxToolResult: 19200 });
+    expect(effectiveMaxWindow(capped, 32000)).toBe(32000);
+    // Built-in catalog lookup resolves real provider model metadata (including pi 1.6.0 GPT-6.2 models).
+    expect(catalogContextWindow("claude-opus-4-6", "anthropic")).toBe(1000000);
+    expect(catalogContextWindow("claude-sonnet-4-5", "anthropic")).toBe(200000);
+    expect(catalogContextWindow("anthropic/claude-opus-4-6")).toBe(1000000);
+    expect(catalogContextWindow("gpt-6.2-sol", "openai")).toBe(272000);
+    expect(catalogContextWindow("gpt-6.2-sol", "azure")).toBe(1050000);
+    expect(catalogContextWindow("gpt-6.2-sol", "openai-codex")).toBe(500000);
+    expect(catalogContextWindow("gpt-6.2-astra", "openai-codex")).toBe(272000);
+  });
+
+  it("supports per-model maxWindow and cacheTTL overrides and disables context engine when maxWindow is 0", () => {
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.context.maxWindow = "auto";
+    cfg.context.cacheTtlSeconds = 300;
+    cfg.context.modelMaxWindows = {
+      "openai/gpt-6.2-sol": 0,
+      "claude-opus-5-5": 160000,
+    };
+    cfg.context.modelCacheTtlSeconds = {
+      "anthropic/claude-opus-5-5": 3600,
+      "gpt-6.2-sol": 0,
+    };
+
+    // Exact provider/model match disables context engine for openai/gpt-6.2-sol
+    expect(isContextEngineEnabled(cfg, "openai/gpt-6.2-sol")).toBe(false);
+    expect(effectiveMaxWindow(cfg, 272000, "openai/gpt-6.2-sol")).toBe(0);
+    expect(scaledContext(cfg, 272000, "openai/gpt-6.2-sol")).toEqual({
+      W: 0,
+      Bmin: 0,
+      Tmin: 0,
+      deltaMin: 0,
+      innermostMin: 0,
+      maxToolResult: 0,
+    });
+    // Bare model-id fallback matches anthropic/claude-opus-5-5
+    expect(isContextEngineEnabled(cfg, "anthropic/claude-opus-5-5")).toBe(true);
+    expect(effectiveMaxWindow(cfg, 1_000_000, "anthropic/claude-opus-5-5")).toBe(160000);
+    // Unlisted model falls back to global default ("auto" -> model catalog window)
+    expect(isContextEngineEnabled(cfg, "openai/gpt-6.2-astra")).toBe(true);
+    expect(effectiveMaxWindow(cfg, 272000, "openai/gpt-6.2-astra")).toBe(272000);
+
+    // Global maxWindow = 0 disables by default, but a positive per-model override re-enables that model
+    const globalOff = structuredClone(cfg);
+    globalOff.context.maxWindow = 0;
+    expect(isContextEngineEnabled(globalOff, "openai/gpt-6.2-astra")).toBe(false);
+    expect(effectiveMaxWindow(globalOff, 272000, "openai/gpt-6.2-astra")).toBe(0);
+    expect(isContextEngineEnabled(globalOff, "anthropic/claude-opus-5-5")).toBe(true);
+    expect(effectiveMaxWindow(globalOff, 1_000_000, "anthropic/claude-opus-5-5")).toBe(160000);
+
+    // Per-model cacheTTL overrides: exact match, bare match, default fallback
+    expect(effectiveCacheTtlSeconds(cfg, "anthropic/claude-opus-5-5")).toBe(3600);
+    expect(effectiveCacheTtlSeconds(cfg, "openai/gpt-6.2-sol")).toBe(0);
+    expect(effectiveCacheTtlSeconds(cfg, "openai/gpt-6.2-astra")).toBe(300);
+
+    // Project overrides accept maxWindow = 0 and per-model maps while rejecting invalid values
+    const proj = applyProjectOverrides(DEFAULT_CONFIG, {
+      context: {
+        maxWindow: 0,
+        modelMaxWindows: { "openai/gpt-6.2-sol": 128000, "anthropic/claude-opus-5-5": 0 },
+        modelCacheTtlSeconds: { "anthropic/claude-opus-5-5": 3600 },
+      },
+    });
+    expect(proj.report.ignored).toEqual([]);
+    expect(proj.config.context.maxWindow).toBe(0);
+    expect(proj.config.context.modelMaxWindows).toEqual({ "openai/gpt-6.2-sol": 128000, "anthropic/claude-opus-5-5": 0 });
+    expect(proj.config.context.modelCacheTtlSeconds).toEqual({ "anthropic/claude-opus-5-5": 3600 });
+
+    const badProj = applyProjectOverrides(DEFAULT_CONFIG, {
+      context: { maxWindow: 500, modelMaxWindows: { "openai/gpt-6.2-sol": 100 }, modelCacheTtlSeconds: { "a/b": -5 } },
+    });
+    expect(badProj.report.ignored).toEqual(["context.maxWindow", "context.modelMaxWindows", "context.modelCacheTtlSeconds"]);
+
+    // diffConfig removes deleted model override keys instead of preserving stale keys from existingRaw
+    const cleared = structuredClone(cfg);
+    delete cleared.context.modelMaxWindows["openai/gpt-6.2-sol"];
+    const diff = diffConfig(cleared, DEFAULT_CONFIG, { context: { modelMaxWindows: { "openai/gpt-6.2-sol": 0, "claude-opus-5-5": 160000 } } });
+    expect((diff.context as any).modelMaxWindows).toEqual({ "claude-opus-5-5": 160000 });
   });
 });
 
 describe("git helpers", () => {
   it("computes git blob hashes", () => {
     expect(blobHash("hello\n")).toBe("ce013625030ba8dba906f756967f9e9ca394464a");
+  });
+
+  it("distinguishes git diff exit 1 from git errors in differsFromHead", () => {
+    const repo = initRepo();
+    write(repo, "a.txt", "one\n");
+    commitAll(repo);
+    const g = new Git(repo);
+    expect(g.differsFromHead("a.txt")).toBe(false);
+    write(repo, "a.txt", "two\n");
+    expect(g.differsFromHead("a.txt")).toBe(true);
+    // Outside a git repo (exit code > 1), differsFromHead does not report a diff.
+    const nonRepo = tmp("no-git-");
+    write(nonRepo, "a.txt", "x\n");
+    expect(new Git(nonRepo).differsFromHead("a.txt")).toBe(false);
+  });
+});
+
+describe("file locks", () => {
+  it("verifies ownership token on release and respects initialization grace for empty lock files", () => {
+    const lockPath = join(tmp("locks-"), "store.lock");
+    const first = tryLock(lockPath, 5000);
+    expect(first).not.toBeNull();
+    // Simulate a stale takeover: replace lock with a new owner's token.
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: Date.now(), token: "other-owner" }));
+    first!.release();
+    // The displaced holder must not unlink the new owner's lock.
+    expect(existsSync(lockPath)).toBe(true);
+    // A brand-new empty lock file is not stolen immediately within the grace window.
+    const initLock = join(tmp("locks-init-"), "init.lock");
+    writeFileSync(initLock, "");
+    expect(tryLock(initLock, 5000)).toBeNull();
+    // Once staleMs is 0 (past grace), an empty lock can be recovered.
+    const taken = tryLock(initLock, -1);
+    expect(taken).not.toBeNull();
+    taken!.release();
+    expect(existsSync(initLock)).toBe(false);
   });
 });

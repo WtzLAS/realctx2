@@ -1,14 +1,17 @@
 import { execFile } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { promisify } from "node:util";
 import { afterAll, describe, expect, it } from "vitest";
+import { ClaudeAdapter } from "../src/adapters/claude-code/adapter.ts";
 import { ClaudeAuxRunner, effortFor, type SpawnFn } from "../src/adapters/claude-code/aux.ts";
 import { chunk, ClaudeServer, type HookInput } from "../src/adapters/claude-code/server.ts";
 import { autoMemoryState, restoreClaudeSettings } from "../src/adapters/claude-code/settings.ts";
-import { findServer, registrations, runDir } from "../src/adapters/claude-code/socket.ts";
-import { parseTranscript } from "../src/adapters/claude-code/transcript.ts";
+import { findServer, listen, registrations, request, runDir, socketPath } from "../src/adapters/claude-code/socket.ts";
+import { SessionLog } from "../src/adapters/claude-code/state.ts";
+import { parseTranscript, TranscriptReader } from "../src/adapters/claude-code/transcript.ts";
+import { warmModelCatalog } from "../src/core/catalog.ts";
 import { Layout } from "../src/core/config.ts";
 import { resolveProject } from "../src/core/project.ts";
 import { type Answers, FakeAux, FakeDecision } from "./helpers/fakes.ts";
@@ -462,6 +465,61 @@ describe("aux sessions through the claude CLI (§4.6.4)", () => {
     await child.close();
     await parent.close();
   });
+
+  it("enforces aux Bash policy through PreToolUse hook in REALCTX2_CHILD sessions and fails closed without parent", async () => {
+    const parent = await rig();
+    await parent.hook("SessionStart", { source: "startup" });
+    await parent.mcp("tools/call", { name: "remember", arguments: { text: "Never edit files in src/db/generated.", kind: "rule", severity: "must", urgency: "immediate", scope: "personal", paths: ["src/db/generated/"] } });
+    const childEnv = { ...process.env, REALCTX2_HOME: parent.home, REALCTX2_CHILD: "1", REALCTX2_PARENT_SOCKET: parent.server.socket, REALCTX2_AUX_ROLE: "reverify" };
+    const runHook = async (event: string, payload: Record<string, unknown>, env = childEnv) => {
+      const p = exec(process.execPath, [HOOK, event], { env, timeout: 20_000 });
+      p.child.stdin!.end(JSON.stringify(payload));
+      return (await p).stdout;
+    };
+    // Denied command from aux.guard.deny
+    const denied = JSON.parse(await runHook("PreToolUse", { tool_name: "Bash", tool_input: { command: "rm -rf /tmp/foo" }, cwd: parent.repo }));
+    expect(denied.hookSpecificOutput).toMatchObject({ hookEventName: "PreToolUse", permissionDecision: "deny" });
+    expect(denied.hookSpecificOutput.permissionDecisionReason).toContain("aux.guard.deny");
+    // Write outside repo
+    const outside = JSON.parse(await runHook("PreToolUse", { tool_name: "Bash", tool_input: { command: "echo hi > /tmp/escape.txt" }, cwd: parent.repo }));
+    expect(outside.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(outside.hookSpecificOutput.permissionDecisionReason).toContain("outside the repository");
+    // Immediate memory gate
+    const gated = JSON.parse(await runHook("PreToolUse", { tool_name: "Bash", tool_input: { command: "echo x > src/db/generated/client.ts" }, cwd: parent.repo }));
+    expect(gated.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(gated.hookSpecificOutput.permissionDecisionReason).toContain("Never edit files in src/db/generated.");
+    // Safe read-only Bash command is allowed
+    expect(await runHook("PreToolUse", { tool_name: "Bash", tool_input: { command: "git status" }, cwd: parent.repo })).toBe("");
+    // Non-Bash tools and non-PreToolUse hooks stay silent in child sessions
+    expect(await runHook("PreToolUse", { tool_name: "Read", tool_input: { file_path: "src/db/schema.ts" }, cwd: parent.repo })).toBe("");
+    expect(await runHook("UserPromptSubmit", { prompt: "hello", cwd: parent.repo })).toBe("");
+    // Unreachable parent socket fails CLOSED for aux Bash
+    const dead = JSON.parse(await runHook("PreToolUse", { tool_name: "Bash", tool_input: { command: "git status" }, cwd: parent.repo }, { ...childEnv, REALCTX2_PARENT_SOCKET: join(tmp("missing-sock-"), "none.sock") }));
+    expect(dead.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(dead.hookSpecificOutput.permissionDecisionReason).toContain("unreachable");
+    await parent.close();
+  });
+
+  it("hardens Unix socket permissions, avoids symlinked socket dirs, and caps request size", async () => {
+    if (process.platform === "win32") return;
+    const base = tmp("sock-sec-");
+    const target = tmp("sock-target-");
+    symlinkSync(target, join(base, "run"));
+    const sock = socketPath(base, process.pid);
+    // Must not use the symlinked directory
+    expect(sock.startsWith(join(base, "run"))).toBe(false);
+    expect(lstatSync(join(sock, "..")).isSymbolicLink()).toBe(false);
+    expect(statSync(join(sock, "..")).mode & 0o777).toBe(0o700);
+    const srv = await listen(sock, async (req) => ({ echo: req.ok }));
+    try {
+      expect(statSync(sock).mode & 0o777).toBe(0o600);
+      expect(await request(sock, { ok: 1 }, 5000)).toEqual({ echo: 1 });
+      const big = await request(sock, { blob: "a".repeat(2 * 1024 * 1024 + 64) }, 5000);
+      expect(big).toEqual({ error: "request too large" });
+    } finally {
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+    }
+  });
 });
 
 describe("post-compaction injection", () => {
@@ -473,5 +531,17 @@ describe("post-compaction injection", () => {
     expect(parts.join("\n\n")).toBe(text);
     expect(chunk("x".repeat(25), 10)).toEqual(["x".repeat(10), "x".repeat(10), "x".repeat(5)]);
     mkdirSync(tmp(), { recursive: true });
+  });
+
+  it("resolves Claude Code model contextWindow from catalog metadata", async () => {
+    await warmModelCatalog();
+    const layout = new Layout(tmp("cc-cat-"));
+    const adapter = new ClaudeAdapter(new SessionLog(layout, "s-cat"), { reader: new TranscriptReader(), aux: () => new FakeAux(), now: () => new Date() });
+    adapter.model = "claude-opus-4-6";
+    expect(adapter.maxContextTokens()).toBe(1_000_000);
+    adapter.model = "claude-sonnet-4-5";
+    expect(adapter.maxContextTokens()).toBe(200_000);
+    adapter.model = "claude-sonnet-4-5[1m]";
+    expect(adapter.maxContextTokens()).toBe(1_000_000);
   });
 });

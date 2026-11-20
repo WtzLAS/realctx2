@@ -3,10 +3,11 @@
  * stores, providers and timers start in `session_start` and stop in an idempotent
  * `session_shutdown`. Every handler fails open: an error in realctx2 never blocks the agent.
  */
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type DecisionProviderConfig, loadGlobalConfig, normalizeEnvVarName, resolveApiKey, saveConfig } from "../../core/config.ts";
+import { type DecisionProviderConfig, Layout, loadGlobalConfig, normalizeEnvVarName, resolveApiKey, saveConfig } from "../../core/config.ts";
 import { Host } from "../../core/host.ts";
 import { SETTINGS_CATEGORIES } from "../../core/settings-schema.ts";
 import type { CommandIO, ConsolidationRecord, ContextEdit, DecisionQuestion, SessionRecord } from "../../core/types.ts";
@@ -16,7 +17,7 @@ import type { PathEvent } from "../../memory/delivery.ts";
 import { PROMPT_SECTION_ID, RULES_SECTION_ID, type ToolKey } from "../../tools/index.ts";
 import { pathEventOf } from "../pathevents.ts";
 import { loadAnySession } from "../sessions.ts";
-import { type Draft, OUTPUT_ENTRY, PiAdapter, STATUS_KEY } from "./adapter.ts";
+import { type Draft, PiAdapter, STATUS_KEY } from "./adapter.ts";
 
 export const DECISION_PROVIDER = "realctx2-decision";
 
@@ -65,6 +66,33 @@ export function applyEditsToMessages(messages: AgentMessage[], projection: Array
   return changed ? out : null;
 }
 
+/** Walk parentSession links in session file headers so `/fork` sessions can still recall parent `o:` blobs. */
+function ancestorBlobDirs(layout: Layout, sessionManager: ExtensionContext["sessionManager"]): string[] {
+  const dirs: string[] = [];
+  const seenFiles = new Set<string>();
+  const seenIds = new Set<string>([sessionManager.getSessionId()]);
+  let parentFile = sessionManager.getHeader?.()?.parentSession;
+  for (let depth = 0; depth < 8 && parentFile && !seenFiles.has(parentFile); depth++) {
+    seenFiles.add(parentFile);
+    try {
+      const raw = readFileSync(parentFile, "utf8");
+      const nl = raw.indexOf("\n");
+      const firstLine = (nl >= 0 ? raw.slice(0, nl) : raw).trim();
+      if (!firstLine) break;
+      const header = JSON.parse(firstLine) as { type?: string; id?: unknown; parentSession?: unknown };
+      if (header.type !== "session" || typeof header.id !== "string" || !header.id) break;
+      if (!seenIds.has(header.id)) {
+        seenIds.add(header.id);
+        dirs.push(layout.blobDir(header.id));
+      }
+      parentFile = typeof header.parentSession === "string" ? header.parentSession : undefined;
+    } catch {
+      break;
+    }
+  }
+  return dirs;
+}
+
 class PiExtension {
   private readonly pi: ExtensionAPI;
   private readonly adapter: PiAdapter;
@@ -74,7 +102,6 @@ class PiExtension {
   private pendingCompaction: ConsolidationRecord | null = null;
   private rechecked = false;
   private providerRegistered = false;
-  private rendererReady = false;
   private notified = new Set<string>();
 
   constructor(pi: ExtensionAPI) {
@@ -180,19 +207,33 @@ class PiExtension {
   }
 
   // ───────────── session lifecycle
-  private async onSessionStart(_event: { reason: string }, ctx: ExtensionContext): Promise<void> {
+  private resetEphemeral(): void {
+    this.events.clear();
+    this.pendingBash = [];
+    this.pendingCompaction = null;
+    this.adapter.clearDeferred();
+  }
+
+  private async onSessionStart(_event: { reason?: string; previousSessionFile?: string }, ctx: ExtensionContext): Promise<void> {
     const sm = ctx.sessionManager;
     const sessionFile = sm.getSessionFile();
     if (this.host && !this.host.isClosed) await this.host.shutdown({ spawnWorker: false }).catch(() => undefined);
+    this.resetEphemeral();
+    this.rechecked = false;
+    this.notified.clear();
     // sub-sessions started through pi's SDK (no UI and no session file) run in light mode (§4.6.7)
     const light = !ctx.hasUI && !sessionFile;
+    const layout = new Layout();
+    const parentBlobDirs = ancestorBlobDirs(layout, sm);
     const host: Host = new Host({
       adapter: this.adapter,
       cwd: ctx.cwd,
       sessionId: sm.getSessionId(),
       sessionFile,
+      parentBlobDirs,
       trusted: ctx.isProjectTrusted(),
       light,
+      layout,
       loadSession: (s) => loadAnySession(host.layout, s),
       onDecisionConfig: (cfg) => this.syncProvider(cfg),
     });
@@ -332,39 +373,83 @@ class PiExtension {
     await host.engine.rebuild().catch(() => undefined);
   }
 
-  private async onShutdown(): Promise<void> {
+  private async onShutdown(event?: { reason?: "quit" | "reload" | "new" | "resume" | "fork" }): Promise<void> {
     const host = this.host;
     if (!host) return;
     this.host = null;
-    const batch = await host.shutdown();
+    const reason = event?.reason;
+    const isReload = reason === "reload";
+    // On /new, /resume, /fork and /reload pi is immediately starting the next session in this process,
+    // so skip spawning a competing detached worker; full detached maintenance runs on quit.
+    const spawnWorker = !reason || reason === "quit";
+    const batch = await host.shutdown({ spawnWorker, reload: isReload });
     await this.adapter.commit({ records: [...this.adapter.deferred.records, ...batch.records], edits: [], messages: [] }).catch(() => undefined);
-    this.adapter.deferred = { records: [], edits: [], messages: [] };
+    this.resetEphemeral();
+    this.rechecked = false;
+    this.notified.clear();
+    this.syncProvider(null);
     this.adapter.setStatus(undefined);
-    this.events.clear();
   }
 
   // ───────────── the command
-  private print(ctx: ExtensionCommandContext, text: string): void {
-    if (ctx.mode === "tui" && this.rendererReady) {
-      try {
-        this.pi.appendEntry(OUTPUT_ENTRY, { text });
-        return;
-      } catch {
-        // fall through
-      }
+  private reportHeader(args: string): { title: string; subtitle?: string } {
+    const trimmed = args.trim();
+    if (!trimmed) return { title: "realctx2 help" };
+    const space = trimmed.search(/\s/);
+    if (space < 0) return { title: `realctx2 ${trimmed}` };
+    const sub = trimmed.slice(0, space);
+    const rest = trimmed.slice(space + 1).trim();
+    return { title: `realctx2 ${sub}`, subtitle: rest ? (rest.length > 48 ? `${rest.slice(0, 47)}…` : rest) : undefined };
+  }
+
+  private async showReport(ctx: ExtensionCommandContext, title: string, content: string, opts?: { subtitle?: string; tone?: "accent" | "error" }): Promise<void> {
+    if (ctx.mode === "tui" && ctx.hasUI) {
+      const { Realctx2ReportComponent } = await import("./report-ui.ts");
+      await ctx.ui.custom<void>(
+        (tui, theme, _keybindings, done) =>
+          new Realctx2ReportComponent({
+            title,
+            subtitle: opts?.subtitle,
+            content,
+            tone: opts?.tone,
+            onClose: () => done(undefined),
+            theme,
+            tui,
+          }),
+      );
+      return;
     }
-    if (ctx.hasUI) ctx.ui.notify(text, "info");
-    else process.stderr.write(`${text}\n`);
+    if (ctx.hasUI) ctx.ui.notify(content, opts?.tone === "error" ? "error" : "info");
+    else process.stderr.write(`${content}\n`);
   }
 
   private async openSettings(ctx: ExtensionCommandContext, host: Host, category?: string): Promise<void> {
     const { Realctx2SettingsComponent } = await import("./settings-ui.ts");
-    let availableModels: Array<{ id: string; provider: string; name?: string }> = [];
+    let availableModels: Array<{ id: string; provider: string; name?: string; contextWindow?: number }> = [];
+    let knownModels: Array<{ id: string; provider: string; name?: string; contextWindow?: number }> = [];
     try {
       const reg = ctx.modelRegistry;
-      const list = reg.getAvailable();
-      const models = list.length ? list : reg.getAll();
-      availableModels = models.map((m) => ({ id: m.id, provider: m.provider, name: m.name }));
+      const avail = reg.getAvailable();
+      const all = reg.getAll();
+      const toChoice = (m: { id: string; provider: string; name?: string; contextWindow?: number }) => ({
+        id: m.id,
+        provider: m.provider,
+        name: m.name,
+        contextWindow: typeof m.contextWindow === "number" && m.contextWindow > 0 ? m.contextWindow : undefined,
+      });
+      availableModels = (avail.length ? avail : all).map(toChoice);
+      const seen = new Set<string>();
+      const pushUnique = (m: { id: string; provider: string; name?: string; contextWindow?: number } | undefined) => {
+        if (!m?.provider || !m?.id) return;
+        const key = `${m.provider}/${m.id}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        knownModels.push(toChoice(m));
+      };
+      // Put active model and configured/available models first, then all remaining registry models.
+      pushUnique(ctx.model);
+      for (const m of avail) pushUnique(m);
+      for (const m of all) pushUnique(m);
     } catch {
       // model registry unavailable
     }
@@ -378,6 +463,7 @@ class PiExtension {
           configPath: host.layout.configFile,
           displayContext: { health: host.health() },
           availableModels,
+          knownModels,
           initialCategory: category,
           onSave: (next) => {
             saveConfig(host.layout, next);
@@ -393,16 +479,63 @@ class PiExtension {
   private async onCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
     this.adapter.bind(ctx);
     const host = this.host;
+    const isTui = ctx.mode === "tui" && ctx.hasUI;
+    const header = this.reportHeader(args);
+    const buffered: string[] = [];
+    let hasError = false;
+    let statusOverridden = false;
+    const flushReport = async (suffix?: string): Promise<void> => {
+      if (!buffered.length) return;
+      const text = buffered.splice(0).join("\n\n");
+      const tone = hasError ? "error" : "accent";
+      hasError = false;
+      const title = suffix ? `${header.title} · ${suffix}` : header.title;
+      await this.showReport(ctx, title, text, { subtitle: header.subtitle, tone });
+    };
     const io: CommandIO = {
       hasUI: ctx.hasUI,
-      print: (text) => this.print(ctx, text),
-      notify: (text, level) => ctx.ui.notify(text, level ?? "info"),
-      confirm: (title, message) => (ctx.hasUI ? ctx.ui.confirm(title, message) : Promise.resolve(false)),
-      edit: ctx.hasUI ? (title, prefill) => ctx.ui.editor(title, prefill) : undefined,
-      openSettings: host && ctx.hasUI && ctx.mode === "tui" ? (category) => this.openSettings(ctx, host, category) : undefined,
+      print: (text) => {
+        if (isTui) buffered.push(text);
+        else if (ctx.hasUI) ctx.ui.notify(text, "info");
+        else process.stderr.write(`${text}\n`);
+      },
+      notify: (text, level) => {
+        if (!isTui) {
+          ctx.ui.notify(text, level ?? "info");
+          return;
+        }
+        if (level === "error") {
+          hasError = true;
+          buffered.push(text);
+          return;
+        }
+        // Keep transient progress notices out of the chat transcript in TUI mode.
+        statusOverridden = true;
+        this.adapter.setStatus(text);
+      },
+      confirm: async (title, message) => {
+        if (isTui) await flushReport("preview");
+        return ctx.hasUI ? ctx.ui.confirm(title, message) : false;
+      },
+      edit: ctx.hasUI
+        ? async (title, prefill) => {
+            if (isTui) await flushReport();
+            return ctx.ui.editor(title, prefill);
+          }
+        : undefined,
+      openSettings: host && isTui ? (category) => this.openSettings(ctx, host, category) : undefined,
     };
-    if (!host) return io.print("realctx2 is not running in this session (it starts with the session; see the extension errors pi reported at startup).");
-    await host.command().handler(args, io);
+    if (!host) {
+      io.print("realctx2 is not running in this session (it starts with the session; see the extension errors pi reported at startup).");
+      await flushReport();
+      return;
+    }
+    try {
+      await host.command().handler(args, io);
+    } finally {
+      if (statusOverridden) host.updateStatus();
+      await flushReport();
+    }
   }
 
   async install(): Promise<void> {
@@ -448,9 +581,37 @@ class PiExtension {
       }),
     );
     pi.on(
+      "session_before_switch",
+      this.safe("session_before_switch", () => {
+        this.host?.noteInput();
+        this.pendingCompaction = null;
+        return undefined;
+      }),
+    );
+    pi.on(
+      "session_before_fork",
+      this.safe("session_before_fork", () => {
+        this.host?.noteInput();
+        this.pendingCompaction = null;
+        return undefined;
+      }),
+    );
+    pi.on(
+      "session_before_tree",
+      this.safe("session_before_tree", () => {
+        // Abort idle maintenance/Precip before navigating so nothing writes to the outgoing branch.
+        this.host?.noteInput();
+        this.pendingCompaction = null;
+        return undefined;
+      }),
+    );
+    pi.on(
       "session_tree",
       this.safe("session_tree", async () => {
-        // all session state is branch-relative: rebuild it from the new active branch
+        // All session state is branch-relative: drop any stale pending state from the old branch,
+        // then rebuild cleanly from the new active branch.
+        this.host?.noteInput();
+        this.resetEphemeral();
         await this.host?.engine.rebuild();
         this.host?.updateStatus();
         return undefined;
@@ -459,11 +620,11 @@ class PiExtension {
     pi.on(
       "model_select",
       this.safe("model_select", () => {
-        this.host?.updateStatus(); // W follows the new model's context window
+        this.host?.updateStatus(); // W follows the new model's context window from catalog metadata
         return undefined;
       }),
     );
-    pi.on("session_shutdown", this.safe("session_shutdown", () => this.onShutdown()));
+    pi.on("session_shutdown", this.safe("session_shutdown", (e) => this.onShutdown(e)));
 
     pi.registerCommand("realctx2", {
       description: "Context and memory manager: status, settings, search, review, ingest, forget, doctor…",
@@ -490,22 +651,10 @@ class PiExtension {
           await this.onCommand(args, ctx);
         } catch (e) {
           this.fail("command", e);
-          ctx.ui.notify(`/realctx2 failed: ${String((e as Error).message ?? e)}`, "error");
+          await this.showReport(ctx, "realctx2 error", `/realctx2 failed: ${String((e as Error).message ?? e)}`, { tone: "error" });
         }
       },
     });
-
-    // command output is TUI-only: a custom entry with a renderer never reaches the model
-    try {
-      const tui = (await import("@earendil-works/pi-tui")) as unknown as { Text: new (text: string, paddingX?: number, paddingY?: number) => unknown };
-      pi.registerEntryRenderer(OUTPUT_ENTRY, ((entry: { data?: unknown }, _options: unknown, theme: { fg(color: string, text: string): string }) => {
-        const text = String((entry.data as { text?: unknown } | undefined)?.text ?? "");
-        return new tui.Text(`${theme.fg("accent", "realctx2")}\n${text}`, 1, 0);
-      }) as never);
-      this.rendererReady = true;
-    } catch {
-      // no TUI package in this host: output goes through notifications
-    }
   }
 }
 

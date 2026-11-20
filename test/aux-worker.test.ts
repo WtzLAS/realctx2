@@ -302,13 +302,43 @@ describe("aux sessions in pi (§9.3.3)", () => {
     expect((await spend.r.run({ role: "reverify", instructions: "c", data: [], schema })).output).toEqual({ verdict: "holds" });
   });
 
-  it("clamps the thinking level to what the model supports", () => {
+  it("clamps the thinking level to what the model supports", async () => {
     const m = (reasoning: boolean, map?: Record<string, unknown>) => ({ reasoning, thinkingLevelMap: map }) as unknown as Model<any>;
     expect(clampThinking(m(false), "high")).toBeUndefined();
     expect(clampThinking(m(true), "off")).toBeUndefined();
     expect(clampThinking(m(true), "medium")).toBe("medium");
+    expect(clampThinking(m(true), "max")).toBe("high");
     expect(clampThinking(m(true, { xhigh: null, max: null }), "max")).toBe("high");
     expect(clampThinking(m(true, { minimal: null, low: null }), "minimal")).toBe("medium");
+    // pi 1.6.0 GPT-6.2 Astra/Sol reject reasoning effort "none" (`off: null`):
+    // clamp up to the lowest supported thinking level instead of omitting reasoning.
+    const gpt62 = m(true, { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
+    expect(clampThinking(gpt62, "off")).toBe("low");
+    expect(clampThinking(gpt62, "minimal")).toBe("low");
+    expect(clampThinking(gpt62, "max")).toBe("max");
+    const gpt62Codex = m(true, { off: null, minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
+    expect(clampThinking(gpt62Codex, "off")).toBe("minimal");
+    // End-to-end: an `off`-thinking role on a model with `off: null` passes `reasoning: "low"` and no `temperature: 0`.
+    const seen: Array<Record<string, unknown>> = [];
+    const mandatory = { id: "gpt-6.2-sol", provider: "openai", reasoning: true, maxTokens: 128000, cost: { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 }, thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } } as unknown as Model<any>;
+    const r = new PiAuxRunner(testConfig({}), {
+      registry: () => ({
+        find: () => undefined,
+        streamSimple: (_m: Model<any>, _ctx: Context, opts: Record<string, unknown>) => {
+          seen.push(opts);
+          return { result: async () => ({ role: "assistant", content: [{ type: "text", text: '{"verdict":"holds"}' }], stopReason: "stop", usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 }, timestamp: 0 }) as unknown as AssistantMessage };
+        },
+      }) as never,
+      model: () => mandatory,
+      cwd: () => process.cwd(),
+      root: () => null,
+      memory: () => null,
+      ownTools: () => [],
+    });
+    const out = await r.run({ role: "janus.scribe", instructions: "n", data: [], schema });
+    expect(out.output).toEqual({ verdict: "holds" });
+    expect(seen[0]).toMatchObject({ reasoning: "low" });
+    expect(seen[0]!.temperature).toBeUndefined();
   });
 });
 

@@ -38,7 +38,7 @@
     "@earendil-works/pi-tui": { "optional": true }
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@earendil-works/pi-coding-agent": "1.6.0",
     "@types/node": "^22.19.0",
     "@types/picomatch": "^4.0.0",
     "typescript": "^5.9.0",

@@ -6,6 +6,7 @@
  * Entries come from the transcript file, which can lag the live conversation by a turn; what
  * hooks have already reported is laid over it under the same ids.
  */
+import { catalogContextWindow } from "../../core/catalog.ts";
 import type { Config } from "../../core/config.ts";
 import type { Telemetry } from "../../core/telemetry.ts";
 import type { AuxSessionRunner, CommandDef, CommitBatch, EntryView, GuidanceMessage, HarnessAdapter, ModelPricing, SessionRecord, ToolCallView, ToolDef } from "../../core/types.ts";
@@ -183,7 +184,9 @@ export class ClaudeAdapter implements HarnessAdapter {
   }
 
   maxContextTokens(): number {
-    return /\[1m\]|-1m\b/i.test(this.model) ? 1_000_000 : 200_000;
+    if (/\[1m\]|-1m\b/i.test(this.model)) return 1_000_000;
+    const fromCatalog = catalogContextWindow(this.model, "anthropic");
+    return fromCatalog > 0 ? fromCatalog : 200_000;
   }
 
   pricing(): ModelPricing | null {

@@ -164,6 +164,12 @@ describe("turn index", () => {
     expect(chunks.length).toBeGreaterThan(3);
     for (const c of chunks) expect(estimateTokens(c)).toBeLessThanOrEqual(560);
     expect(chunks.join("\n")).toBe(long);
+    // Non-ASCII text (1 token per char) and surrogate pairs must still stay under maxTokens without splitting pairs.
+    const cjk = "漢".repeat(1200) + "🚀".repeat(200);
+    const nonAsciiChunks = chunkText(cjk, 256);
+    expect(nonAsciiChunks.length).toBeGreaterThanOrEqual(6);
+    expect(nonAsciiChunks.join("")).toBe(cjk);
+    for (const c of nonAsciiChunks) expect(estimateTokens(c)).toBeLessThanOrEqual(256);
     for (let i = 0; i < 6; i++) ti.addRaw({ session: "s1", harness: "pi", entryId: `e${i}`, at: `2026-11-01T00:0${i}:00.000Z`, text: i === 3 ? long : `entry ${i} talks about migrations step${i}`, role: i % 2 ? "assistant" : "user", seq: i });
     ti.addRaw({ session: "s2", harness: "claude-code", entryId: "e0", at: "2026-10-01T00:00:00.000Z", text: "an earlier session mentioned NEEDLE_xyzzy too", seq: 0 });
     ti.addConsolidation({ id: "t:c7f3a2e8", session: "s1", harness: "pi", kind: "precip", at: "2026-11-01T01:00:00.000Z", text: "[t:c7f3a2e8] Fixed the migrations ordering bug." });

@@ -28,10 +28,16 @@ export interface BlobMeta {
 /** Sidecar store for oversized tool outputs: `sessions/<sid>/blobs/<sha256>`. */
 export class BlobStore {
   readonly dir: string | null;
+  readonly fallbackDirs: string[];
   private mem = new Map<string, { meta: BlobMeta; text: string }>();
 
-  constructor(dir: string | null) {
+  constructor(dir: string | null, fallbackDirs: string[] = []) {
     this.dir = dir;
+    this.fallbackDirs = fallbackDirs.filter((d) => d && d !== dir);
+  }
+
+  private readDirs(): string[] {
+    return this.dir ? [this.dir, ...this.fallbackDirs] : this.fallbackDirs;
   }
 
   put(text: string, meta: { tool?: string; toolCallId?: string; at: string }): BlobMeta {
@@ -48,25 +54,43 @@ export class BlobStore {
 
   meta(id: string): BlobMeta | null {
     const key = id.replace(/^\[|\]$/g, "");
-    if (!this.dir) return this.mem.get(key)?.meta ?? null;
-    return readJson<BlobMeta | null>(join(this.dir, `${key.slice(2)}.json`), null);
+    if (!this.dir && !this.fallbackDirs.length) return this.mem.get(key)?.meta ?? null;
+    for (const d of this.readDirs()) {
+      const m = readJson<BlobMeta | null>(join(d, `${key.slice(2)}.json`), null);
+      if (m) return m;
+    }
+    return this.mem.get(key)?.meta ?? null;
   }
 
   read(id: string): string | null {
     const key = id.replace(/^\[|\]$/g, "");
-    if (!this.dir) return this.mem.get(key)?.text ?? null;
-    const m = this.meta(key);
-    if (!m) return null;
-    try {
-      return readFileSync(join(this.dir, m.sha), "utf8");
-    } catch {
-      return null;
+    if (!this.dir && !this.fallbackDirs.length) return this.mem.get(key)?.text ?? null;
+    for (const d of this.readDirs()) {
+      const m = readJson<BlobMeta | null>(join(d, `${key.slice(2)}.json`), null);
+      if (!m) continue;
+      try {
+        return readFileSync(join(d, m.sha), "utf8");
+      } catch {
+        // continue to fallback dirs
+      }
     }
+    return this.mem.get(key)?.text ?? null;
   }
 
   list(): BlobMeta[] {
-    if (!this.dir) return [...this.mem.values()].map((x) => x.meta);
-    return listFiles(this.dir, ".json").map((f) => readJson<BlobMeta | null>(join(this.dir!, f), null)).filter((m): m is BlobMeta => m !== null);
+    if (!this.dir && !this.fallbackDirs.length) return [...this.mem.values()].map((x) => x.meta);
+    const seen = new Set<string>();
+    const out: BlobMeta[] = [];
+    for (const d of this.readDirs()) {
+      for (const f of listFiles(d, ".json")) {
+        const m = readJson<BlobMeta | null>(join(d, f), null);
+        if (m && !seen.has(m.id)) {
+          seen.add(m.id);
+          out.push(m);
+        }
+      }
+    }
+    return out;
   }
 }
 

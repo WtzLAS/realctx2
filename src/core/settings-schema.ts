@@ -37,6 +37,8 @@ export interface ScalarSetting {
   options?: EnumOption[];
   placeholder?: string;
   nullLabel?: string;
+  /** When set, `0` is accepted even when `min > 0` and displayed with this label (e.g. `"0 (disabled)"`). */
+  zeroLabel?: string;
   /** True when the setting takes effect on the next session rather than live. */
   restart?: boolean;
   /** True when pi's model registry picker should be offered for this field. */
@@ -73,6 +75,26 @@ export interface StringMapSetting {
   restart?: boolean;
 }
 
+export interface ModelOverridesSetting {
+  kind: "model-overrides";
+  path: string;
+  label: string;
+  description: string;
+  /** Unit displayed after numeric values (e.g. `"tokens"`, `"sec"`). */
+  unit?: string;
+  /** Minimum positive numeric value (e.g. `8192` for maxWindow, `0` for cacheTTL). */
+  min: number;
+  /** Maximum numeric value. */
+  max: number;
+  /** When set, `0` is accepted even when `min > 0` and displayed with this label (e.g. `"0 (disabled)"`). */
+  zeroLabel?: string;
+  /** Human-readable summary of the global default value shown on the dedicated screen. */
+  defaultSummary: (cfg: Config) => string;
+  /** Show each model's catalog context window next to its name when available. */
+  showContextWindow?: boolean;
+  restart?: boolean;
+}
+
 export interface SubscreenEntry {
   kind: "subscreen";
   id: string;
@@ -92,7 +114,7 @@ export interface ActionEntry {
   description: string;
 }
 
-export type EditableSetting = ScalarSetting | StringListSetting | StringMapSetting;
+export type EditableSetting = ScalarSetting | StringListSetting | StringMapSetting | ModelOverridesSetting;
 export type SettingEntry = EditableSetting | SubscreenEntry | ActionEntry;
 
 export interface SettingSection {
@@ -286,7 +308,47 @@ function formatNum(n: number): string {
 }
 
 export function isScalarSetting(entry: SettingEntry): entry is ScalarSetting {
-  return entry.kind !== "subscreen" && entry.kind !== "action" && entry.kind !== "string-list" && entry.kind !== "multi-enum" && entry.kind !== "string-map";
+  return (
+    entry.kind !== "subscreen" &&
+    entry.kind !== "action" &&
+    entry.kind !== "string-list" &&
+    entry.kind !== "multi-enum" &&
+    entry.kind !== "string-map" &&
+    entry.kind !== "model-overrides"
+  );
+}
+
+export function formatModelOverrideValue(entry: ModelOverridesSetting, value: "auto" | number | undefined): string {
+  if (value === undefined || value === "auto") return "auto";
+  if (value === 0 && entry.zeroLabel) return entry.zeroLabel;
+  return entry.unit ? `${formatNum(value)} ${entry.unit}` : formatNum(value);
+}
+
+export function parseModelOverrideInput(
+  entry: ModelOverridesSetting,
+  raw: string,
+): { ok: true; value: "auto" | number } | { ok: false; error: string } {
+  const trimmed = raw.trim();
+  const lower = trimmed.toLowerCase();
+  if (trimmed === "" || lower === "auto" || lower === "default") return { ok: true, value: "auto" };
+  if (entry.zeroLabel && (lower === "off" || lower === "disable" || lower === "disabled")) return { ok: true, value: 0 };
+  const n = Number(trimmed.replace(/,/g, ""));
+  if (!Number.isFinite(n)) {
+    return {
+      ok: false,
+      error: entry.zeroLabel ? 'Enter "auto", 0 (disable), or a whole number' : 'Enter "auto" or a whole number',
+    };
+  }
+  if (!Number.isInteger(n)) return { ok: false, error: "Must be a whole integer" };
+  if (n === 0 && entry.zeroLabel) return { ok: true, value: 0 };
+  if (n < entry.min) {
+    return {
+      ok: false,
+      error: entry.zeroLabel ? `Must be 0 (disable) or ≥ ${entry.min}` : `Must be ≥ ${entry.min}`,
+    };
+  }
+  if (n > entry.max) return { ok: false, error: `Must be ≤ ${entry.max}` };
+  return { ok: true, value: n };
 }
 
 export function formatSettingValue(entry: EditableSetting, value: unknown): string {
@@ -301,6 +363,11 @@ export function formatSettingValue(entry: EditableSetting, value: unknown): stri
     const n = Object.keys(map).length;
     return n === 0 ? "(none)" : `${n} header${n === 1 ? "" : "s"}`;
   }
+  if (entry.kind === "model-overrides") {
+    const map = value && typeof value === "object" ? (value as Record<string, "auto" | number>) : {};
+    const n = Object.values(map).filter((v) => v !== "auto" && v !== undefined).length;
+    return n === 0 ? "auto (all models)" : `${n} override${n === 1 ? "" : "s"}`;
+  }
   if (!isScalarSetting(entry)) return String(value ?? "");
   const scalar = entry;
   if (scalar.kind === "boolean") return value ? "true" : "false";
@@ -314,6 +381,7 @@ export function formatSettingValue(entry: EditableSetting, value: unknown): stri
   }
   if (scalar.kind === "number-or-auto") {
     if (value === "auto") return "auto";
+    if (value === 0 && scalar.zeroLabel) return scalar.zeroLabel;
     if (typeof value === "number") return scalar.unit ? `${formatNum(value)} ${scalar.unit}` : formatNum(value);
     return String(value);
   }
@@ -349,10 +417,17 @@ export function parseSettingInput(entry: ScalarSetting, raw: string): { ok: true
     return { ok: true, value: trimmed };
   }
   if (entry.kind === "number-or-auto") {
-    if (trimmed === "" || trimmed.toLowerCase() === "auto") return { ok: true, value: "auto" };
+    const lower = trimmed.toLowerCase();
+    if (trimmed === "" || lower === "auto") return { ok: true, value: "auto" };
+    if (entry.zeroLabel && (lower === "off" || lower === "disable" || lower === "disabled")) return { ok: true, value: 0 };
     const n = Number(trimmed.replace(/,/g, ""));
-    if (!Number.isFinite(n)) return { ok: false, error: 'Enter "auto" or a valid number' };
-    if (entry.min !== undefined && n < entry.min) return { ok: false, error: `Must be ≥ ${entry.min}` };
+    if (!Number.isFinite(n)) {
+      return { ok: false, error: entry.zeroLabel ? 'Enter "auto", 0 (disable), or a valid number' : 'Enter "auto" or a valid number' };
+    }
+    if (n === 0 && entry.zeroLabel) return { ok: true, value: 0 };
+    if (entry.min !== undefined && n < entry.min) {
+      return { ok: false, error: entry.zeroLabel ? `Must be 0 (disable) or ≥ ${entry.min}` : `Must be ≥ ${entry.min}` };
+    }
     if (entry.max !== undefined && n > entry.max) return { ok: false, error: `Must be ≤ ${entry.max}` };
     return { ok: true, value: n };
   }
@@ -391,6 +466,30 @@ export function stepSettingValue(cfg: Config, entry: ScalarSetting, dir: -1 | 1)
     const idx = Math.max(0, values.indexOf(curVal));
     const nextIdx = (idx + dir + values.length) % values.length;
     return { changed: true, next: setSettingValue(cfg, entry, values[nextIdx]) };
+  }
+  if (entry.kind === "number-or-auto" && entry.step) {
+    if (cur === "auto") {
+      const base = entry.path === "context.maxWindow" ? 128000 : (entry.min ?? 0);
+      let v = Math.round(base + dir * entry.step);
+      if (entry.min !== undefined) v = Math.max(entry.min, v);
+      if (entry.max !== undefined) v = Math.min(entry.max, v);
+      return { changed: true, next: setSettingValue(cfg, entry, v) };
+    }
+    if (typeof cur === "number") {
+      if (cur === 0 && entry.zeroLabel) {
+        if (dir < 0) return { changed: true, next: setSettingValue(cfg, entry, "auto") };
+        return { changed: true, next: setSettingValue(cfg, entry, entry.min ?? entry.step) };
+      }
+      const raw = Number((cur + dir * entry.step).toFixed(6));
+      if (dir < 0 && entry.min !== undefined && raw < entry.min) {
+        return { changed: true, next: setSettingValue(cfg, entry, entry.zeroLabel ? 0 : "auto") };
+      }
+      let v = entry.step >= 1 ? Math.round(raw) : raw;
+      if (entry.min !== undefined) v = Math.max(entry.min, v);
+      if (entry.max !== undefined) v = Math.min(entry.max, v);
+      if (v === cur) return { changed: false, next: cfg };
+      return { changed: true, next: setSettingValue(cfg, entry, v) };
+    }
   }
   if ((entry.kind === "number" || entry.kind === "integer") && typeof cur === "number" && entry.step) {
     let v = Number((cur + dir * entry.step).toFixed(6));
@@ -1125,7 +1224,7 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
     title: "Context",
     aliases: ["ctx", "janus", "palim", "precip", "climb"],
     description: "Tune context window sizing, working tail protection, Precip and Palim consolidation thresholds, climb policy, Janus intent tracking, and credit attribution.",
-    summary: (cfg) => `W=${Math.round(cfg.context.maxWindow / 1000)}k · ρ=${cfg.context.rho} · climb: ${cfg.context.climb.enabled ? "on" : "off"} · janus: ${cfg.janus.timeoutMs}ms`,
+    summary: (cfg) => `W=${cfg.context.maxWindow === "auto" ? "auto" : cfg.context.maxWindow === 0 ? "off" : `${Math.round(cfg.context.maxWindow / 1000)}k`} · ρ=${cfg.context.rho} · climb: ${cfg.context.climb.enabled ? "on" : "off"} · janus: ${cfg.janus.timeoutMs >= 1000 && cfg.janus.timeoutMs % 1000 === 0 ? `${cfg.janus.timeoutMs / 1000}s` : `${cfg.janus.timeoutMs}ms`}`,
     build: () => ({
       id: "context",
       title: "Context Engine",
@@ -1136,14 +1235,32 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
           title: "Window & Working Tail",
           items: [
             {
-              kind: "integer",
+              kind: "number-or-auto",
               path: "context.maxWindow",
               label: "Max effective window (maxWindow)",
-              description: "Upper cap on the effective working context window W = min(model window, maxWindow). Bmin, Tmin and deltaMin scale proportionally when W differs from 128,000.",
+              description: 'Effective working context window W: "auto" uses the active model\'s contextWindow from the model catalog metadata; a number caps W at min(model window, maxWindow); 0 disables the context engine. Bmin, Tmin and deltaMin scale proportionally with W/128,000.',
               unit: "tokens",
+              zeroLabel: "0 (disabled)",
               min: 8192,
               max: 2_000_000,
               step: 8192,
+            },
+            {
+              kind: "model-overrides",
+              path: "context.modelMaxWindows",
+              label: "Per-model maxWindow overrides",
+              description: 'Override maxWindow for individual models: "auto" inherits the default maxWindow, 0 disables the context engine for that model, or enter a token cap ≥ 8,192.',
+              unit: "tokens",
+              zeroLabel: "0 (disabled)",
+              min: 8192,
+              max: 2_000_000,
+              showContextWindow: true,
+              defaultSummary: (cfg) =>
+                cfg.context.maxWindow === "auto"
+                  ? "auto (model catalog)"
+                  : cfg.context.maxWindow === 0
+                    ? "0 (disabled)"
+                    : `${formatNum(cfg.context.maxWindow)} tokens`,
             },
             {
               kind: "number",
@@ -1300,6 +1417,16 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
               step: 60,
             },
             {
+              kind: "model-overrides",
+              path: "context.modelCacheTtlSeconds",
+              label: "Per-model cacheTTL overrides",
+              description: 'Override the prompt-cache TTL in seconds for individual models: "auto" inherits Provider cache TTL, or enter seconds ≥ 0 (e.g. 3600 for 1-hour caches).',
+              unit: "sec",
+              min: 0,
+              max: 86_400,
+              defaultSummary: (cfg) => `${formatNum(cfg.context.cacheTtlSeconds)} sec`,
+            },
+            {
               kind: "number",
               path: "context.prepareFraction",
               label: "Prepare fold occupancy fraction",
@@ -1404,8 +1531,8 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
               description: "Wall-clock timeout (ms) for Janus decision calls before failing safe (continue without closing). Janus never retries.",
               unit: "ms",
               min: 100,
-              max: 60_000,
-              step: 250,
+              max: 300_000,
+              step: 1_000,
             },
             {
               kind: "integer",
@@ -1414,8 +1541,8 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
               description: "Milliseconds to wait for an in-flight Janus response at a commit boundary before proceeding and applying the answer at the next commit point.",
               unit: "ms",
               min: 0,
-              max: 10_000,
-              step: 50,
+              max: 120_000,
+              step: 1_000,
             },
             {
               kind: "integer",

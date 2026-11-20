@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { BlobStore, guardToolResult, paginate, pickPage, reachableEntries, renderLayer } from "../src/context/archive.ts";
+import { planReplace } from "../src/context/consolidate.ts";
 import { GUIDANCE_TYPE } from "../src/context/render.ts";
 import { SessionState } from "../src/context/state.ts";
 import type { AuxTask, ConsolidationRecord, EntryView } from "../src/core/types.ts";
@@ -559,13 +560,13 @@ describe("oversized tool results (§5.4.6)", () => {
 });
 
 describe("memory in the loop", () => {
-  async function setup(over: { embeddings?: "none" | "dense" } = {}): Promise<{ w: World; mem: MemoryRuntime; s: Session; plan: ReturnType<typeof director>; repo: string }> {
+  async function setup(over: { embeddings?: "none" | "dense"; cfg?: Record<string, unknown> } = {}): Promise<{ w: World; mem: MemoryRuntime; s: Session; plan: ReturnType<typeof director>; repo: string }> {
     const repo = initRepo();
     write(repo, "src/db/schema.ts", "export const users = { deletedAt: null };\n");
     write(repo, "src/db/generated/client.ts", "// generated\n");
     write(repo, "src/auth/tokenCache.ts", "export class TokenCache { refresh() {} }\n");
     commitAll(repo);
-    const w = world({ cwd: repo, cfg: { context: { maxWindow: 32000 }, janus: { lateWaitMs: 30 } }, embeddings: over.embeddings });
+    const w = world({ cwd: repo, cfg: { context: { maxWindow: 32000 }, janus: { lateWaitMs: 30 }, ...(over.cfg ?? {}) }, embeddings: over.embeddings });
     w.close();
     const mem = new MemoryRuntime({ layout: w.layout, cfg: w.cfg, cwd: repo, trusted: true, decision: w.decision, aux: w.aux, dense: w.dense, clock: w.clock, sessionId: "sess-test", harness: "test", random: () => 0.99 });
     const s = new Session({ world: w, memory: mem });
@@ -780,5 +781,85 @@ describe("memory in the loop", () => {
     expect(s.decision.sites().filter((x) => x === "janus")).toEqual([]);
     expect(s.engine.state.stack).toEqual([]);
     mem.shutdown();
+  });
+
+  it("disables the context engine when maxWindow is 0 while keeping memory path delivery and gate active", async () => {
+    const { mem, w } = await setup({ cfg: { context: { maxWindow: 0 } } });
+    const s = new Session({ world: w, memory: mem });
+    await s.start();
+    const rule = await remember(mem, "Never drop database tables without a backup.", { kind: "rule", severity: "must", urgency: "immediate", paths: ["src/db/"] });
+
+    expect(s.engine.contextEnabled()).toBe(false);
+    expect(s.engine.window()).toBe(0);
+    expect(s.engine.status().disabled).toBe(true);
+
+    // Path memories mentioned in prompt still deliver, but Janus is not called
+    const b = await s.user("inspect src/db/schema.ts");
+    expect(b.messages[0]!.content).toContain(`[m:${rule}]`);
+    expect(s.decision.sites().filter((x) => x === "janus")).toEqual([]);
+    expect(s.engine.state.stack).toEqual([]);
+
+    // Huge tool output is NOT archived by oversize guard when context engine is disabled
+    const huge = "x".repeat(60_000);
+    await s.round("reading large file", [{ name: "read", args: { path: "src/db/schema.ts" }, output: huge }]);
+    const toolEntry = (await s.h.listEntries()).find((e) => e.kind === "toolResult")!;
+    expect(toolEntry.text).toContain(huge);
+    expect(toolEntry.text).not.toContain("[o:");
+
+    // Pre-edit memory gate still fires when editing a path with an unseen immediate rule
+    await remember(mem, "Never modify tokenCache without rotating signing keys.", { kind: "rule", severity: "must", urgency: "immediate", paths: ["src/auth/"] });
+    const gate = await s.engine.onToolCall({ toolCallId: "tc-gate", event: { action: "edit", paths: ["src/auth/tokenCache.ts"] }, nested: false, own: false });
+    expect(gate).not.toBeNull();
+
+    // Context edits, compaction override, and reinjection are all disabled
+    expect(await s.engine.onContext()).toBeNull();
+    expect(await s.engine.onBeforeCompact({ tokensBefore: 100_000 })).toBeNull();
+    expect(s.engine.reinjection()).toBe("");
+    expect(s.decision.sites().filter((x) => x === "janus")).toEqual([]);
+    mem.shutdown();
+  });
+
+  it("respects per-model cacheTTL overrides in onContext cold-cache detection", async () => {
+    const repo = tmp("ctx-model-ttl-");
+    const w = world({
+      cwd: repo,
+      cfg: {
+        context: {
+          maxWindow: 32000,
+          cacheTtlSeconds: 300,
+          modelCacheTtlSeconds: { "test/main": 3600 },
+        },
+      },
+    });
+    const s = new Session({ world: w });
+    await s.start();
+    // Seed 3 rounds where rounds 1-2 exceed Bmin so round 0 sits strictly before workingTail
+    await s.round("work0", [{ name: "read", args: { path: "a.ts" }, output: "hello" }]);
+    await s.round("work1", work(1, 1500));
+    await s.round("work2", work(2, 1500));
+    const entries = await s.h.listEntries();
+    const u0 = s.engine.units[0]!;
+    const coldPlan = planReplace(entries, s.engine.state, u0.start, u0.end, {
+      id: "t:cold0001",
+      kind: "palim",
+      text: "summary",
+      telos: [],
+      model: "test/main",
+      now: new Date(w.now.t).toISOString(),
+    })!;
+    expect(coldPlan).toBeTruthy();
+    (s.engine as any).foldJobs.set("cold:0", { key: "cold:0", kind: "cold", level: 0, done: true, plan: coldPlan, promise: Promise.resolve() });
+    (s.engine as any).lastRequestAt = w.now.t;
+
+    // At +600s (past global 300s default, but below model override 3600s): cache is still warm -> no fold applied
+    w.now.t += 600_000;
+    expect(await s.engine.onContext()).toBeNull();
+    expect((s.engine as any).foldJobs.has("cold:0")).toBe(true);
+
+    // At +3601s from lastRequestAt: cache is cold under the model override -> cold fold is applied
+    (s.engine as any).lastRequestAt = w.now.t - 3_601_000;
+    const edits = await s.engine.onContext();
+    expect(edits).not.toBeNull();
+    expect((s.engine as any).foldJobs.has("cold:0")).toBe(false);
   });
 });

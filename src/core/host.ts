@@ -15,6 +15,7 @@ import { EmulatedDecisionClient, type FetchLike, HttpDecisionClient, ResilientDe
 import { createEmbeddingClients } from "../providers/embedding.ts";
 import { buildTools, promptSection, type ToolEnv, type ToolKey } from "../tools/index.ts";
 import { ensureDir } from "../util/fs.ts";
+import { warmModelCatalog } from "./catalog.ts";
 import { type Config, type DecisionProviderConfig, Layout, loadConfig, type ProjectOverrideReport } from "./config.ts";
 import { type ProjectInfo, resolveProject } from "./project.ts";
 import { Telemetry } from "./telemetry.ts";
@@ -27,6 +28,8 @@ export interface HostOptions {
   sessionId: string;
   /** pi session file or Claude Code transcript path (registered for `where: "project"` search). */
   sessionFile?: string;
+  /** Ancestor session blob directories (for `/fork` sessions so `recall(o:…)` finds parent blobs). */
+  parentBlobDirs?: string[];
   /** Whether project-local files may be loaded: the shared store and project config (§7.12). */
   trusted: boolean;
   /** Sub-sessions and subagents: path memories, the gate and the tools, but no Janus or Precip (§4.6.7). */
@@ -150,7 +153,7 @@ export class Host {
       this.telemetry.event("memory.open_failed", { error: this.memoryError });
     }
     this.memory = memory;
-    this.blobs = new BlobStore(this.layout.blobDir(o.sessionId));
+    this.blobs = new BlobStore(this.layout.blobDir(o.sessionId), o.parentBlobDirs);
     this.engine = new ContextEngine({ adapter: o.adapter, cfg: this.cfg, decision: this.decision, sessionId: o.sessionId, memory, blobs: this.blobs, telemetry: this.telemetry, clock: this.clock, light: this.light });
     this.env = {
       cfg: this.cfg,
@@ -232,6 +235,7 @@ export class Host {
 
   // ───────────── session start (§4.2)
   async start(): Promise<void> {
+    await warmModelCatalog();
     if (this.started) {
       await this.engine.rebuild();
       return;
@@ -314,8 +318,7 @@ export class Host {
   updateStatus(): void {
     try {
       const s = this.engine.status();
-      const pct = s.window > 0 ? Math.round((s.occupancy / s.window) * 100) : 0;
-      const parts = [`ctx ${pct}%`];
+      const parts = [s.disabled ? "ctx off" : `ctx ${s.window > 0 ? Math.round((s.occupancy / s.window) * 100) : 0}%`];
       if (s.stack.length) parts.push(`${s.stack.length} intent${s.stack.length > 1 ? "s" : ""}`);
       const cards = this.engine.state.deliveries.filter((d) => d.kind === "card" && !this.engine.state.attributed.has(d.deliveryId)).length;
       if (cards) parts.push(`${cards} card${cards > 1 ? "s" : ""}`);
@@ -418,12 +421,12 @@ export class Host {
    * model-dependent work that has not run, 4. spawn the model-free worker, detached.
    * Returns the last records for the adapter to persist. Idempotent.
    */
-  async shutdown(opts: { spawnWorker?: boolean } = {}): Promise<CommitBatch> {
+  async shutdown(opts: { spawnWorker?: boolean; reload?: boolean } = {}): Promise<CommitBatch> {
     if (this.closed) return emptyBatch();
     this.noteInput();
     let batch = emptyBatch();
     try {
-      batch = await this.engine.onShutdown();
+      batch = await this.engine.onShutdown({ reload: opts.reload });
     } catch (e) {
       this.telemetry.event("shutdown.engine_failed", { error: String((e as Error).message ?? e) });
     }
@@ -432,7 +435,7 @@ export class Host {
     const s = this.engine.status();
     if (mem) {
       try {
-        if (!this.light) {
+        if (!this.light && !opts.reload) {
           const state = this.engine.state;
           const pending = [...state.records.values()].filter((r) => r.kind === "precip" && r.text && !r.knowledge && !state.parentOf(r.id));
           if (pending.length) mem.enqueue({ kind: "idle-harvest", sessionId: this.sessionId, sessionFile: this.sessionFile, harness: this.adapter.harness, data: { records: pending.slice(-12).map((r) => ({ id: r.id, text: r.text })) } });
@@ -441,26 +444,28 @@ export class Host {
       } catch (e) {
         this.telemetry.event("shutdown.queue_failed", { error: String((e as Error).message ?? e) });
       }
-      const deliveries = this.engine.state.deliveries.filter((d) => !d.subagent);
-      const attributed = deliveries.map((d) => this.engine.state.attributed.get(d.deliveryId)).filter((a): a is NonNullable<typeof a> => !!a);
-      this.telemetry.session({
-        session: this.sessionId,
-        harness: this.adapter.harness,
-        requests: s.requests,
-        deliveries: deliveries.length,
-        uses: Math.round(attributed.reduce((sum, a) => sum + a.u, 0) * 100) / 100,
-        irrelevantRate: attributed.length ? Math.round((attributed.reduce((sum, a) => sum + (a.use.ignored_irrelevant ?? 0), 0) / attributed.length) * 100) / 100 : null,
-        closures: this.engine.state.closedOrder.length,
-        consolidations: s.records,
-        janusLate: s.janusLate,
-        foldsSkippedByCost: s.foldsSkippedByCost,
-      });
+      if (!opts.reload) {
+        const deliveries = this.engine.state.deliveries.filter((d) => !d.subagent);
+        const attributed = deliveries.map((d) => this.engine.state.attributed.get(d.deliveryId)).filter((a): a is NonNullable<typeof a> => !!a);
+        this.telemetry.session({
+          session: this.sessionId,
+          harness: this.adapter.harness,
+          requests: s.requests,
+          deliveries: deliveries.length,
+          uses: Math.round(attributed.reduce((sum, a) => sum + a.u, 0) * 100) / 100,
+          irrelevantRate: attributed.length ? Math.round((attributed.reduce((sum, a) => sum + (a.use.ignored_irrelevant ?? 0), 0) / attributed.length) * 100) / 100 : null,
+          closures: this.engine.state.closedOrder.length,
+          consolidations: s.records,
+          janusLate: s.janusLate,
+          foldsSkippedByCost: s.foldsSkippedByCost,
+        });
+      }
       try {
         mem.shutdown({ requests: s.requests });
       } catch (e) {
         this.telemetry.event("shutdown.memory_failed", { error: String((e as Error).message ?? e) });
       }
-      if (opts.spawnWorker !== false && !this.light) this.spawnWorker();
+      if (opts.spawnWorker !== false && !opts.reload && !this.light) this.spawnWorker();
     }
     return batch;
   }

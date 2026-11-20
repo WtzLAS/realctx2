@@ -238,7 +238,7 @@ export class PathDelivery {
       for (const m of this.commandMatches(event.command)) if (immediate(m.ref.node)) hits.set(key(m.ref), m.ref);
       // writes the shell parser sees: redirects, sed -i, tee, mv, cp, rm, git checkout/restore
       const fx = event.effects ?? analyzeCommand(event.command, { cwd: this.s.graph.project.cwd });
-      const written = [...fx.writes, ...fx.deletes, ...fx.moves.flatMap((m) => [m.from, m.to]), ...fx.copies.map((c) => c.to)];
+      const written = [...fx.writes, ...fx.deletes, ...fx.moves.flatMap((m) => [m.from, m.to]), ...fx.copies.map((c) => c.to), ...fx.mkdirs];
       for (const abs of written) {
         const rel = this.s.paths.rel(abs);
         if (rel === null) continue;
