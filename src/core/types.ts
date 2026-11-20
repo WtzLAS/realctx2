@@ -233,6 +233,7 @@ export interface CommandIO {
   notify(text: string, level?: "info" | "warning" | "error"): void;
   confirm(title: string, message: string): Promise<boolean>;
   edit?(title: string, prefill: string): Promise<string | undefined>;
+  openSettings?(category?: string): Promise<void>;
   hasUI: boolean;
 }
 

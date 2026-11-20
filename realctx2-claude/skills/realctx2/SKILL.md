@@ -11,6 +11,8 @@ realctx2 manages this session's context and long-term memory. Each command is al
 realctx2 commands:
   /realctx2:status
       Window, occupancy, open intents, consolidations, providers, spend, uncommitted shared files
+  /realctx2:settings [category]
+      Open the interactive settings screen (endpoints, context, memory, index & storage, tools)
   /realctx2:stack
       The intent stack, with regions and their token sizes
   /realctx2:tree [<t: id>]

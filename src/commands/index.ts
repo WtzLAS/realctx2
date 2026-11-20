@@ -1,10 +1,31 @@
 /** The `/realctx2` command (§10): one command with subcommands. Claude Code exposes them as skills. */
 import type { Host } from "../core/host.ts";
+import { findCategory, SETTINGS_CATEGORIES } from "../core/settings-schema.ts";
 import type { CommandDef, CommandIO } from "../core/types.ts";
 import { parseArgs } from "./args.ts";
 import * as memory from "./memory.ts";
 import * as status from "./status.ts";
 import * as store from "./store.ts";
+
+async function openSettingsCmd(host: Host, io: CommandIO, rest: string): Promise<void> {
+  const arg = parseArgs(rest).positional[0];
+  if (arg && !findCategory(arg)) {
+    const names = SETTINGS_CATEGORIES.map((c) => c.id).join(", ");
+    io.print(`Unknown settings category "${arg}". Available categories: ${names}`);
+    return;
+  }
+  if (io.openSettings) {
+    await io.openSettings(arg);
+    return;
+  }
+  const lines = [
+    `realctx2 settings (interactive settings screen requires pi's TUI)`,
+    `Config file: ${host.layout.configFile}`,
+    "",
+    ...SETTINGS_CATEGORIES.map((c) => `  ${c.title} (${c.id}): ${c.summary(host.cfg, { health: host.health() })}`),
+  ];
+  io.print(lines.join("\n"));
+}
 
 interface Sub {
   usage: string;
@@ -16,6 +37,7 @@ interface Sub {
 
 export const SUBCOMMANDS: Record<string, Sub> = {
   status: { usage: "status", help: "Window, occupancy, open intents, consolidations, providers, spend, uncommitted shared files", run: (h, io) => status.status(h, io) },
+  settings: { usage: "settings [category]", help: "Open the interactive settings screen (endpoints, context, memory, index & storage, tools)", run: (h, io, r) => openSettingsCmd(h, io, r) },
   stack: { usage: "stack", help: "The intent stack, with regions and their token sizes", run: (h, io) => status.stack(h, io) },
   tree: { usage: "tree [<t: id>]", help: "The message tree under a consolidation, or the whole session's", run: (h, io, r) => status.tree(h, io, parseArgs(r).positional[0]) },
   search: { usage: "search <query> [--history] [--project]", help: "Search memories and turns, with scores, layers, scopes and urgency", run: (h, io, r) => memory.search(h, io, parseArgs(r)) },
@@ -75,8 +97,10 @@ export function buildCommand(host: Host): CommandDef {
     handler: (args, io) => runCommand(host, args, io),
     completions(prefix: string): string[] {
       const p = prefix.trimStart();
-      if (p.includes(" ")) return [];
-      return Object.keys(SUBCOMMANDS).filter((k) => k.startsWith(p));
+      if (!p.includes(" ")) return Object.keys(SUBCOMMANDS).filter((k) => k.startsWith(p));
+      const m = /^settings\s+(\S*)$/.exec(p);
+      if (m) return SETTINGS_CATEGORIES.map((c) => c.id).filter((id) => id.startsWith(m[1]!));
+      return [];
     },
   };
 }

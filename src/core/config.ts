@@ -1,7 +1,7 @@
 /** Configuration (§9.4): defaults, the global file, and restricted project overrides. */
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readJson } from "../util/fs.ts";
+import { readJson, writeJson } from "../util/fs.ts";
 import type { AuxRole, AuxTools, ThinkingLevel, Urgency } from "./types.ts";
 
 export interface DecisionProviderConfig {
@@ -514,6 +514,96 @@ export interface LoadedConfig {
   config: Config;
   overrides: ProjectOverrideReport;
   globalFileFound: boolean;
+}
+
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((v, i) => deepEqual(v, b[i]));
+  if (isObject(a) && isObject(b)) {
+    const ka = Object.keys(a).filter((k) => a[k] !== undefined);
+    const kb = Object.keys(b).filter((k) => b[k] !== undefined);
+    return ka.length === kb.length && ka.every((k) => kb.includes(k) && deepEqual(a[k], b[k]));
+  }
+  return false;
+}
+
+function cleanValue(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(cleanValue);
+  if (isObject(v)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v)) {
+      if (val === undefined) continue;
+      out[k] = cleanValue(val);
+    }
+    return out;
+  }
+  return v;
+}
+
+const DYNAMIC_PATHS = new Set([
+  "providers.decision",
+  "providers.embedding.late",
+  "providers.embedding.dense",
+  "providers.aux.pi.roles",
+  "providers.aux.claudeCode.roles",
+  "tools.names",
+]);
+
+function diffObject(next: Record<string, unknown>, base: Record<string, unknown>, existing: unknown, path: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const ex = isObject(existing) ? existing : undefined;
+  const isDynamic = DYNAMIC_PATHS.has(path) || path.endsWith(".headers") || path.includes(".roles.");
+
+  // Preserve unknown future keys from existing config.json at fixed schema levels.
+  if (ex && !isDynamic) {
+    for (const [k, v] of Object.entries(ex)) {
+      if (!(k in base) && !(k in next) && v !== undefined) out[k] = v;
+    }
+  }
+
+  const keys = new Set([...Object.keys(next), ...Object.keys(base)]);
+  for (const k of keys) {
+    const childPath = path ? `${path}.${k}` : k;
+    const nv = next[k];
+    const bv = base[k];
+    if (deepEqual(nv, bv)) continue;
+    if (nv === undefined) {
+      // Key existed in defaults (e.g. claudeCode.roles.precip.model) and was explicitly cleared.
+      if (bv !== undefined) out[k] = null;
+      continue;
+    }
+    if (isObject(nv) && isObject(bv)) {
+      const sub = diffObject(nv, bv, ex?.[k], childPath);
+      if (Object.keys(sub).length > 0) out[k] = sub;
+    } else {
+      const cleaned = cleanValue(nv);
+      if (bv === undefined && isObject(cleaned) && Object.keys(cleaned).length === 0) continue;
+      out[k] = cleaned;
+    }
+  }
+  return out;
+}
+
+/**
+ * Compute a minimal config.json object representing `next` relative to `base` (DEFAULT_CONFIG),
+ * while preserving unknown future keys from `existingRaw`.
+ */
+export function diffConfig(next: Config, base: Config = DEFAULT_CONFIG, existingRaw?: unknown): Record<string, unknown> {
+  return diffObject(next as unknown as Record<string, unknown>, base as unknown as Record<string, unknown>, existingRaw, "");
+}
+
+/** Load only the global configuration file merged with defaults (excluding project overrides). */
+export function loadGlobalConfig(layout: Layout): Config {
+  const globalRaw = readJson<unknown>(layout.configFile, null);
+  return deepMerge(structuredClone(DEFAULT_CONFIG), globalRaw ?? {});
+}
+
+/** Persist `next` as minimal overrides to the global config.json atomically. */
+export function saveConfig(layout: Layout, next: Config): Record<string, unknown> {
+  const existingRaw = readJson<unknown>(layout.configFile, null);
+  const diff = diffConfig(next, DEFAULT_CONFIG, existingRaw);
+  writeJson(layout.configFile, diff);
+  return diff;
 }
 
 export function loadConfig(layout: Layout, sharedDir?: string | null, trusted = false): LoadedConfig {

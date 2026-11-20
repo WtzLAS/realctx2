@@ -6,8 +6,9 @@
 import { resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { DecisionProviderConfig } from "../../core/config.ts";
+import { type DecisionProviderConfig, loadGlobalConfig, saveConfig } from "../../core/config.ts";
 import { Host } from "../../core/host.ts";
+import { SETTINGS_CATEGORIES } from "../../core/settings-schema.ts";
 import type { CommandIO, ConsolidationRecord, ContextEdit, DecisionQuestion, SessionRecord } from "../../core/types.ts";
 import { SUBCOMMANDS } from "../../commands/index.ts";
 import type { PendingDelivery } from "../../context/engine.ts";
@@ -356,16 +357,50 @@ class PiExtension {
     else process.stderr.write(`${text}\n`);
   }
 
+  private async openSettings(ctx: ExtensionCommandContext, host: Host, category?: string): Promise<void> {
+    const { Realctx2SettingsComponent } = await import("./settings-ui.ts");
+    let availableModels: Array<{ id: string; provider: string; name?: string }> = [];
+    try {
+      const reg = ctx.modelRegistry;
+      const list = reg.getAvailable();
+      const models = list.length ? list : reg.getAll();
+      availableModels = models.map((m) => ({ id: m.id, provider: m.provider, name: m.name }));
+    } catch {
+      // model registry unavailable
+    }
+    const globalCfg = loadGlobalConfig(host.layout);
+    await ctx.ui.custom<void>(
+      (tui, theme, _keybindings, done) =>
+        new Realctx2SettingsComponent({
+          config: globalCfg,
+          effectiveConfig: host.cfg,
+          projectOverrides: host.overrides.applied,
+          configPath: host.layout.configFile,
+          displayContext: { health: host.health() },
+          availableModels,
+          initialCategory: category,
+          onSave: (next) => {
+            saveConfig(host.layout, next);
+            host.reloadConfig();
+          },
+          onClose: () => done(undefined),
+          theme,
+          tui,
+        }),
+    );
+  }
+
   private async onCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
     this.adapter.bind(ctx);
+    const host = this.host;
     const io: CommandIO = {
       hasUI: ctx.hasUI,
       print: (text) => this.print(ctx, text),
       notify: (text, level) => ctx.ui.notify(text, level ?? "info"),
       confirm: (title, message) => (ctx.hasUI ? ctx.ui.confirm(title, message) : Promise.resolve(false)),
       edit: ctx.hasUI ? (title, prefill) => ctx.ui.editor(title, prefill) : undefined,
+      openSettings: host && ctx.hasUI && ctx.mode === "tui" ? (category) => this.openSettings(ctx, host, category) : undefined,
     };
-    const host = this.host;
     if (!host) return io.print("realctx2 is not running in this session (it starts with the session; see the extension errors pi reported at startup).");
     await host.command().handler(args, io);
   }
@@ -431,12 +466,24 @@ class PiExtension {
     pi.on("session_shutdown", this.safe("session_shutdown", () => this.onShutdown()));
 
     pi.registerCommand("realctx2", {
-      description: "Context and memory manager: status, search, review, ingest, forget, doctor…",
+      description: "Context and memory manager: status, settings, search, review, ingest, forget, doctor…",
       getArgumentCompletions: (prefix: string) => {
         const p = prefix.trimStart();
-        if (p.includes(" ")) return null;
-        const items = Object.entries(SUBCOMMANDS).filter(([k]) => k.startsWith(p)).map(([k, v]) => ({ value: k, label: k, description: v.help }));
-        return items.length ? items : null;
+        if (!p.includes(" ")) {
+          const items = Object.entries(SUBCOMMANDS).filter(([k]) => k.startsWith(p)).map(([k, v]) => ({ value: k, label: k, description: v.help }));
+          return items.length ? items : null;
+        }
+        const m = /^settings\s+(\S*)$/.exec(p);
+        if (m) {
+          const sub = m[1]!.toLowerCase();
+          const items = SETTINGS_CATEGORIES.filter((c) => c.id.startsWith(sub) || c.aliases?.some((a) => a.startsWith(sub))).map((c) => ({
+            value: `settings ${c.id}`,
+            label: c.id,
+            description: `${c.title} — ${c.description}`,
+          }));
+          return items.length ? items : null;
+        }
+        return null;
       },
       handler: async (args, ctx) => {
         try {

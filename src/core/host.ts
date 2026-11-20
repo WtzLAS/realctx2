@@ -205,6 +205,31 @@ export class Host {
     return true;
   }
 
+  /**
+   * Reload the full configuration after `/realctx2 settings` writes `config.json`.
+   * Mutates `this.cfg` in place so live subsystems see threshold changes immediately,
+   * and re-syncs the decision endpoint and pi classifier registration when changed.
+   */
+  reloadConfig(): void {
+    const loaded = loadConfig(this.layout, this.project.sharedDir, this.trusted);
+    const prevDecision = this.cfg.providers.decision;
+    this.configMtime = this.mtime();
+    for (const k of Object.keys(loaded.config) as Array<keyof Config>) {
+      (this.cfg as unknown as Record<string, unknown>)[k] = loaded.config[k];
+    }
+    this.overrides.applied.splice(0, this.overrides.applied.length, ...loaded.overrides.applied);
+    this.overrides.ignored.splice(0, this.overrides.ignored.length, ...loaded.overrides.ignored);
+    if (!sameJson(prevDecision, this.cfg.providers.decision)) {
+      if (this.decision instanceof ResilientDecisionClient) {
+        this.http = this.makeHttp(this.cfg.providers.decision);
+        this.decision.setPrimary(this.http);
+      }
+      this.onDecisionConfig?.(this.cfg.providers.decision);
+    }
+    this.sectionCache = null;
+    this.updateStatus();
+  }
+
   // ───────────── session start (§4.2)
   async start(): Promise<void> {
     if (this.started) {
