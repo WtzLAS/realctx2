@@ -92,7 +92,7 @@ export interface PiRig {
   /** Aux roles answer by the JSON schema they were given: a handler per property name found in it. */
   aux: Array<{ when: string; reply: (user: string, system: string) => unknown }>;
   auxCalls: Array<{ system: string; user: string; tools: string[] }>;
-  ui: { notes: Array<{ text: string; level?: string }>; status: Map<string, string | undefined>; confirm: boolean[]; edits: Array<(prefill: string) => string | undefined> };
+  ui: { notes: Array<{ text: string; level?: string }>; status: Map<string, string | undefined>; confirm: boolean[]; edits: Array<(prefill: string) => string | undefined>; /** `setWorkingMessage` / `setWorkingVisible` calls, as `message:…` and `visible:…`. */ working: string[] };
   errors: unknown[];
   prompt(text: string): Promise<void>;
   /** Fire `session_shutdown` and dispose the session. */
@@ -159,12 +159,14 @@ export async function piRig(o: { cwd: string; config?: Record<string, unknown>; 
   const sessionDir = join(agentDir, "sessions");
   const sessionManager = o.sessionFile ? SessionManager.open(o.sessionFile, sessionDir) : SessionManager.create(o.cwd, sessionDir);
   const { session } = await createAgentSession({ cwd: o.cwd, agentDir, model: faux.getModel(), thinkingLevel: "off", modelRuntime, resourceLoader, sessionManager, settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, ...(o.settings ?? {}) } as never) });
-  const ui: PiRig["ui"] = { notes: [], status: new Map(), confirm: [], edits: [] };
+  const ui: PiRig["ui"] = { notes: [], status: new Map(), confirm: [], edits: [], working: [] };
   const errors: unknown[] = [];
   const uiContext = new Proxy(
     {
       notify: (text: string, level?: string) => void ui.notes.push({ text, level }),
       setStatus: (key: string, text: string | undefined) => void ui.status.set(key, text),
+      setWorkingMessage: (message?: string) => void ui.working.push(`message:${message ?? ""}`),
+      setWorkingVisible: (visible: boolean) => void ui.working.push(`visible:${visible}`),
       confirm: async () => ui.confirm.shift() ?? true,
       editor: async (_title: string, prefill?: string) => ui.edits.shift()?.(prefill ?? ""),
       select: async () => undefined,

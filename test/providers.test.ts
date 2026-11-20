@@ -105,6 +105,29 @@ describe("HttpDecisionClient", () => {
     await expect(c3.decide("e", [QUESTIONS[0]!], { callSite: "janus", timeoutMs: 60 })).rejects.toThrow(/timeout/);
     expect(Date.now() - t0).toBeLessThan(400);
   });
+  it("drops Decisions API options the server rejects, without failing the call or tripping the breaker", async () => {
+    // a Decisions-compatible server without prompt caching or JSON parts (seen in the wild)
+    const strict = fakeFetch((_u, body) => {
+      if ("prompt_cache_key" in body) return { status: 400, json: { error: { message: "unknown field 'prompt_cache_key'" } } };
+      if (typeof body.input !== "string") return { status: 400, json: { error: { message: "Unsupported input content type 'input_json'" } } };
+      return { json: { answers: [{ type: "predicate", name: "redirect", probability: 0.25 }] } };
+    });
+    const c = new HttpDecisionClient({ format: "decisions", url: "http://x/v1/decisions", model: "m" }, { fetch: strict.fetch });
+    const ans = await c.decide({ stack: ["a"] }, [QUESTIONS[0]!], { callSite: "janus", timeoutMs: 3000, noRetry: true, cacheKey: "sess.janus" });
+    expect(ans.redirect!.p).toBe(0.25);
+    expect(strict.calls.length).toBe(3); // as built, without the cache key, then with JSON as text
+    expect(JSON.parse(strict.calls[2]!.body.input)).toEqual({ stack: ["a"] });
+    expect([...c.unsupported].sort()).toEqual(["input_json", "prompt_cache_key"]);
+    // later requests leave both out from the start
+    await c.decide({ x: 1 }, [QUESTIONS[0]!], { callSite: "t", timeoutMs: 3000, cacheKey: "k" });
+    expect(strict.calls.length).toBe(4);
+    expect(c.available()).toBe(true);
+    // any other 400 still fails
+    const other = fakeFetch(() => ({ status: 400, json: { error: { message: "questions must not be empty" } } }));
+    const c2 = new HttpDecisionClient({ format: "decisions", url: "http://x/v1/decisions", model: "m" }, { fetch: other.fetch });
+    await expect(c2.decide("e", [QUESTIONS[0]!], { callSite: "t", timeoutMs: 3000, cacheKey: "k" })).rejects.toThrow(/questions must not be empty/);
+    expect(other.calls.length).toBe(1);
+  });
   it("opens the breaker after 5 consecutive failures for 60 s", () => {
     let now = 0;
     const b = new CircuitBreaker(5, 60_000, () => now);

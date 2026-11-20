@@ -4,7 +4,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { PiAdapter } from "../src/adapters/pi/adapter.ts";
 import { MODEL_COOLDOWN_STRIKES, PiAuxRunner } from "../src/adapters/pi/aux.ts";
 import { projectedEntries } from "../src/adapters/pi/entries.ts";
-import { applyEditsToMessages, DECISION_PROVIDER } from "../src/adapters/pi/index.ts";
+import { applyEditsToMessages, DECISION_PROVIDER, WORKING_MESSAGE } from "../src/adapters/pi/index.ts";
 import { toolRenderers } from "../src/adapters/pi/tool-renderers.ts";
 import { DEFAULT_CONFIG, Layout } from "../src/core/config.ts";
 import { resolveProject } from "../src/core/project.ts";
@@ -78,7 +78,12 @@ describe("realctx2 as a pi extension (§4.1–4.4)", () => {
     const [rule, fact] = remembered;
 
     // a user turn: Janus kindles, the scribe names the intent, guidance follows the user message
-    r.decision.handler = janus([{ kindle: true }, {}, {}, {}]);
+    const decide = janus([{ kindle: true }, {}, {}, {}]);
+    const workingAtJanus: string[][] = [];
+    r.decision.handler = (names, state, questions) => {
+      if (names.includes("focus")) workingAtJanus.push([...r.ui.working]);
+      return decide(names, state, questions);
+    };
     r.aux.push(scribe("Add an email column"));
     r.main.push(
       { text: "I'll look at the schema.", tools: [{ name: "read", args: { path: "src/db/schema.ts" } }] },
@@ -87,6 +92,10 @@ describe("realctx2 as a pi extension (§4.1–4.4)", () => {
     );
     await r.prompt("add an email column to users");
     expect(r.errors).toEqual([]);
+    // pi shows no Working row until the first turn starts: realctx2 shows it while the user
+    // message waits for Janus in before_agent_start, and restores pi's own message afterwards
+    expect(workingAtJanus[0]).toEqual([`message:${WORKING_MESSAGE}`, "visible:true"]);
+    expect(r.ui.working).toEqual([`message:${WORKING_MESSAGE}`, "visible:true", "message:"]);
     const b = r.branch();
     const user = b.findIndex((e) => e.role === "user" && e.text === "add an email column to users");
     const guidance = b[user + 1]!;

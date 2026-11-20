@@ -10,7 +10,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { type DecisionProviderConfig, Layout, loadGlobalConfig, normalizeEnvVarName, resolveApiKey, saveConfig } from "../../core/config.ts";
 import { Host } from "../../core/host.ts";
 import { SETTINGS_CATEGORIES } from "../../core/settings-schema.ts";
-import type { CommandIO, ConsolidationRecord, ContextEdit, DecisionQuestion, SessionRecord } from "../../core/types.ts";
+import type { CommandIO, CommitBatch, ConsolidationRecord, ContextEdit, DecisionQuestion, SessionRecord } from "../../core/types.ts";
 import { SUBCOMMANDS } from "../../commands/index.ts";
 import type { PendingDelivery } from "../../context/engine.ts";
 import type { PathEvent } from "../../memory/delivery.ts";
@@ -21,6 +21,32 @@ import { loadAnySession } from "../sessions.ts";
 import { type Draft, PiAdapter, STATUS_KEY } from "./adapter.ts";
 
 export const DECISION_PROVIDER = "realctx2-decision";
+/** pi's Working row while a user message waits for Janus in `before_agent_start`. */
+export const WORKING_MESSAGE = "Working · realctx2 is reading the prompt";
+
+/**
+ * pi's Working row, shown early. Cosmetic: a mode or pi version whose UI context lacks these
+ * methods (rpc, print, older releases) gets no row, and the hook still runs.
+ */
+function workingRow(ctx: ExtensionContext): { show(message: string): void; restore(): void } {
+  const ui = (ctx.hasUI ? ctx.ui : undefined) as Partial<Pick<ExtensionContext["ui"], "setWorkingMessage" | "setWorkingVisible">> | undefined;
+  const call = (f: () => void) => {
+    try {
+      f();
+    } catch {
+      // the row is cosmetic
+    }
+  };
+  return {
+    show(message) {
+      if (typeof ui?.setWorkingMessage === "function") call(() => ui.setWorkingMessage!(message));
+      if (typeof ui?.setWorkingVisible === "function") call(() => ui.setWorkingVisible!(true));
+    },
+    restore() {
+      if (typeof ui?.setWorkingMessage === "function") call(() => ui.setWorkingMessage!());
+    },
+  };
+}
 
 type Part = { type: string; text?: string };
 
@@ -280,7 +306,16 @@ class PiExtension {
     }
     // extension-triggered custom runs skip user-turn Janus
     if (event.messageType !== "user") return undefined;
-    const batch = await host.engine.onUserMessage(event.prompt ?? "", ctx.signal);
+    // pi shows its Working row only at the first turn_start, after every before_agent_start
+    // handler; until then the prompt has left the editor and nothing says the run is waiting
+    const working = workingRow(ctx);
+    working.show(WORKING_MESSAGE);
+    let batch: CommitBatch;
+    try {
+      batch = await host.engine.onUserMessage(event.prompt ?? "", ctx.signal);
+    } finally {
+      working.restore();
+    }
     this.adapter.deferred.edits.push(...batch.edits);
     host.updateStatus();
     const msg = batch.messages[0];

@@ -194,7 +194,14 @@ function clamp01(x: number): number {
 
 // ───────────────────────────── Decisions API (`POST …/v1/decisions`)
 
-export function buildDecisionsRequest(model: string, evidence: string | object, questions: DecisionQuestion[], cacheKey?: string): Record<string, unknown> {
+/**
+ * Options of the Decisions API that a compatible server may not implement. `HttpDecisionClient`
+ * drops one after an HTTP 400 that names it: `input_json` parts become JSON text in `input`.
+ */
+export type DecisionsFeature = "prompt_cache_key" | "input_json";
+const DECISIONS_FEATURES: DecisionsFeature[] = ["prompt_cache_key", "input_json"];
+
+export function buildDecisionsRequest(model: string, evidence: string | object, questions: DecisionQuestion[], cacheKey?: string, without: ReadonlySet<DecisionsFeature> = new Set()): Record<string, unknown> {
   const qs = questions.map((q) => {
     if (q.kind === "binary") {
       const meanings = [q.yes ? `True means: ${q.yes}` : "", q.no ? `False means: ${q.no}` : ""].filter(Boolean);
@@ -205,9 +212,9 @@ export function buildDecisionsRequest(model: string, evidence: string | object, 
     }
     return { type: "score", name: q.name, instructions: q.instructions, levels: q.levels.map((l) => (l.description ? { label: l.label, description: l.description } : { label: l.label })) };
   });
-  const input = typeof evidence === "string" ? evidence : [{ role: "user", content: [{ type: "input_json", data: evidence }] }];
+  const input = typeof evidence === "string" ? evidence : without.has("input_json") ? JSON.stringify(evidence) : [{ role: "user", content: [{ type: "input_json", data: evidence }] }];
   const req: Record<string, unknown> = { model, input, questions: qs };
-  if (cacheKey) req.prompt_cache_key = cacheKey;
+  if (cacheKey && !without.has("prompt_cache_key")) req.prompt_cache_key = cacheKey;
   return req;
 }
 
@@ -294,6 +301,8 @@ export class HttpDecisionClient implements DecisionClient {
   private readonly fetchImpl: FetchLike;
   private readonly telemetry?: Telemetry;
   private readonly budget: number;
+  /** Decisions API options this endpoint rejected; later requests leave them out. */
+  readonly unsupported = new Set<DecisionsFeature>();
   lastError: string | undefined;
 
   constructor(config: DecisionProviderConfig, opts: HttpDecisionOptions = {}) {
@@ -332,8 +341,8 @@ export class HttpDecisionClient implements DecisionClient {
 
   private async request(evidence: string | object, questions: DecisionQuestion[], opts: DecideOptions): Promise<Record<string, DecisionAnswer>> {
     const { format, model, url } = this.config;
-    const body = format === "systemone" ? buildSystemOneRequest(model, evidence, questions) : buildDecisionsRequest(model, evidence, questions, opts.cacheKey);
-    const payload = JSON.stringify(body);
+    const build = () => JSON.stringify(format === "systemone" ? buildSystemOneRequest(model, evidence, questions) : buildDecisionsRequest(model, evidence, questions, opts.cacheKey, this.unsupported));
+    let payload = build();
     const headers = buildAuthHeaders(this.config);
     const started = Date.now();
     const attempts = opts.noRetry ? 1 : 2;
@@ -351,6 +360,12 @@ export class HttpDecisionClient implements DecisionClient {
         const res = await this.fetchImpl(url, { method: "POST", headers, body: payload, signal });
         if (!res.ok) {
           lastErr = await extractHttpError(res);
+          if (this.dropRejected(res.status, lastErr, payload, opts.callSite)) {
+            // the same request without what the server rejected; not a failed attempt
+            payload = build();
+            attempt--;
+            continue;
+          }
           if (res.status === 429 || res.status >= 500) continue;
           break;
         }
@@ -381,6 +396,20 @@ export class HttpDecisionClient implements DecisionClient {
     this.lastError = lastErr;
     this.telemetry?.call({ callSite: opts.callSite, kind: "decision", latencyMs: Date.now() - started, outcome: lastErr === "timeout" ? "timeout" : "error", detail: lastErr });
     throw new DecisionUnavailable(lastErr);
+  }
+
+  /**
+   * A Decisions-compatible server that lacks an optional feature answers 400 and names it
+   * ("unknown field 'prompt_cache_key'", "Unsupported input content type 'input_json'"). Without
+   * this, every request fails, the breaker opens, and all decisions fall back to slow emulation.
+   */
+  private dropRejected(status: number, error: string, payload: string, callSite: string): boolean {
+    if (this.config.format === "systemone" || (status !== 400 && status !== 422)) return false;
+    const feature = DECISIONS_FEATURES.find((f) => !this.unsupported.has(f) && error.includes(f) && payload.includes(`"${f}"`));
+    if (!feature) return false;
+    this.unsupported.add(feature);
+    this.telemetry?.event("decision.feature_dropped", { feature, callSite });
+    return true;
   }
 }
 

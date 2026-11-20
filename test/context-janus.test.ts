@@ -245,6 +245,50 @@ describe("Janus decision rules (§5.2.4)", () => {
     expect(s.engine.state.stack).toEqual([]);
   });
 
+  it("bounds a user message's whole wait: a slow scribe opens its intent at the next turn_end", async () => {
+    // with a decision model the budget is janus.timeoutMs, shared by the decision, scribe and cards
+    const s = new Session({ cfg: testConfig({ context: { maxWindow: 32000 }, janus: { lateWaitMs: 50, timeoutMs: 150 } }) });
+    await s.start();
+    const gates: Array<() => void> = [];
+    let scribes = 0;
+    s.aux.on("janus.scribe", async () => {
+      scribes++;
+      await new Promise<void>((r) => gates.push(r));
+      return { label: "Fix flaky auth test", reason: "r", success: "s", failure: "f" };
+    });
+    s.decision.on("janus", (_e, qs) => keepOpen({ new_root: 0.9 })(qs.map((q) => q.name)));
+    const t0 = Date.now();
+    const b0 = await s.user("fix the flaky auth test");
+    expect(Date.now() - t0).toBeLessThan(1000); // not the scribe's own time
+    expect(b0.messages).toEqual([]);
+    expect(s.engine.state.stack).toEqual([]);
+    gates.shift()!();
+    await new Promise((r) => setTimeout(r, 15));
+    // this round's own Janus run also says "new root", from evidence taken before the late intent opened
+    const tools = [{ name: "bash", args: { command: "true" }, output: "ok" }];
+    const b1 = await s.round("looking at the test", tools);
+    expect(b1.messages.map((m) => m.content)).toEqual([expect.stringContaining('[intent] I\'m now working on "Fix flaky auth test".')]);
+    expect(b1.messages[0]!.details?.intentId).toBe(s.engine.state.stack[0]!.id);
+    expect(s.engine.state.stack.map((i) => i.label)).toEqual(["Fix flaky auth test"]);
+    expect(scribes).toBe(1); // the round's plan could not kindle a second intent
+    // a late scribe for a message that never reached a turn_end is dropped by the next message
+    const s2 = new Session({ cfg: testConfig({ context: { maxWindow: 32000 }, janus: { lateWaitMs: 50, timeoutMs: 150 } }) });
+    await s2.start();
+    const held: Array<() => void> = [];
+    s2.aux.on("janus.scribe", async () => {
+      await new Promise<void>((r) => held.push(r));
+      return { label: "An old purpose", reason: "r", success: "s", failure: "f" };
+    });
+    s2.decision.on("janus", (_e, qs) => keepOpen({ new_root: 0.9 })(qs.map((q) => q.name)));
+    await s2.user("first task");
+    s2.decision.on("janus", (_e, qs) => keepOpen()(qs.map((q) => q.name)));
+    await s2.user("never mind, thanks");
+    while (held.length) held.shift()!();
+    await new Promise((r) => setTimeout(r, 15));
+    expect((await s2.round("ok", tools)).messages).toEqual([]);
+    expect(s2.engine.state.intents.size).toBe(0);
+  });
+
   it("never holds a commit point for emulated decisions: they apply one step late, and a stale kindle is dropped", async () => {
     const s = new Session({ cfg: cfg() });
     await s.start();
