@@ -269,6 +269,8 @@ export interface HarnessAdapter {
   archiveEntries?(): Promise<EntryView[]>;
   listRecords(): Promise<SessionRecord[]>; // realctx2 session records on the active branch
   requestTokens(): Promise<number | null>; // size of the next request incl. system prompt + tools
+  /** Estimated tokens of the system prompt and tool declarations, if known (used to scale post-edit occupancy). */
+  systemPromptTokens?(): number;
   commit(batch: CommitBatch): Promise<void>; // records, edits, guidance (outside a boundary return)
   registerTool(def: ToolDef): void; // checked for name clashes first (§8.1.3)
   registerCommand(def: CommandDef): void;

@@ -1079,4 +1079,145 @@ describe("memory in the loop", () => {
     expect(edits).not.toBeNull();
     expect(s.engine.palim.jobs.has("cold:0")).toBe(false);
   });
+
+  it("applies idle-completed Precip in onContext before the next prompt's first request and persists at turn_end", async () => {
+    const s = new Session({ cfg: cfg() });
+    consolidators(s.aux);
+    const plan = director(s.decision, s.aux);
+    await s.start();
+    plan.push({ kindle: "First job" });
+    await s.user("do first job");
+    for (let i = 0; i < 4; i++) {
+      plan.push({});
+      await s.round(`first work ${i}`, work(i));
+    }
+    plan.push({ close: ["First job"] });
+    await s.finish("First job done.");
+    await s.engine.onIdle();
+
+    // User submits next prompt: onContext applies the finished idle Precip immediately before the first LLM request
+    plan.push({ kindle: "Second job" });
+    await s.user("do second job");
+    const occBefore = s.engine.status().occupancy;
+    const edits = await s.engine.onContext();
+    expect(edits).not.toBeNull();
+    expect(edits![0]!.replacement).toContain('intent "First job" · succeeded · details archived]');
+    // Footer/status occupancy drops right away once onContext applies the Precip edits
+    expect(s.engine.status().occupancy).toBeLessThan(occBefore - 3000);
+    // Retrying onContext before turn_end still returns the unpersisted edits
+    expect(await s.engine.onContext()).toEqual(edits);
+
+    // Next turn_end persists those exact edits and record
+    plan.push({});
+    const b = await s.round("starting second job", work(9, 30));
+    expect(b.edits).toEqual(edits);
+    expect(b.records.some((r) => r.type === "realctx2.consolidation" && r.record.kind === "precip" && !r.record.shadow)).toBe(true);
+    expect(await s.h.contextText()).toContain('intent "First job" · succeeded · details archived]');
+    await hiddenReachable(s);
+  });
+
+  it("retries an aborted idle Precip on the next turn without waiting for another idle period", async () => {
+    const s = new Session({ cfg: cfg() });
+    let precipCalls = 0;
+    s.aux.on("precip", async (task) => {
+      precipCalls++;
+      if (precipCalls === 1) {
+        await new Promise((r) => setTimeout(r, 40));
+        if (task.signal?.aborted) return null;
+      }
+      return { memory: "Retried on next turn.", sidecar: { artifacts: [], entities: [], outcome: "ok" } };
+    });
+    const plan = director(s.decision, s.aux);
+    await s.start();
+    plan.push({ kindle: "Interrupted task" });
+    await s.user("do interrupted task");
+    for (let i = 0; i < 4; i++) {
+      plan.push({});
+      await s.round(`work ${i}`, work(i));
+    }
+    plan.push({ close: ["Interrupted task"] });
+    await s.finish("Done.");
+
+    // Abort idle Precip as if the user typed immediately
+    const ac = new AbortController();
+    const firstIdle = s.engine.onIdle(ac.signal);
+    await new Promise((r) => setTimeout(r, 10));
+    ac.abort();
+    await firstIdle;
+    expect(precipCalls).toBe(1);
+
+    // User immediately sends the next prompt without a second onIdle(): Precip retries and commits on the turn
+    plan.push({ kindle: "Follow-up task" });
+    await s.user("follow up");
+    await s.drain();
+    expect(precipCalls).toBe(2);
+    plan.push({});
+    const b = await s.round("follow-up work", work(9, 30));
+    expect(b.records.some((r) => r.type === "realctx2.consolidation" && r.record.kind === "precip")).toBe(true);
+    expect(await s.h.contextText()).toContain('intent "Interrupted task" · succeeded · details archived]');
+  });
+
+  it("reports actual context tokens in status().occupancy (not Q_q headroom) and scales post-edit occupancy accurately", async () => {
+    const s = new Session({ cfg: cfg() });
+    consolidators(s.aux);
+    const plan = director(s.decision, s.aux);
+    s.h.systemTokens = 4000;
+    await s.start();
+    plan.push({ kindle: "Big task" });
+    await s.user("big task");
+    for (let i = 0; i < 4; i++) {
+      plan.push({});
+      await s.round(`round ${i}`, work(i, 1200));
+    }
+    // Simulate a provider whose tokenizer uses 1.25x more tokens than chars/4
+    const origReq = s.h.requestTokens.bind(s.h);
+    s.h.requestTokens = async () => {
+      const entries = await s.h.listEntries();
+      return s.h.systemTokens + Math.round(entries.reduce((sum, e) => sum + e.tokens, 0) * 1.25);
+    };
+    // Run a plain round (no guidance appended after turn_end) so requestTokens() matches what onTurnEnd measured
+    plan.push({});
+    await s.round("steady work", work(4, 100));
+    const st = s.engine.status();
+    const actualReq = await s.h.requestTokens();
+    // status().occupancy matches actual requestTokens, while predictedOccupancy adds Q_0.95 headroom
+    expect(st.occupancy).toBe(actualReq);
+    expect(st.predictedOccupancy).toBeGreaterThan(st.occupancy);
+
+    // Close the intent, wait for Precip, and commit on the next turn_end (while requestTokens still reflects pre-edit usage)
+    plan.push({ close: ["Big task"] });
+    await s.round("finishing", work(5, 100));
+    await s.drain();
+    plan.push({});
+    const beforeCommitEntries = (await s.h.listEntries()).reduce((sum, e) => sum + e.tokens, 0);
+    await s.round("after close", work(6, 50));
+    const afterCommitEntries = (await s.h.listEntries()).reduce((sum, e) => sum + e.tokens, 0);
+    expect(afterCommitEntries).toBeLessThan(beforeCommitEntries - 4000);
+    // Scaled post-edit occupancy tracks system + 1.25 * afterCommitEntries (not inflated by 0.25 * omittedTokens)
+    const expectedPost = s.h.systemTokens + Math.round(afterCommitEntries * 1.25);
+    expect(Math.abs(s.engine.status().occupancy - expectedPost)).toBeLessThan(500);
+    void origReq;
+  });
+
+  it("downgrades uncommitted consolidations to shadow records on shutdown when persistEdits is false", async () => {
+    const s = new Session({ cfg: cfg() });
+    consolidators(s.aux);
+    const plan = director(s.decision, s.aux);
+    await s.start();
+    plan.push({ kindle: "Final task" });
+    await s.user("final task");
+    for (let i = 0; i < 4; i++) {
+      plan.push({});
+      await s.round(`final work ${i}`, work(i));
+    }
+    plan.push({ close: ["Final task"] });
+    await s.finish("All done.");
+    await s.engine.onIdle();
+
+    const last = await s.engine.onShutdown({ persistEdits: false });
+    const consol = last.records.filter((r) => r.type === "realctx2.consolidation");
+    expect(consol.length).toBe(1);
+    expect(consol[0]!.record.shadow).toBe(true);
+    expect(last.edits).toEqual([]);
+  });
 });

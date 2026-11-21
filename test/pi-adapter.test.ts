@@ -1463,4 +1463,56 @@ describe("intent tracking for pi steering and follow-up", () => {
     expect(b.some((e) => e.customType === "realctx2.guidance" && e.text.includes('I\'m now working on "Late steer task" (inside: Immediate steer task).'))).toBe(true);
     await r.shutdown();
   }, 30_000);
+
+  it("applies settle-deferred idle Precip before the next prompt's first LLM request and persists edits at turn_end", async () => {
+    const cwd = repo();
+    const r = await piRig({ cwd });
+    r.aux.push(
+      scribe("Refactor cache layer"),
+      { when: '"sidecar"', reply: () => ({ memory: "Refactored cache layer cleanly.", sidecar: { outcome_summary: "Refactored", state_changes: [], artifacts: [], open_threads: [] } }) },
+      scribe("Follow-up check"),
+    );
+    // Prompt 1: kindle on user prompt, keep open during work turns, close on closure-only agent_before_settle;
+    // Prompt 2: kindle "Follow-up check" on user prompt
+    const base = janus([{ kindle: true }, {}, {}, {}, { kindle: true }, {}]);
+    r.decision.handler = (names, state, questions) => {
+      if (!names.includes("focus") && names.some((n) => n.startsWith("close."))) {
+        const out: Record<string, number | Probs> = {};
+        for (const n of names) {
+          if (!n.startsWith("close.")) continue;
+          const label = /"([^"]+)"/.exec(questions[n]!.instructions)?.[1] ?? "";
+          out[n] = label === "Refactor cache layer" ? { success: 0.94, open: 0.03 } : { open: 0.96 };
+        }
+        return out;
+      }
+      return base(names, state, questions);
+    };
+    const work = (i: number) => ({ text: `cache work ${i}`, tools: [{ name: "bash", args: { command: `echo ${filler(900, `c${i}_`)}` } }] });
+    r.main.push(work(0), work(1), work(2), { text: "All cache refactoring is done." });
+
+    await r.prompt("refactor the cache layer");
+    // Wait for idle Precip (triggered by agent_settled) to finish before the user sends Prompt 2
+    for (let i = 0; i < 150 && !r.auxCalls.some((c) => c.system.includes('"sidecar"')); i++) await new Promise((res) => setTimeout(res, 20));
+    await new Promise((res) => setTimeout(res, 150));
+    expect(r.auxCalls.some((c) => c.system.includes('"sidecar"'))).toBe(true);
+
+    const callsBeforePrompt2 = r.calls.length;
+    r.main.push({ text: "Follow-up complete." });
+    await r.prompt("run a follow-up check");
+
+    expect(r.errors).toEqual([]);
+    // The VERY FIRST LLM call of Prompt 2 already receives the consolidated Precip message instead of raw Prompt 1 turns
+    const firstCallOfPrompt2 = r.calls[callsBeforePrompt2]!;
+    expect(firstCallOfPrompt2).toBeDefined();
+    expect(firstCallOfPrompt2.text).toContain('intent "Refactor cache layer" · succeeded · details archived]');
+    expect(firstCallOfPrompt2.text).toContain("Refactored cache layer cleanly.");
+    expect(firstCallOfPrompt2.text).not.toContain("c0_0");
+    // And turn_end persisted the context_edit entries and non-shadow consolidation record
+    const b = r.branch();
+    const consol = b.find((e) => e.customType === "realctx2.consolidation");
+    expect(consol).toBeDefined();
+    expect(consol!.raw.data.record.shadow).toBeFalsy();
+    expect(b.filter((e) => e.type === "context_edit").length).toBeGreaterThanOrEqual(4);
+    await r.shutdown();
+  }, 60_000);
 });

@@ -105,6 +105,10 @@ export class FakeHarness implements HarnessAdapter {
     return this.systemTokens + entries.reduce((s, e) => s + e.tokens, 0);
   }
 
+  systemPromptTokens(): number {
+    return this.systemTokens;
+  }
+
   async commit(batch: CommitBatch): Promise<void> {
     this.batches.push(batch);
     this.records.push(...batch.records);

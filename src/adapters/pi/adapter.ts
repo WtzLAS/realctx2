@@ -10,6 +10,7 @@ import type { Telemetry } from "../../core/telemetry.ts";
 import type { AuxRole, AuxSessionRunner, CommandDef, CommitBatch, ContextEdit, EntryView, HarnessAdapter, ModelPricing, SessionRecord, ToolDef } from "../../core/types.ts";
 import type { MemoryRuntime } from "../../memory/runtime.ts";
 import { errMsg } from "../../util/errors.ts";
+import { estimateTokens } from "../../util/text.ts";
 import { PiAuxRunner } from "./aux.ts";
 import { archiveEntries, branchRecords, projectedEntries, replacementFor } from "./entries.ts";
 import { toolRenderers } from "./tool-renderers.ts";
@@ -160,6 +161,30 @@ export class PiAdapter implements HarnessAdapter {
       return this.need().getContextUsage()?.tokens ?? null;
     } catch {
       return null;
+    }
+  }
+
+  systemPromptTokens(): number {
+    const ctx = this.ctx;
+    if (!ctx) return 0;
+    try {
+      const msgs = ctx.sessionManager.buildSessionProjection().messages;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i] as { role?: string; content?: unknown; sections?: Record<string, string>; toolsAdded?: unknown };
+        if (m.role !== "system") continue;
+        let chars = typeof m.content === "string" ? m.content.length : Array.isArray(m.content) ? m.content.reduce((s, b: { type?: string; text?: string }) => s + (b?.type === "text" && typeof b.text === "string" ? b.text.length : 0), 0) : 0;
+        if (m.sections) for (const sec of Object.values(m.sections)) if (typeof sec === "string") chars += sec.length;
+        if (m.toolsAdded) chars += JSON.stringify(m.toolsAdded).length;
+        return Math.ceil(chars / 4);
+      }
+    } catch {
+      // fall back to getSystemPrompt below
+    }
+    try {
+      const prompt = ctx.getSystemPrompt?.();
+      return typeof prompt === "string" ? estimateTokens(prompt) : 0;
+    } catch {
+      return 0;
     }
   }
 

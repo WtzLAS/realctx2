@@ -542,6 +542,7 @@ class PiExtension {
       const projection = ctx.sessionManager.buildSessionProjection().entries.map((p) => ({ id: p.sourceEntry.id, messages: p.messages }));
       messages = applyEditsToMessages(event.messages, projection, edits);
       if (!messages) host.telemetry.event("pi.context_unaligned", { edits: edits.length });
+      host.updateStatus();
     }
     if (guidance.length) {
       const next = messages ?? [...event.messages];
@@ -575,6 +576,7 @@ class PiExtension {
       await this.adapter.commit(host.engine.onCompacted(record, event.compactionEntry.id));
     }
     await host.engine.rebuild().catch(() => undefined);
+    host.updateStatus();
   }
 
   private async onShutdown(event?: { reason?: "quit" | "reload" | "new" | "resume" | "fork" }): Promise<void> {
@@ -586,7 +588,8 @@ class PiExtension {
     // On /new, /resume, /fork and /reload pi is immediately starting the next session in this process,
     // so skip spawning a competing detached worker; full detached maintenance runs on quit.
     const spawnWorker = !reason || reason === "quit";
-    const batch = await host.shutdown({ spawnWorker, reload: isReload });
+    // pi persists context_edit only through boundary returns, not at session_shutdown
+    const batch = await host.shutdown({ spawnWorker, reload: isReload, persistEdits: false });
     await this.adapter.commit({ records: [...this.adapter.deferred.records, ...batch.records], edits: [], messages: [] }).catch(() => undefined);
     this.resetEphemeral();
     this.rechecked = false;
@@ -787,10 +790,12 @@ class PiExtension {
     pi.on("agent_before_settle", this.safe("agent_before_settle", (e, ctx) => this.boundary("agent_before_settle", e, ctx)));
     pi.on(
       "agent_settled",
-      this.safe("agent_settled", () => {
+      this.safe("agent_settled", async () => {
         this.expectInitialUser = false;
         this.pendingUserMessages = [];
         this.flushBash();
+        await this.host?.engine.refreshOccupancy();
+        this.host?.updateStatus();
         this.host?.noteSettled(); // queued Precip now, maintenance after the idle period
         return undefined;
       }),

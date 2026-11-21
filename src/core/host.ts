@@ -442,12 +442,12 @@ export class Host {
    * model-dependent work that has not run, 4. spawn the model-free worker, detached.
    * Returns the last records for the adapter to persist. Idempotent.
    */
-  async shutdown(opts: { spawnWorker?: boolean; reload?: boolean } = {}): Promise<CommitBatch> {
+  async shutdown(opts: { spawnWorker?: boolean; reload?: boolean; persistEdits?: boolean } = {}): Promise<CommitBatch> {
     if (this.closed) return emptyBatch();
     this.noteInput();
     let batch = emptyBatch();
     try {
-      batch = await this.engine.onShutdown({ reload: opts.reload });
+      batch = await this.engine.onShutdown({ reload: opts.reload, persistEdits: opts.persistEdits });
     } catch (e) {
       this.telemetry.event("shutdown.engine_failed", { error: errMsg(e) });
     }

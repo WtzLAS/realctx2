@@ -73,6 +73,7 @@ export class Palim {
   private readonly consolidator: Consolidator;
   private readonly telemetry?: Telemetry;
   private occupancyNow = 0;
+  private contextTokensNow = 0;
   private exhaustedNotifiedAt = -1;
 
   constructor(host: PalimHost) {
@@ -83,14 +84,21 @@ export class Palim {
     this.telemetry = host.telemetry;
   }
 
-  /** P, the occupancy measured at the last pressure check. */
+  /** P, the predicted next-request occupancy (current context + Q_q headroom) at the last check. */
   get lastOccupancy(): number {
     return this.occupancyNow;
+  }
+
+  /** Current context size (without next-round Q_q headroom) at the last check. */
+  get lastContextTokens(): number {
+    return this.contextTokensNow;
   }
 
   /** Plans made against another branch are void (`rebuild`). */
   reset(): void {
     this.jobs.clear();
+    this.occupancyNow = 0;
+    this.contextTokensNow = 0;
     this.exhaustedNotifiedAt = -1;
   }
 
@@ -123,10 +131,47 @@ export class Palim {
   }
 
   // ───────────── ordinary mode (§5.4.2)
-  private occupancy(requestTokens: number | null): number {
-    const base = requestTokens ?? this.entries.reduce((s, e) => s + (e.omitted ? 0 : e.tokens), 0);
+  private entriesTokens(): number {
+    return this.entries.reduce((s, e) => s + (e.omitted ? 0 : e.tokens), 0);
+  }
+
+  /**
+   * Current context size, accounting for edits queued in this step that the harness's
+   * `requestTokens()` does not reflect yet. Scales remaining entry tokens by the pre-edit
+   * entry tokenization ratio so estimation error on omitted entries does not linger.
+   */
+  private baseTokens(req: number | null): number {
+    const after = this.entriesTokens();
+    const saved = this.host.savedThisStep();
+    if (req === null) return after;
+    if (saved <= 0) return req;
+    const before = after + saved;
+    if (before <= 0) return Math.max(0, req - saved);
+    const sys = this.adapter.systemPromptTokens?.();
+    if (typeof sys === "number" && Number.isFinite(sys) && sys >= 0) {
+      const cappedSys = Math.min(sys, req);
+      const ratio = (req - cappedSys) / before;
+      return cappedSys + after * ratio;
+    }
+    return req * (after / before);
+  }
+
+  private predicted(base: number): number {
     const q = this.state.stats.roundTokens.length ? quantile(this.state.stats.roundTokens, this.cfg.context.q) : 0;
     return base + q;
+  }
+
+  /** Refresh current context tokens and predicted occupancy P without running a pressure sweep. */
+  async refreshOccupancy(): Promise<void> {
+    let req: number | null = null;
+    try {
+      req = await this.adapter.requestTokens();
+    } catch {
+      req = null;
+    }
+    const base = this.baseTokens(req);
+    this.contextTokensNow = base;
+    this.occupancyNow = this.predicted(base);
   }
 
   private fast(): boolean {
@@ -331,8 +376,9 @@ export class Palim {
     const rho = this.cfg.context.rho * W;
     const measure = async () => {
       const req = await this.adapter.requestTokens();
-      // the harness reports the size before this step's edits: subtract what they save
-      return this.occupancy(req === null ? null : Math.max(0, req - this.host.savedThisStep()));
+      const base = this.baseTokens(req);
+      this.contextTokensNow = base;
+      return this.predicted(base);
     };
     let P = await measure();
     this.occupancyNow = P;

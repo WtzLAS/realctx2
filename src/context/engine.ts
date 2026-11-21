@@ -307,6 +307,7 @@ export class ContextEngine {
     this.pending = emptyBatch();
     this.unresolvedDeliveries = [];
     this.resolveIds();
+    await this.palim.refreshOccupancy();
   }
 
   private setEntries(entries: EntryView[]): void {
@@ -793,7 +794,14 @@ export class ContextEngine {
       if (mention && msg.content.includes(mention)) this.deliverShown(mentionShown, "path", { guidanceKey: String(msg.details?.key ?? "") });
       batch.messages.push(msg);
     }
-    if (this.contextEnabled()) this.startPrecipJobs(false);
+    this.savedThisStep = 0;
+    if (this.contextEnabled()) {
+      // Idle ended when the user acted: any settle-deferred Precip that has not started or was
+      // aborted during idle is now eligible to run in the background on this turn.
+      for (const job of this.precipJobs) job.deferred = false;
+      this.startPrecipJobs(false);
+    }
+    await this.palim.refreshOccupancy();
     const taken = this.take();
     batch.records.push(...taken.records);
     batch.edits.push(...taken.edits);
@@ -1038,8 +1046,15 @@ export class ContextEngine {
           this.palim.climb();
           this.palim.startOrdinaryFolds();
           await this.palim.pressure(signal);
-        } else this.palim.shadow();
+        } else {
+          this.palim.shadow();
+          await this.palim.refreshOccupancy();
+        }
+      } else {
+        await this.palim.refreshOccupancy();
       }
+    } else {
+      await this.palim.refreshOccupancy();
     }
     this.indexTurns();
     this.flushStats(false);
@@ -1053,8 +1068,12 @@ export class ContextEngine {
   /** `agent_before_settle` / `Stop`: closure-only Janus, and whatever is already ready. */
   async onBeforeSettle(signal?: AbortSignal): Promise<CommitBatch> {
     await this.refresh();
+    this.savedThisStep = 0;
     const batch = emptyBatch();
-    if (!this.contextEnabled()) return batch;
+    if (!this.contextEnabled()) {
+      await this.palim.refreshOccupancy();
+      return batch;
+    }
     if (!this.light) {
       // an intent whose scribe missed the last turn_end opens here, before the next message drops it
       const kindled = await this.takeLateKindle(Date.now() + this.cfg.janus.lateWaitMs, signal);
@@ -1070,10 +1089,17 @@ export class ContextEngine {
     if (!this.light) batch.messages.push(...this.takeLateCards());
     this.commitReady();
     this.flushStats(false);
+    await this.palim.refreshOccupancy();
     const taken = this.take();
     batch.records.push(...taken.records);
     batch.edits.push(...taken.edits);
     return batch;
+  }
+
+  /** Refresh cached occupancy from the harness's current projection (e.g. after boundary drafts commit). */
+  async refreshOccupancy(): Promise<void> {
+    this.savedThisStep = 0;
+    await this.palim.refreshOccupancy();
   }
 
   /**
@@ -1096,8 +1122,9 @@ export class ContextEngine {
 
   /**
    * The `context` hook (§4.2): normally nothing. Returns edits to apply to this one request when
-   * (1) it would go out above capacity and folds are ready, or (2) the provider cache is cold
-   * and a cost-deferred fold is ready. They are persisted at the next commit point.
+   * (1) a finished Precip (e.g. completed during idle) is ready, (2) the request would go out
+   * above capacity and folds are ready, or (3) the provider cache is cold and a cost-deferred
+   * fold is ready. They are persisted at the next commit point.
    */
   async onContext(): Promise<ContextEdit[] | null> {
     if (this.light || this.level === 0 || !this.contextEnabled()) return null;
@@ -1105,15 +1132,41 @@ export class ContextEngine {
     const lastWrite = Math.max(this.lastRequestAt, this.adapter.lastCacheWriteAt?.() ?? 0);
     const cold = lastWrite > 0 && now - lastWrite >= effectiveCacheTtlSeconds(this.cfg, this.adapter.modelName()) * 1000;
     this.lastRequestAt = now;
-    const ready = [...this.palim.jobs.values()].filter((j) => j.done && j.plan);
-    if (!ready.length) return null;
-    const tokens = await this.adapter.requestTokens();
-    const over = tokens !== null && tokens > this.window();
-    const pick = ready.filter((j) => (cold && j.kind === "cold") || (over && j.kind !== "cold"));
-    if (!pick.length) return null;
+    const readyPrecip = this.precipJobs.filter((j) => j.done && j.plan);
+    const readyFolds = [...this.palim.jobs.values()].filter((j) => j.done && j.plan);
+    let pickFolds: typeof readyFolds = [];
+    if (readyFolds.length) {
+      const tokens = await this.adapter.requestTokens();
+      const over = tokens !== null && tokens > this.window();
+      pickFolds = readyFolds.filter((j) => (cold && j.kind === "cold") || (over && j.kind !== "cold"));
+    }
+    if (!this.appliedNow.length && !readyPrecip.length && !pickFolds.length) return null;
     await this.refresh();
     const edits: ContextEdit[] = [];
-    for (const job of pick.sort((a, b) => a.level - b.level)) {
+    // Re-apply plans already applied on an earlier `context` call of this turn (e.g. retries).
+    for (const plan of this.appliedNow) {
+      this.applyLocal(plan);
+      edits.push(...plan.edits);
+    }
+    if (readyPrecip.length) {
+      const readySet = new Set(readyPrecip);
+      this.precipJobs = this.precipJobs.filter((j) => !readySet.has(j));
+      for (const job of readyPrecip) {
+        const plan = job.plan!;
+        const problem = this.invariants(plan, true);
+        job.committed = true;
+        if (problem) {
+          this.telemetry?.event("consolidation.dropped", { kind: plan.record.kind, problem });
+          this.problems.push(`${plan.record.id}: ${problem}`);
+          if (this.problems.length > 50) this.problems.shift();
+          continue;
+        }
+        edits.push(...plan.edits);
+        this.appliedNow.push(plan);
+        this.applyLocal(plan);
+      }
+    }
+    for (const job of pickFolds.sort((a, b) => a.level - b.level)) {
       const plan = job.plan!;
       this.palim.jobs.delete(job.key);
       if (this.invariants(plan, false)) continue;
@@ -1121,7 +1174,10 @@ export class ContextEngine {
       this.appliedNow.push(plan);
       this.applyLocal(plan);
     }
-    return edits.length ? edits : null;
+    if (!edits.length) return null;
+    this.savedThisStep = this.appliedNow.reduce((s, p) => s + (p.record.shadow ? 0 : Math.max(0, p.record.tokensBefore - p.record.tokensAfter)), 0);
+    await this.palim.refreshOccupancy();
+    return edits;
   }
 
   /**
@@ -1175,7 +1231,7 @@ export class ContextEngine {
   }
 
   /** Session end: attribute what is still open with deterministic signals, and hand back the last records. */
-  async onShutdown(opts: { reload?: boolean } = {}): Promise<CommitBatch> {
+  async onShutdown(opts: { reload?: boolean; persistEdits?: boolean } = {}): Promise<CommitBatch> {
     try {
       await this.refresh();
     } catch {
@@ -1190,7 +1246,7 @@ export class ContextEngine {
         for (const r of res.records) this.emit(r);
       }
     }
-    this.commitReady();
+    this.commitReady({ allowEdits: opts.persistEdits !== false });
     this.flushStats(true);
     await this.settleBackground();
     return this.take();
@@ -1286,6 +1342,7 @@ export class ContextEngine {
             // aborted during idle: leave queued so the next idle or turn can retry it
             job.promise = null;
             job.done = false;
+            job.deferred = false;
             return null;
           }
           job.plan = plan;
@@ -1296,6 +1353,7 @@ export class ContextEngine {
           if (signal?.aborted) {
             job.promise = null;
             job.done = false;
+            job.deferred = false;
             return null;
           }
           job.done = true;
@@ -1380,9 +1438,13 @@ export class ContextEngine {
         if (this.problems.length > 50) this.problems.shift();
         return false;
       }
-      this.applyLocal(plan);
     }
-    if (!plan.record.shadow) this.savedThisStep += Math.max(0, plan.record.tokensBefore - plan.record.tokensAfter);
+    // Always update the local projection (onTurnEnd refreshed raw entries before commitReady, so
+    // plans already applied in `context` need their local edits re-applied for Palim planning).
+    this.applyLocal(plan);
+    // Plans already applied in `context` were already reflected in the turn's provider usage, so
+    // only newly committed plans contribute to `savedThisStep`.
+    if (!plan.record.shadow && !opts.applied) this.savedThisStep += Math.max(0, plan.record.tokensBefore - plan.record.tokensAfter);
     this.pending.records.push({ type: "realctx2.consolidation", record: plan.record });
     this.pending.edits.push(...plan.edits);
     this.memory?.turns?.addConsolidation({ id: plan.record.id, session: this.sessionId, harness: this.adapter.harness, kind: plan.record.kind, at: plan.record.createdAt, text: plan.text });
@@ -1393,19 +1455,26 @@ export class ContextEngine {
   }
 
   /** Commit every finished consolidation together, so the prompt cache breaks at most once per step. */
-  private commitReady(): void {
-    for (const plan of this.appliedNow.splice(0)) this.commitPlan(plan, { allowTail: false, applied: true });
+  private commitReady(opts: { allowEdits?: boolean } = {}): void {
+    // When the harness cannot persist context_edit entries (e.g. pi `session_shutdown`), keep the
+    // consolidation as a shadow record so episodes/knowledge still harvest without claiming edits
+    // that never landed in the transcript.
+    const normalize = (plan: ReplacePlan): ReplacePlan =>
+      opts.allowEdits === false && !plan.record.shadow && plan.edits.length > 0
+        ? { ...plan, record: { ...plan.record, shadow: true }, edits: [] }
+        : plan;
+    for (const plan of this.appliedNow.splice(0)) this.commitPlan(normalize(plan), { allowTail: false, applied: true });
     const doneJobs = this.precipJobs.filter((j) => j.done);
     this.precipJobs = this.precipJobs.filter((j) => !j.done);
     for (const job of doneJobs) {
-      if (job.plan) this.commitPlan(job.plan, { allowTail: true });
+      if (job.plan) this.commitPlan(normalize(job.plan), { allowTail: true });
       job.committed = true;
     }
     const folds = this.palim.jobs;
     for (const job of [...folds.values()]) {
       if (!job.done || job.kind !== "ordinary") continue;
       folds.delete(job.key);
-      if (job.plan) this.commitPlan(job.plan, { allowTail: false });
+      if (job.plan) this.commitPlan(normalize(job.plan), { allowTail: false });
     }
     // prepared folds whose span changed, or whose intent closed, are dropped
     for (const job of [...folds.values()]) {
@@ -1448,7 +1517,7 @@ export class ContextEngine {
     return this.memory?.graph.get(id) ?? null;
   }
 
-  status(): { round: number; requests: number; stack: Intent[]; records: number; deliveries: number; attributed: number; frontier: number; janusLate: number; foldsSkippedByCost: number; occupancy: number; window: number; disabled: boolean; cacheTtlSeconds: number; jobs: { precip: number; folds: number }; problems: string[] } {
+  status(): { round: number; requests: number; stack: Intent[]; records: number; deliveries: number; attributed: number; frontier: number; janusLate: number; foldsSkippedByCost: number; occupancy: number; predictedOccupancy: number; window: number; disabled: boolean; cacheTtlSeconds: number; jobs: { precip: number; folds: number }; problems: string[] } {
     const window = this.window();
     return {
       round: this.round,
@@ -1460,7 +1529,8 @@ export class ContextEngine {
       frontier: this.state.stats.frontier ?? 0,
       janusLate: this.state.stats.janusLate,
       foldsSkippedByCost: this.state.stats.foldsSkippedByCost,
-      occupancy: Math.round(this.palim.lastOccupancy),
+      occupancy: Math.round(this.palim.lastContextTokens),
+      predictedOccupancy: Math.round(this.palim.lastOccupancy),
       window,
       disabled: !this.contextEnabled(),
       cacheTtlSeconds: effectiveCacheTtlSeconds(this.cfg, this.adapter.modelName()),
