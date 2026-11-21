@@ -25,6 +25,8 @@ export const ROLE_DEFAULTS: Record<AuxRole, RoleSettings> = {
   "evo.operator": { tools: "read-only", thinking: "medium", maxTurns: 6, timeoutMs: 120_000 },
   "ingest.slicer": { tools: "read-only", thinking: "high", maxTurns: 12, timeoutMs: 300_000 },
   reverify: { tools: "read-only", thinking: "medium", maxTurns: 10, timeoutMs: 180_000 },
+  // the user waits for it on the review screen: a short tool loop to check the code, then a verdict
+  "review.resolve": { tools: "read-only", thinking: "medium", maxTurns: 6, timeoutMs: 120_000 },
   // thinking off: it stands in for a decision model on every step, and thinking made each answer take 5 to 10 s
   "decision.emulate": { tools: "none", thinking: "off", maxTurns: 1, timeoutMs: 10_000 },
 };

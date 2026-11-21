@@ -160,6 +160,7 @@ export const AUX_ROLES: Array<{ role: AuxRole; label: string; description: strin
   { role: "evo.operator", label: "evo.operator", description: "Executes EvoDisco memory graph evolution operators (Abstract, Refine, Bridge). Runs with read-only tools.", transcriptOnly: false },
   { role: "ingest.slicer", label: "ingest.slicer", description: "Slices AGENTS.md, CLAUDE.md, and rule files into path-anchored memories during /realctx2 ingest. Runs with read-only tools.", transcriptOnly: false },
   { role: "reverify", label: "reverify", description: "Re-verifies stale path-anchored memories against changed repository files. Runs with read-only tools.", transcriptOnly: false },
+  { role: "review.resolve", label: "review.resolve", description: "Proposes how to settle a review item on the /realctx2 review screen: a conflict between two memories (retire, rewrite or merge them) or a flagged memory (keep, retire, or rewrite its text or paths); applied only after the user confirms. Runs with read-only tools.", transcriptOnly: false },
   { role: "decision.emulate", label: "decision.emulate", description: "Emulates decision-model probability answers when no decision endpoint is available. Runs single-turn without tools.", transcriptOnly: true },
 ];
 

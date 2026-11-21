@@ -1,9 +1,9 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { Layout } from "../src/core/config.ts";
 import { Host } from "../src/core/host.ts";
-import { type ReviewModel, ReviewSession } from "../src/commands/review.ts";
+import { type ReviewPlan, type ReviewModel, type ReviewProposal, ReviewSession } from "../src/commands/review.ts";
 import type { CommandIO, ToolDef } from "../src/core/types.ts";
 import { rawTurnId } from "../src/storage/turnindex.ts";
 import { promptSection } from "../src/tools/index.ts";
@@ -608,6 +608,402 @@ describe("/realctx2 commands (§10)", () => {
     const other = primary.id === `[m:${keep}]` ? drop : keep;
     expect(model.run(primary.key, "approve").message).toContain(`Retired [m:${other}]`);
     expect(mem.graph.get(other)!.node.status).toBe("archived");
+    expect(model.rows()).toEqual([]);
+    await r.host.shutdown({ spawnWorker: false });
+  });
+});
+
+describe("review: the aux model settles a conflict", () => {
+  it("lets the aux model retire either memory, rewrite either, or merge them with edits, after confirmation", async () => {
+    const r = await rig();
+    const mem = r.host.memory!;
+    /** A conflict whose newer memory is the one the item lists ("current"). */
+    const conflict = async (current: string, other: string, opts: { current?: string; other?: string } = {}) => {
+      const o = idOf(await r.run(`remember "${other}" --scope personal${opts.other ?? ""}`));
+      r.now.t += 60_000;
+      const c = idOf(await r.run(`remember "${current}" --scope personal${opts.current ?? ""}`));
+      mem.graph.link(mem.graph.get(c)!, "contradicts", mem.graph.get(o)!);
+      mem.graph.commit("personal");
+      return { c, o };
+    };
+    const port = await conflict("The API listens on port 9090.", "The API listens on port 8080.");
+    const pm = await conflict("Install dependencies with npm.", "Install dependencies with pnpm.");
+    const tests = await conflict("Run the tests with vitest only.", "Run the tests with bun test only.");
+    const cluster = await conflict("Staging deploys use the blue cluster.", "Staging deploys use the green cluster.");
+    const fri = await conflict("Deploys run on Fridays.", "Deploys never run on Fridays; release with `make release`.", { current: " --path src/db/schema.ts", other: " --path src/auth/tokenCache.ts --kind rule --severity must" });
+    const rule = idOf(await r.run('remember "Callers must use TokenCache.refresh." --kind rule --scope personal --path src/auth/tokenCache.ts'));
+    mem.review.add({ at: new Date(r.now.t).toISOString(), scope: "personal", id: rule, kind: "rule-change", suggestion: { text: "Callers must use TokenCache.renew." } });
+    // the model's answers, by what it reads as CURRENT
+    const answers: Record<string, unknown> = {
+      "port 9090": { decision: "remove-current", reason: "server.ts binds 8080." },
+      "with npm": { decision: "remove-other", reason: "There is a package-lock.json and no pnpm lockfile." },
+      "vitest only": { decision: "rewrite-current", reason: "Both runners are used.", text: "Run the tests with vitest and with bun test; both must pass." },
+      "blue cluster": { decision: "rewrite-other", reason: "Green is production, not staging.", text: "Production deploys use the green cluster." },
+      "run on Fridays": { decision: "merge", reason: "Fridays are frozen except for hotfixes.", text: "Deploys never run on Fridays, except hotfixes with on-call approval; release with `make release`." },
+    };
+    r.aux.on("review.resolve", (task) => Object.entries(answers).find(([k]) => task.data[0]!.text.includes(k))?.[1] ?? null);
+    const model = new ReviewSession(r.host, mem);
+    const row = (id: string) => model.rows().find((x) => x.id === `[m:${id}]`)!;
+    expect(model.rows().filter((x) => x.label === "conflict").map((x) => x.id)).toEqual([port, pm, tests, cluster, fri].map((p) => `[m:${p.c}]`));
+
+    // a conflict-only action: asked first, confirmed afterwards; it never runs as a plain action
+    expect(model.actions(row(port.c).key).map((x) => `${x.key} ${x.label}`)).toEqual(["a keep this", "d dismiss (not a conflict)", "e edit", "f keep other", "p unpin", "m ask model"]);
+    expect(model.actions(row(port.c).key).find((x) => x.id === "resolve")).toMatchObject({ ask: true });
+    expect(model.actions(row(rule).key).map((x) => x.id)).not.toContain("resolve");
+    expect(await model.propose(row(rule).key)).toEqual({ ok: false, message: "Only a conflict or a flagged memory can be settled by the model." });
+    expect(model.run(row(port.c).key, "resolve").ok).toBe(false);
+
+    // remove current
+    let p = await model.propose(row(port.c).key);
+    const task = r.aux.calls.at(-1)!;
+    expect(task.role).toBe("review.resolve");
+    expect(task.data.map((d) => d.label)).toEqual(["CURRENT", "OTHER"]);
+    expect(task.data[0]!.text).toContain(`id: m:${port.c}\nscope: personal`);
+    expect(task.data[0]!.text).toContain("origin: explicit");
+    expect(task.data[1]!.text).toContain("text:\nThe API listens on port 8080.");
+    expect((task.schema.properties as Record<string, { enum?: string[] }>).decision!.enum).toEqual(["remove-current", "remove-other", "rewrite-current", "rewrite-other", "merge"]);
+    for (const d of ["- remove-current:", "- remove-other:", "- rewrite-current:", "- rewrite-other:", "- merge:"]) expect(task.instructions).toContain(d);
+    expect(p).toMatchObject({ ok: true, confirm: `The model suggests: retire [m:${port.c}] and keep [m:${port.o}]. Apply it?`, destructive: true, preview: ["Why: server.ts binds 8080.", `Retire [m:${port.c}] "The API listens on port 9090" (reversible with /realctx2 restore)`] });
+    expect(mem.graph.get(port.c)!.node.status).toBe("active"); // asking changed nothing
+    let out = model.applyProposal(row(port.c).key, (p as { plan: ReviewPlan }).plan);
+    expect(out).toEqual({ ok: true, message: `Applied the model's suggestion. Kept [m:${port.o}]; Retired [m:${port.c}] "The API listens on port 9090" (restore with /realctx2 restore ${port.c}).` });
+    expect([mem.graph.get(port.c)!.node.status, mem.graph.get(port.o)!.node.status]).toEqual(["archived", "active"]);
+
+    // remove other
+    p = await model.propose(row(pm.c).key);
+    expect(p).toMatchObject({ ok: true, confirm: `The model suggests: retire [m:${pm.o}] and keep [m:${pm.c}]. Apply it?` });
+    expect(model.applyProposal(row(pm.c).key, (p as { plan: ReviewPlan }).plan).ok).toBe(true);
+    expect([mem.graph.get(pm.c)!.node.status, mem.graph.get(pm.o)!.node.status]).toEqual(["active", "archived"]);
+
+    // rewrite current: the other stays, the contradiction goes
+    p = await model.propose(row(tests.c).key);
+    expect(p).toMatchObject({ ok: true, destructive: false, confirm: `The model suggests: rewrite [m:${tests.c}]; [m:${tests.o}] stays as it is. Apply it?`, preview: ["Why: Both runners are used.", `New text of [m:${tests.c}]`, "  Run the tests with vitest and with bun test; both must pass."] });
+    expect(mem.graph.get(tests.c)!.node.text).toBe("Run the tests with vitest only.");
+    out = model.applyProposal(row(tests.c).key, (p as { plan: ReviewPlan }).plan);
+    expect(out).toEqual({ ok: true, message: `Applied the model's suggestion. Rewrote [m:${tests.c}]; [m:${tests.o}] stays as it is.` });
+    let n = mem.graph.get(tests.c)!.node;
+    expect([n.text, n.title, n.status]).toEqual(["Run the tests with vitest and with bun test; both must pass.", "Run the tests with vitest and with bun test; both must pass", "active"]);
+    expect(mem.graph.get(tests.o)!.node).toMatchObject({ text: "Run the tests with bun test only.", status: "active" });
+    expect(mem.graph.contradictions(mem.graph.get(tests.c)!)).toEqual([]);
+
+    // rewrite other
+    p = await model.propose(row(cluster.c).key);
+    expect(p).toMatchObject({ ok: true, confirm: `The model suggests: rewrite [m:${cluster.o}]; [m:${cluster.c}] stays as it is. Apply it?` });
+    expect(model.applyProposal(row(cluster.c).key, (p as { plan: ReviewPlan }).plan).ok).toBe(true);
+    expect(mem.graph.get(cluster.o)!.node.text).toBe("Production deploys use the green cluster.");
+    expect(mem.graph.get(cluster.c)!.node.text).toBe("Staging deploys use the blue cluster.");
+    expect(mem.graph.contradictions(mem.graph.get(cluster.o)!)).toEqual([]);
+
+    // merge with edits: the current memory takes the merged text and the other's paths; the other is retired
+    const order = ["passive", "caption", "hint", "immediate"];
+    const urgencies = [mem.graph.get(fri.c)!.node.urgency, mem.graph.get(fri.o)!.node.urgency];
+    expect([mem.graph.get(fri.c)!.node.kind, mem.graph.get(fri.c)!.node.severity, mem.graph.get(fri.o)!.node.severity]).toEqual(["fact", undefined, "must"]);
+    p = await model.propose(row(fri.c).key);
+    expect(p).toMatchObject({
+      ok: true,
+      destructive: true,
+      confirm: `The model suggests: merge both into [m:${fri.c}] and retire [m:${fri.o}]. Apply it?`,
+      preview: ["Why: Fridays are frozen except for hotfixes.", `Merged text of [m:${fri.c}]`, "  Deploys never run on Fridays, except hotfixes with on-call approval; release with `make release`.", `Retire [m:${fri.o}] "Deploys never run on Fridays; release with \`make release\`" (reversible with /realctx2 restore)`],
+    });
+    out = model.applyProposal(row(fri.c).key, (p as { plan: ReviewPlan }).plan);
+    expect(out).toEqual({ ok: true, message: `Applied the model's suggestion. Merged [m:${fri.o}] into [m:${fri.c}]; [m:${fri.o}] is retired (restore with /realctx2 restore ${fri.o}).` });
+    n = mem.graph.get(fri.c)!.node;
+    expect(n.text).toBe("Deploys never run on Fridays, except hotfixes with on-call approval; release with `make release`.");
+    expect(mem.paths.displayAnchors(mem.graph.get(fri.c)!).map((a) => a.at).sort()).toEqual(["src/auth/tokenCache.ts", "src/db/schema.ts"]);
+    // the merged memory keeps the stronger gate: the other was a MUST rule
+    expect([n.kind, n.severity, n.urgency]).toEqual(["rule", "must", urgencies.sort((x, y) => order.indexOf(y) - order.indexOf(x))[0]]);
+    expect(mem.graph.get(fri.o)!.node).toMatchObject({ status: "archived", statusReason: `retired: merged into [m:${fri.c}] in review` });
+    expect(model.rows().map((x) => x.label)).toEqual(["rule change"]); // every conflict is settled
+    await r.host.shutdown({ spawnWorker: false });
+  });
+
+  it("refuses suggestions it cannot carry out, and plans for memories that changed meanwhile", async () => {
+    const r = await rig();
+    const mem = r.host.memory!;
+    const o = idOf(await r.run('remember "Logs go to /var/log/app." --scope personal'));
+    r.now.t += 60_000;
+    const c = idOf(await r.run('remember "Logs go to stdout only." --scope personal'));
+    mem.graph.link(mem.graph.get(c)!, "contradicts", mem.graph.get(o)!);
+    mem.graph.commit("personal");
+    const model = new ReviewSession(r.host, mem);
+    const key = model.rows()[0]!.key;
+    const replies: unknown[] = [null, { decision: "keep-both", reason: "x" }, { decision: "merge", reason: "x" }, { decision: "rewrite-current", reason: "x", text: "Logs go to stdout only." }, { decision: "rewrite-other", reason: "Containers log to stdout.", text: "Logs went to /var/log/app before the move to containers." }];
+    r.aux.on("review.resolve", () => {
+      const next = replies.shift();
+      if (next === null) throw new Error("timeout after 120 s");
+      return next;
+    });
+    expect(await model.propose(key)).toEqual({ ok: false, message: "The model gave no usable answer: timeout after 120 s. Nothing changed." });
+    expect(await model.propose(key)).toEqual({ ok: false, message: 'The model chose "keep-both", which is not possible here. Nothing changed.' });
+    expect(await model.propose(key)).toEqual({ ok: false, message: "The model chose merge but gave no new text. Nothing changed." });
+    expect(await model.propose(key)).toEqual({ ok: false, message: `The model chose rewrite-current but left the text of [m:${c}] as it is. Nothing changed.` });
+    const p = await model.propose(key);
+    expect(p.ok).toBe(true);
+    // the other memory was edited after the model read it: the plan is stale
+    mem.graph.sd("personal").patchNode(o, { text: "Logs go to /var/log/app on the VM." });
+    expect(model.applyProposal(key, (p as { plan: ReviewPlan }).plan)).toEqual({ ok: false, message: "The memories changed after the model read them: nothing was applied. Ask again." });
+    expect(mem.graph.get(o)!.node.text).toBe("Logs go to /var/log/app on the VM.");
+    // without an aux model: nothing is asked
+    r.aux.isAvailable = false;
+    const calls = r.aux.calls.length;
+    expect(await model.propose(key)).toEqual({ ok: false, message: "No aux model is available right now: nothing changed." });
+    expect(r.aux.calls).toHaveLength(calls);
+    // a stopped request changes nothing
+    r.aux.isAvailable = true;
+    const stop = new AbortController();
+    r.aux.on("review.resolve", () => (stop.abort(), { decision: "remove-other", reason: "x" }));
+    expect(await model.propose(key, stop.signal)).toEqual({ ok: false, message: "Stopped asking the model: nothing changed." });
+    expect(model.rows()).toHaveLength(1);
+    await r.host.shutdown({ spawnWorker: false });
+  });
+});
+
+describe("review: the aux model settles a flagged memory", () => {
+  it("lets the aux model keep, retire or rewrite a flagged memory (its text or, for a stale rule, its paths), after confirmation", async () => {
+    const r = await rig();
+    const mem = r.host.memory!;
+    const sd = mem.graph.sd("personal");
+    const at = new Date(r.now.t).toISOString();
+    // harm, from attribution
+    const harmful = idOf(await r.run('remember "Clean the build with git clean -fdx." --scope personal'));
+    mem.accounting.bump("personal", harmful, "harm", 1.2);
+    mem.accounting.flush(mem.graph, r.host.cfg);
+    // escalated, then made dormant as low value by the lifecycle
+    const escalated = idOf(await r.run('remember "Callers must await TokenCache.warmup at startup." --kind rule --severity should --scope personal'));
+    sd.patchNode(escalated, { flags: ["escalated"] });
+    const low = idOf(await r.run('remember "The repo has some scripts for various things one might need to do." --scope personal'));
+    sd.patchNode(low, { flags: ["low-value"], status: "dormant", statusReason: "forgetting: low Memory Worth" });
+    // a pinned rule whose file was deleted: the code moved to src/auth/session/tokens.ts
+    const stale = idOf(await r.run('remember "Callers must use TokenCache.refresh, never the raw fetch." --kind rule --severity must --scope personal --path src/auth/tokenCache.ts'));
+    rmSync(join(r.repo, "src/auth/tokenCache.ts"));
+    write(r.repo, "src/auth/session/tokens.ts", "export class TokenCache {\n  refresh(): Promise<void> { return renew(); }\n}\n");
+    for (const a of mem.graph.get(stale)!.node.anchors) sd.setAnchor(stale, { ...a, status: "stale", staleAt: at });
+    sd.patchNode(stale, { flags: ["stale-rule"] });
+    mem.graph.commit("personal");
+    const answers: Record<string, unknown> = {
+      "git clean": { decision: "keep", reason: "The harm came from an unrelated failing test; git clean -fdx is the documented way." },
+      warmup: { decision: "retire", reason: "TokenCache has no warmup method any more." },
+      "some scripts": { decision: "rewrite", reason: "Too vague to act on; package.json defines the scripts.", text: "Format with npm run fmt and lint with npm run lint before committing." },
+      "raw fetch": { decision: "rewrite", reason: "TokenCache moved to src/auth/session/tokens.ts; the rule still holds.", paths: ["src/auth/session/tokens.ts"] },
+    };
+    r.aux.on("review.resolve", (task) => Object.entries(answers).find(([k]) => task.data[0]!.text.includes(k))?.[1] ?? null);
+    const model = new ReviewSession(r.host, mem);
+    const row = (id: string) => model.rows().find((x) => x.id === `[m:${id}]`)!;
+    expect([harmful, escalated, low, stale].map((id) => row(id).label)).toEqual(["harm", "escalated", "low value", "stale rule"]);
+    expect(model.actions(row(harmful).key).map((x) => `${x.key} ${x.label}`)).toEqual(["a approve (keep)", "d dismiss", "e edit", "f forget", "p unpin", "m ask model"]);
+    expect(model.actions(row(harmful).key).at(-1)).toMatchObject({ id: "resolve", ask: true, confirm: `Let the aux model decide: keep, retire or rewrite [m:${harmful}]? Nothing changes until you confirm its suggestion.` });
+
+    // keep: the flags go, the memory stays as it is
+    let p = await model.propose(row(harmful).key);
+    let task = r.aux.calls.at(-1)!;
+    expect(task.role).toBe("review.resolve");
+    expect(task.data.map((d) => d.label)).toEqual(["MEMORY", "WHY FLAGGED"]);
+    expect(task.data[0]!.text).toContain(`id: m:${harmful}\nscope: personal`);
+    expect(task.data[1]!.text).toContain("harm: acted on with a harmful effect (harm 1.20)");
+    expect(task.data[1]!.text).toContain("signals since it was written: delivered 0, used 0 (succeeded 0, failed 0), ignored while relevant 0, contradicted 0, harm 1.2,");
+    expect((task.schema.properties as Record<string, { enum?: string[] }>).decision!.enum).toEqual(["keep", "retire", "rewrite"]);
+    expect(Object.keys(task.schema.properties as object)).toEqual(["decision", "reason", "text", "paths"]);
+    for (const d of ["- keep:", "- retire:", "- rewrite:", "- harm: Agents who acted on it ended up worse off."]) expect(task.instructions).toContain(d);
+    expect(task.instructions).not.toContain("- stale-rule:"); // only its own flags are explained
+    expect(p).toMatchObject({ ok: true, destructive: false, confirm: `The model suggests: keep [m:${harmful}] as it is. Apply it?`, preview: ["Why: The harm came from an unrelated failing test; git clean -fdx is the documented way.", "Its flags (harm) are cleared and it counts as verified"] });
+    expect(mem.graph.get(harmful)!.node.flags).toContain("harm"); // asking changed nothing
+    let out = model.applyProposal(row(harmful).key, (p as { plan: ReviewPlan }).plan);
+    expect(out).toEqual({ ok: true, message: `Applied the model's suggestion. Approved [m:${harmful}]: flags cleared.` });
+    expect(mem.graph.get(harmful)!.node).toMatchObject({ status: "active", text: "Clean the build with git clean -fdx.", verifiedAt: at, reviewBaseline: { at, counters: { harm: 1.2 } } });
+    expect(mem.graph.get(harmful)!.node.flags ?? []).not.toContain("harm");
+
+    // retire
+    p = await model.propose(row(escalated).key);
+    expect(r.aux.calls.at(-1)!.instructions).toContain("- escalated: Agents kept breaking it");
+    expect(p).toMatchObject({ ok: true, destructive: true, confirm: `The model suggests: retire [m:${escalated}]. Apply it?`, preview: ["Why: TokenCache has no warmup method any more.", `Retire [m:${escalated}] "Callers must await TokenCache.warmup at startup" (reversible with /realctx2 restore)`] });
+    out = model.applyProposal(row(escalated).key, (p as { plan: ReviewPlan }).plan);
+    expect(out).toEqual({ ok: true, message: `Applied the model's suggestion. Retired [m:${escalated}] "Callers must await TokenCache.warmup at startup" (restore with /realctx2 restore ${escalated}).` });
+    expect(mem.graph.get(escalated)!.node.status).toBe("archived");
+
+    // rewrite the text: a dormant low-value memory comes back with the new text
+    p = await model.propose(row(low).key);
+    expect(r.aux.calls.at(-1)!.data[1]!.text).toContain("status: dormant (forgetting: low Memory Worth)");
+    expect(p).toMatchObject({ ok: true, destructive: false, confirm: `The model suggests: rewrite [m:${low}]. Apply it?`, preview: ["Why: Too vague to act on; package.json defines the scripts.", `New text of [m:${low}]`, "  Format with npm run fmt and lint with npm run lint before committing.", "Its flags (low value) are cleared and it counts as verified; it becomes active again"] });
+    out = model.applyProposal(row(low).key, (p as { plan: ReviewPlan }).plan);
+    expect(out).toEqual({ ok: true, message: `Applied the model's suggestion. Updated [m:${low}]: text. Its flags are cleared; it is active again.` });
+    let n = mem.graph.get(low)!.node;
+    expect([n.text, n.title, n.status]).toEqual(["Format with npm run fmt and lint with npm run lint before committing.", "Format with npm run fmt and lint with npm run lint before committing", "active"]);
+    expect(n.flags ?? []).not.toContain("low-value"); // ("revived" marks the wake-up, as for approve)
+
+    // rewrite the paths of a stale rule: it follows the code to its new file, the text stays
+    p = await model.propose(row(stale).key);
+    task = r.aux.calls.at(-1)!;
+    expect(task.data[0]!.text).toContain("stale paths (deleted or moved): src/auth/tokenCache.ts");
+    expect(task.data[0]!.text).not.toMatch(/\npaths: /);
+    expect(task.instructions).toContain("- stale-rule: The paths it applied to were deleted or moved");
+    expect(p).toMatchObject({ ok: true, confirm: `The model suggests: rewrite [m:${stale}]. Apply it?`, preview: ["Why: TokenCache moved to src/auth/session/tokens.ts; the rule still holds.", "New paths: src/auth/session/tokens.ts (instead of src/auth/tokenCache.ts)", "Its flags (stale rule) are cleared and it counts as verified"] });
+    out = model.applyProposal(row(stale).key, (p as { plan: ReviewPlan }).plan);
+    expect(out).toEqual({ ok: true, message: `Applied the model's suggestion. Updated [m:${stale}]: anchors. Its flags are cleared.` });
+    n = mem.graph.get(stale)!.node;
+    expect([n.text, n.kind, n.severity, n.flags ?? []]).toEqual(["Callers must use TokenCache.refresh, never the raw fetch.", "rule", "must", []]);
+    expect(mem.paths.displayAnchors(mem.graph.get(stale)!).filter((a) => a.anchor.status === "live").map((a) => a.at)).toEqual(["src/auth/session/tokens.ts"]);
+    expect(mem.delivery.rulesAt("src/auth/session/tokens.ts").map((x) => x.ref.node.id)).toContain(stale);
+    expect(model.rows()).toEqual([]);
+    await r.host.shutdown({ spawnWorker: false });
+  });
+
+  it("refuses suggestions it cannot carry out, and plans for a memory that changed meanwhile", async () => {
+    const r = await rig();
+    const mem = r.host.memory!;
+    const id = idOf(await r.run('remember "Use the staging database for load tests." --scope personal --path src/db/schema.ts'));
+    mem.graph.sd("personal").patchNode(id, { flags: ["rewrite-candidate"] });
+    mem.graph.commit("personal");
+    mem.review.add({ at: new Date(r.now.t).toISOString(), scope: "personal", id, kind: "rule-obsolete" });
+    const model = new ReviewSession(r.host, mem);
+    const key = model.rows().find((x) => x.label === "rewrite candidate")!.key;
+    // a queued re-verification verdict already is the aux model's answer: it is not asked again
+    const queued = model.rows().find((x) => x.label === "obsolete rule")!.key;
+    expect(model.actions(queued).map((x) => x.id)).not.toContain("resolve");
+    expect(await model.propose(queued)).toEqual({ ok: false, message: "Only a conflict or a flagged memory can be settled by the model." });
+    const replies: unknown[] = [
+      { decision: "merge", reason: "x", text: "y" },
+      { decision: "rewrite", reason: "x" },
+      { decision: "rewrite", reason: "x", text: "Use the staging database for load tests.", paths: ["src/db/schema.ts"] },
+      { decision: "rewrite", reason: "x", paths: ["src/db/schema.ts", "src/db/nowhere.ts"] },
+      { decision: "rewrite", reason: "Load tests need their own database.", text: "Run load tests against the loadtest database, never staging.", paths: ["src/db/", "**/*.load.ts"] },
+    ];
+    r.aux.on("review.resolve", () => replies.shift());
+    expect(await model.propose(key)).toEqual({ ok: false, message: 'The model chose "merge", which is not possible here. Nothing changed.' });
+    expect(await model.propose(key)).toEqual({ ok: false, message: `The model chose rewrite but changed neither the text nor the paths of [m:${id}]. Nothing changed.` });
+    expect(await model.propose(key)).toEqual({ ok: false, message: `The model chose rewrite but changed neither the text nor the paths of [m:${id}]. Nothing changed.` });
+    expect(await model.propose(key)).toEqual({ ok: false, message: "The model chose rewrite with paths that do not exist here (src/db/nowhere.ts). Nothing changed." });
+    const p = await model.propose(key);
+    expect(p).toMatchObject({ ok: true, preview: ["Why: Load tests need their own database.", `New text of [m:${id}]`, "  Run load tests against the loadtest database, never staging.", "New paths: src/db/, **/*.load.ts (instead of src/db/schema.ts)", "Its flags (rewrite candidate) are cleared and it counts as verified"] });
+    // a plan for one item is not applied to another
+    expect(model.applyProposal(queued, (p as { plan: ReviewPlan }).plan)).toEqual({ ok: false, message: "This item is no longer pending." });
+    // the memory was edited after the model read it: the plan is stale
+    mem.graph.sd("personal").patchNode(id, { text: "Use the staging database for load tests on weekends." });
+    expect(model.applyProposal(key, (p as { plan: ReviewPlan }).plan)).toEqual({ ok: false, message: "The memory changed after the model read it: nothing was applied. Ask again." });
+    expect(mem.graph.get(id)!.node).toMatchObject({ text: "Use the staging database for load tests on weekends.", flags: ["rewrite-candidate"] });
+    expect(mem.paths.displayAnchors(mem.graph.get(id)!).map((a) => a.at)).toEqual(["src/db/schema.ts"]);
+    await r.host.shutdown({ spawnWorker: false });
+  });
+});
+
+describe("review: the user edits the model's suggestion before applying it", () => {
+  type Suggested = Extract<ReviewProposal, { ok: true }>;
+  const HELP = ["# Lines above the --- line that start with # are ignored.", "# Save to see your edit before anything is applied; close without saving to keep the suggestion as it was."];
+
+  it("edits a suggested merge or rewrite of a conflict: the edit is checked like the model's answer and applied only after confirmation", async () => {
+    const r = await rig();
+    const mem = r.host.memory!;
+    const conflict = async (current: string, other: string) => {
+      const o = idOf(await r.run(`remember "${other}" --scope personal`));
+      r.now.t += 60_000;
+      const c = idOf(await r.run(`remember "${current}" --scope personal`));
+      mem.graph.link(mem.graph.get(c)!, "contradicts", mem.graph.get(o)!);
+      mem.graph.commit("personal");
+      return { c, o };
+    };
+    const fri = await conflict("Deploys run on Fridays.", "Deploys never run on Fridays.");
+    const tests = await conflict("Run the tests with vitest only.", "Run the tests with bun test only.");
+    const port = await conflict("The API listens on port 9090.", "The API listens on port 8080.");
+    const answers: Record<string, unknown> = {
+      "run on Fridays": { decision: "merge", reason: "Fridays are frozen except for hotfixes.", text: "Deploys never run on Fridays, except hotfixes." },
+      "vitest only": { decision: "rewrite-current", reason: "Both runners are used.", text: "Run the tests with vitest and with bun test." },
+      "port 9090": { decision: "remove-current", reason: "server.ts binds 8080." },
+    };
+    r.aux.on("review.resolve", (task) => Object.entries(answers).find(([k]) => task.data[0]!.text.includes(k))?.[1] ?? null);
+    const model = new ReviewSession(r.host, mem);
+    const row = (id: string) => model.rows().find((x) => x.id === `[m:${id}]`)!;
+
+    // the merge: its text opens in the editor
+    let key = row(fri.c).key;
+    let p = (await model.propose(key)) as Suggested;
+    const form = model.proposalForm(key, p.plan)!;
+    expect(form.title).toBe(`Edit the model's suggestion for [m:${fri.c}]`);
+    expect(form.prefill).toBe([`# Editing the merged text that goes into [m:${fri.c}] ([m:${fri.o}] is retired), as the aux model suggested it.`, ...HELP, "---", "Deploys never run on Fridays, except hotfixes."].join("\n"));
+    // an edit that cannot be used: the suggestion stands, and the edit can be fixed
+    expect(model.reviseProposal(key, p.plan, "Deploys never run on Fridays.")).toEqual({ ok: false, fixable: true, message: "the form has no --- line above the text" });
+    expect(model.reviseProposal(key, p.plan, form.prefill.replace(/---\n[^]*$/, "---\n  \n"))).toEqual({ ok: false, fixable: true, message: "the text below the --- line is empty" });
+    // the edited suggestion; a # line below --- is text, not a comment
+    const merged = "Deploys never run on Fridays, except hotfixes.\n# Hotfixes\nA hotfix needs on-call approval.";
+    const revised = model.reviseProposal(key, p.plan, form.prefill.replace("except hotfixes.", "except hotfixes.\n# Hotfixes\nA hotfix needs on-call approval.")) as Suggested;
+    expect(revised).toMatchObject({
+      ok: true,
+      destructive: true,
+      confirm: `Your edit of the model's suggestion: merge both into [m:${fri.c}] and retire [m:${fri.o}]. Apply it?`,
+      preview: ["The model's reason: Fridays are frozen except for hotfixes.", `Merged text of [m:${fri.c}]`, "  Deploys never run on Fridays, except hotfixes.", "  # Hotfixes", "  A hotfix needs on-call approval.", `Retire [m:${fri.o}] "Deploys never run on Fridays" (reversible with /realctx2 restore)`],
+    });
+    expect(revised.plan).toEqual({ ...p.plan, text: merged, edited: true });
+    expect(mem.graph.get(fri.c)!.node.text).toBe("Deploys run on Fridays."); // editing changed nothing
+    // editing again starts from the edit
+    expect(model.proposalForm(key, revised.plan)!.prefill.endsWith(`---\n${merged}`)).toBe(true);
+    expect(model.applyProposal(key, revised.plan)).toEqual({ ok: true, message: `Applied the model's suggestion as you edited it. Merged [m:${fri.o}] into [m:${fri.c}]; [m:${fri.o}] is retired (restore with /realctx2 restore ${fri.o}).` });
+    expect(mem.graph.get(fri.c)!.node.text).toBe(merged);
+    expect(mem.graph.get(fri.o)!.node.status).toBe("archived");
+
+    // a rewrite: the edit must still change the memory
+    key = row(tests.c).key;
+    p = (await model.propose(key)) as Suggested;
+    const rewrite = model.proposalForm(key, p.plan)!.prefill;
+    expect(rewrite.split("\n")[0]).toBe(`# Editing the new text of [m:${tests.c}] ([m:${tests.o}] stays as it is), as the aux model suggested it.`);
+    expect(model.reviseProposal(key, p.plan, rewrite.replace("Run the tests with vitest and with bun test.", "Run the tests with vitest only."))).toEqual({ ok: false, fixable: true, message: `the text is the current text of [m:${tests.c}], so nothing would be rewritten` });
+    // the memories changed after the model read them: the suggestion is dropped, not fixed
+    mem.graph.sd("personal").patchNode(tests.o, { text: "Run the tests with bun test, never vitest." });
+    expect(model.reviseProposal(key, p.plan, rewrite)).toEqual({ ok: false, message: "The memories changed after the model read them: the suggestion was dropped. Ask again." });
+    expect(mem.graph.get(tests.c)!.node.text).toBe("Run the tests with vitest only.");
+
+    // retiring has no text to edit
+    key = row(port.c).key;
+    p = (await model.propose(key)) as Suggested;
+    expect(model.proposalForm(key, p.plan)).toBeNull();
+    expect(model.reviseProposal(key, p.plan, "---\nThe API listens on port 9090.")).toEqual({ ok: false, message: "A suggestion to remove-current has no text to edit." });
+    expect(mem.graph.get(port.c)!.node.status).toBe("active");
+    await r.host.shutdown({ spawnWorker: false });
+  });
+
+  it("edits a suggested rewrite of a flagged memory: its text and its paths", async () => {
+    const r = await rig();
+    const mem = r.host.memory!;
+    const id = idOf(await r.run('remember "Use the staging database for load tests." --scope personal --path src/db/schema.ts'));
+    mem.graph.sd("personal").patchNode(id, { flags: ["rewrite-candidate"] });
+    mem.graph.commit("personal");
+    r.aux.on("review.resolve", () => ({ decision: "rewrite", reason: "Load tests need their own database.", text: "Run load tests against the loadtest database, never staging." }));
+    const model = new ReviewSession(r.host, mem);
+    const key = model.rows()[0]!.key;
+    // the memory's own edit form keeps a # line below --- as text too
+    expect(model.planEdit(key, "# a comment\npaths: src/db/schema.ts\n---\n# Load tests\nUse the loadtest database.")).toMatchObject({ ok: true, preview: ["New text", "  # Load tests", "  Use the loadtest database."] });
+
+    const p = (await model.propose(key)) as Suggested;
+    const form = model.proposalForm(key, p.plan)!;
+    expect(form.title).toBe(`Edit the model's suggestion for [m:${id}]`);
+    expect(form.prefill).toBe(
+      [
+        `# Editing the aux model's suggested rewrite of [m:${id}]: its paths and its text.`,
+        ...HELP,
+        "# repository paths or globs, comma-separated; a trailing / covers the subtree; empty: no paths",
+        "paths: src/db/schema.ts", // its paths as they are: the model suggested none
+        "---",
+        "Run load tests against the loadtest database, never staging.",
+      ].join("\n"),
+    );
+    const edit = (paths: string, text = "Run load tests against the loadtest database, never staging.") => form.prefill.replace("paths: src/db/schema.ts", `paths: ${paths}`).replace(/---\n[^]*$/, `---\n${text}`);
+    expect(model.reviseProposal(key, p.plan, edit("src/db/schema.ts, src/db/nowhere.ts"))).toEqual({ ok: false, fixable: true, message: "these paths do not exist here: src/db/nowhere.ts" });
+    expect(model.reviseProposal(key, p.plan, edit("src/db/schema.ts", "Use the staging database for load tests."))).toEqual({ ok: false, fixable: true, message: `it changes neither the text nor the paths of [m:${id}], so nothing would be rewritten` });
+    // an empty paths line takes them all away, and says so
+    expect((model.reviseProposal(key, p.plan, edit("")) as Suggested).preview).toContain("No paths: it applies everywhere in its store (instead of src/db/schema.ts)");
+    // new text and a subtree instead of the one file
+    const text = "Run load tests against the loadtest database (src/db/loadtest.ts), never staging.";
+    const revised = model.reviseProposal(key, p.plan, edit("src/db/", text)) as Suggested;
+    expect(revised).toMatchObject({
+      ok: true,
+      destructive: false,
+      confirm: `Your edit of the model's suggestion: rewrite [m:${id}]. Apply it?`,
+      preview: ["The model's reason: Load tests need their own database.", `New text of [m:${id}]`, `  ${text}`, "New paths: src/db/ (instead of src/db/schema.ts)", "Its flags (rewrite candidate) are cleared and it counts as verified"],
+    });
+    expect(model.proposalForm(key, revised.plan)!.prefill).toContain(`paths: src/db/\n---\n${text}`);
+    expect(mem.graph.get(id)!.node.text).toBe("Use the staging database for load tests."); // editing changed nothing
+    expect(model.applyProposal(key, revised.plan)).toEqual({ ok: true, message: `Applied the model's suggestion as you edited it. Updated [m:${id}]: text, anchors. Its flags are cleared.` });
+    const n = mem.graph.get(id)!;
+    expect(n.node.text).toBe(text);
+    expect(n.node.flags ?? []).not.toContain("rewrite-candidate");
+    expect(mem.paths.displayAnchors(n).filter((a) => a.anchor.status === "live").map((a) => a.at)).toEqual(["src/db/**"]);
     expect(model.rows()).toEqual([]);
     await r.host.shutdown({ spawnWorker: false });
   });

@@ -26,7 +26,7 @@ export const MODEL_COOLDOWN_STRIKES = 2;
 /** Cooldown duration for failing background aux models (2 minutes). */
 const MODEL_COOLDOWN_MS = 2 * 60_000;
 /** User-initiated foreground roles still retry during cooldown and clear it on success. */
-const FOREGROUND_ROLES = new Set<AuxRole>(["qemem.planner", "qemem.constructor", "ingest.slicer"]);
+const FOREGROUND_ROLES = new Set<AuxRole>(["qemem.planner", "qemem.constructor", "ingest.slicer", "review.resolve"]);
 
 interface ModelHealth {
   failures: number;

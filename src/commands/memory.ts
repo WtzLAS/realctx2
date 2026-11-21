@@ -169,7 +169,8 @@ export async function pin(host: Host, io: CommandIO, p: Parsed, value: boolean):
 
 // ───────────── rules (§6.9.3)
 /** The live path anchors as the form shows them: a subtree ends in `/`. */
-function formAnchors(mem: MemoryRuntime, ref: ScopedNode): Array<{ spec: string; anchor: PathAnchor }> {
+/** A memory's live anchors as the paths the edit form shows (a trailing / covers the subtree). */
+export function formAnchors(mem: MemoryRuntime, ref: ScopedNode): Array<{ spec: string; anchor: PathAnchor }> {
   return mem.paths
     .displayAnchors(ref)
     .filter((a) => a.at && a.anchor.status === "live")
@@ -180,7 +181,7 @@ function formAnchors(mem: MemoryRuntime, ref: ScopedNode): Array<{ spec: string;
 export function memoryForm(mem: MemoryRuntime, ref: ScopedNode, opts: { text?: string; note?: string } = {}): string {
   const n = ref.node;
   return [
-    `# Editing ${mid(n)} (${scopeLabel(ref.scope)}). Lines starting with # are ignored. Save to apply; empty the text to cancel.`,
+    `# Editing ${mid(n)} (${scopeLabel(ref.scope)}). Lines above the --- line that start with # are ignored. Save to apply; empty the text to cancel.`,
     ...(opts.note ? opts.note.split("\n").map((l) => `# ${l}`) : []),
     ...(n.kind === "rule" || n.severity ? [`severity: ${n.severity ?? "info"}`] : []),
     `# immediate | hint | caption | passive`,
@@ -196,25 +197,40 @@ export function memoryForm(mem: MemoryRuntime, ref: ScopedNode, opts: { text?: s
   ].join("\n");
 }
 
-function parseRuleForm(text: string): { severity?: Severity; urgency?: Urgency; paths: string[]; commands: string[]; on: TriggerAction[]; text: string } | null {
-  const lines = text.split("\n").filter((l) => !l.startsWith("#"));
+/**
+ * An edit form: `key: value` fields and `#` comments above the first `---` line, the text below it.
+ * Only the fields are comments-aware: a `# heading` in the text stays. Null: there is no `---` line.
+ */
+export function splitForm(form: string): { field(key: string): string | undefined; list(key: string): string[]; text: string } | null {
+  const lines = form.replace(/\r\n?/g, "\n").split("\n");
   const sep = lines.findIndex((l) => l.trim() === "---");
   if (sep < 0) return null;
   const head = new Map<string, string>();
   for (const l of lines.slice(0, sep)) {
+    if (l.startsWith("#")) continue;
     const m = /^(\w+):\s*(.*)$/.exec(l);
     if (m) head.set(m[1]!.toLowerCase(), m[2]!.trim());
   }
-  const list = (k: string) => (head.get(k) ?? "").split(",").map((x) => x.trim()).filter(Boolean);
-  const sev = head.get("severity");
-  const urg = head.get("urgency");
+  return {
+    field: (k) => head.get(k),
+    list: (k) => [...new Set((head.get(k) ?? "").split(",").map((x) => x.trim()).filter(Boolean))],
+    text: lines.slice(sep + 1).join("\n").trim(),
+  };
+}
+
+function parseRuleForm(text: string): { severity?: Severity; urgency?: Urgency; paths: string[]; commands: string[]; on: TriggerAction[]; text: string } | null {
+  const form = splitForm(text);
+  if (!form) return null;
+  const list = form.list;
+  const sev = form.field("severity");
+  const urg = form.field("urgency");
   return {
     severity: SEVERITIES.includes(sev as Severity) ? (sev as Severity) : undefined,
     urgency: URGENCY_ORDER.includes(urg as Urgency) ? (urg as Urgency) : undefined,
     paths: list("paths"),
     commands: list("commands"),
     on: list("on").filter((x): x is TriggerAction => ACTIONS.includes(x as TriggerAction)),
-    text: lines.slice(sep + 1).join("\n").trim(),
+    text: form.text,
   };
 }
 
@@ -233,6 +249,21 @@ export interface EditPlan {
 export function planMemoryEdit(mem: MemoryRuntime, ref: ScopedNode, edited: string): EditPlan | { error: string } {
   const form = parseRuleForm(edited);
   if (!form || !form.text) return { error: "the form had no text below the --- line" };
+  return planMemoryFields(mem, ref, form);
+}
+
+/** The fields of a memory edit. Left out (`commands` and `on`, or `severity`, `urgency`): they stay as they are. */
+export interface MemoryFields {
+  text: string;
+  severity?: Severity;
+  urgency?: Urgency;
+  /** Replace the live paths; the specs `formAnchors` shows keep their anchors as they are. */
+  paths: string[];
+  commands?: string[];
+  on?: TriggerAction[];
+}
+
+export function planMemoryFields(mem: MemoryRuntime, ref: ScopedNode, form: MemoryFields): EditPlan {
   const n = ref.node;
   const text = sanitize(form.text);
   const changes: string[] = [];
@@ -269,12 +300,16 @@ export function planMemoryEdit(mem: MemoryRuntime, ref: ScopedNode, edited: stri
   const removed = [...have].filter(([k]) => !wantKeys.has(k)).map(([, a]) => a);
   const added = wanted.filter((a) => !have.has(anchorKey(a)));
   if (removed.length || added.length) changes.push("anchors");
-  const triggers = { ...(form.on.length || form.commands.length ? { on: [...new Set([...form.on, ...(form.commands.length ? (["command"] as TriggerAction[]) : [])])] } : {}), ...(form.commands.length ? { commands: form.commands } : {}) };
-  if (JSON.stringify(triggers) !== JSON.stringify(n.triggers ?? {})) {
-    patch.triggers = Object.keys(triggers).length ? triggers : null;
-    changes.push("triggers");
+  if (form.on !== undefined || form.commands !== undefined) {
+    const on = form.on ?? [];
+    const commands = form.commands ?? [];
+    const triggers = { ...(on.length || commands.length ? { on: [...new Set([...on, ...(commands.length ? (["command"] as TriggerAction[]) : [])])] } : {}), ...(commands.length ? { commands } : {}) };
+    if (JSON.stringify(triggers) !== JSON.stringify(n.triggers ?? {})) {
+      patch.triggers = Object.keys(triggers).length ? triggers : null;
+      changes.push("triggers");
+    }
   }
-  const triggered = wanted.length > 0 || form.commands.length > 0;
+  const triggered = wanted.length > 0 || (form.commands ?? n.triggers?.commands ?? []).length > 0;
   if (form.urgency && form.urgency !== n.urgency) {
     patch.urgency = capUrgency(form.urgency, triggered);
     patch.urgencyBy = "user";

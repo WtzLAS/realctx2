@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { PiAdapter } from "../src/adapters/pi/adapter.ts";
@@ -399,6 +399,125 @@ describe("the review screen in pi", () => {
     expect(r.calls).toEqual([]); // commands never reach the model
     await r.shutdown();
   });
+
+  it("lets the aux model settle a conflict from its details: it merges both, the user edits the merged text, and it applies once the user confirms", async () => {
+    const cwd = repo();
+    const r = await piRig({ cwd, mode: "tui" });
+    // the write path's judge finds the second memory contradicts the first, and does not replace it
+    r.decision.handler = (names) => Object.fromEntries(names.map((n) => [n, n.startsWith("rel.") ? { contradictory: 0.95, compatible: 0.05 } : 0.05]));
+    const ids: string[] = [];
+    for (const text of ["Deploys never run on Fridays.", "Deploys run on Fridays."]) {
+      r.ui.screens.push((c) => c.handleInput("\x1b"));
+      await r.prompt(`/realctx2 remember "${text}" --scope personal`);
+      ids.push(/\[m:([0-9a-z]{8})\]/.exec(r.ui.shown.at(-1)!)![1]!);
+    }
+    const [other, current] = ids as [string, string];
+    r.aux.push({ when: "contradict each other", reply: () => ({ decision: "merge", reason: "Fridays are frozen except for hotfixes.", text: "Deploys never run on Fridays, except hotfixes with on-call approval." }) });
+    const seen: Record<string, string> = {};
+    r.ui.screens.push(async (c, render) => {
+      seen.list = render();
+      c.handleInput("\r");
+      seen.details = render();
+      c.handleInput("m");
+      seen.asking = render();
+      for (let i = 0; i < 300 && !render().includes("The model suggests"); i++) await new Promise((res) => setTimeout(res, 10));
+      seen.question = render();
+      c.handleInput("e"); // pi's editor opens on the merged text
+    });
+    // the user adds a line in pi's editor; the screen comes back with the edited suggestion
+    r.ui.edits.push((prefill) => {
+      seen.prefill = prefill;
+      return prefill.replace("with on-call approval.", "with on-call approval.\nAnnounce them in #deploys first.");
+    });
+    r.ui.screens.push((c, render) => {
+      seen.edited = render();
+      c.handleInput("m");
+      seen.done = render();
+      c.handleInput("\x1b");
+    });
+    await r.prompt("/realctx2 review");
+    expect(r.errors).toEqual([]);
+    expect(seen.list).toContain(`› conflict  [m:${current}] Deploys run on Fridays`);
+    expect(seen.details).toContain("m ask model");
+    expect(seen.asking).toContain("Asking the aux model how to settle this");
+    // a real aux session: read-only tools, both memories as data, the allowed decisions in the schema
+    const call = r.auxCalls.at(-1)!;
+    expect(call.system).toContain("You are a read-only helper process for realctx2. Use your tools");
+    expect(call.user).toContain(`<data label="CURRENT">`);
+    expect(call.user).toContain("text:\nDeploys never run on Fridays.");
+    for (const d of ["- remove-current:", "- remove-other:", "- rewrite-current:", "- rewrite-other:", "- merge:"]) expect(call.system).toContain(d);
+    expect(call.system).toContain("call the `submit_result` tool exactly once"); // the schema travels as that tool's parameters
+    expect(seen.question).toContain(`? The model suggests: merge both into [m:${current}] and retire [m:${other}]. Apply it?`);
+    expect(seen.question).toContain("Why: Fridays are frozen except for hotfixes.");
+    expect(seen.question).toContain("Deploys never run on Fridays, except hotfixes with on-call approval.");
+    expect(seen.question).toContain("Press m again or y to apply · e to edit it first");
+    expect(seen.prefill).toContain(`# Editing the merged text that goes into [m:${current}] ([m:${other}] is retired), as the aux model suggested it.`);
+    expect(seen.prefill.endsWith("---\nDeploys never run on Fridays, except hotfixes with on-call approval.")).toBe(true);
+    expect(seen.edited).toContain(`? Your edit of the model's suggestion: merge both into [m:${current}] and retire [m:${other}]. Apply`); // wraps at 100 columns
+    expect(seen.edited).toContain("The model's reason: Fridays are frozen except for hotfixes.");
+    expect(seen.edited).toContain("Announce them in #deploys first.");
+    expect(seen.done).toContain(`✓ Applied the model's suggestion as you edited it. Merged [m:${other}] into [m:${current}]`);
+    expect(seen.done).toContain("Nothing to review.");
+    expect(r.auxCalls.filter((x) => x.system.includes("contradict each other"))).toHaveLength(1); // editing does not ask the model again
+    r.ui.screens.push((c) => c.handleInput("\x1b"), (c) => c.handleInput("\x1b"));
+    await r.prompt(`/realctx2 inspect m:${current}`);
+    expect(r.ui.shown.at(-1)).toMatch(/Deploys never run on Fridays, except hotfixes with on-call approval\.\n\s*Announce them in #deploys first\./);
+    await r.prompt(`/realctx2 inspect m:${other}`);
+    expect(r.ui.shown.at(-1)).toMatch(/archived/);
+    expect(r.calls).toEqual([]);
+    await r.shutdown();
+  }, 20_000);
+
+  it("lets the aux model settle a flagged memory: a rule whose file is gone follows the code to its new file once the user confirms", async () => {
+    const cwd = repo();
+    const r = await piRig({ cwd, mode: "tui", config: { paths: { absentToDeletedDays: 0 } } });
+    const cmd = async (line: string) => {
+      r.ui.screens.push((c) => c.handleInput("\x1b"));
+      await r.prompt(line);
+      return r.ui.shown.at(-1)!;
+    };
+    const id = /\[m:([0-9a-z]{8})\]/.exec(await cmd('/realctx2 remember "Callers must use TokenCache.refresh, never the raw fetch." --kind rule --severity must --scope personal --path src/auth/tokenCache.ts'))![1]!;
+    // the code moves to a new file that git does not see as a rename; the old path is deleted on the default branch
+    rmSync(join(cwd, "src/auth/tokenCache.ts"));
+    write(cwd, "src/auth/session/tokens.ts", "import { renewSession } from './renew';\n\nexport class TokenCache {\n  private token: string | null = null;\n  async refresh(): Promise<string> {\n    this.token = await renewSession();\n    return this.token;\n  }\n}\n");
+    commitAll(cwd, "move the token cache");
+    expect(await cmd("/realctx2 paths sync")).toContain("1 newly absent");
+    expect(await cmd("/realctx2 paths sync")).toContain("1 rule(s) flagged for review");
+    r.aux.push({ when: "was flagged for review", reply: () => ({ decision: "rewrite", reason: "TokenCache moved to src/auth/session/tokens.ts; the rule still holds there.", paths: ["src/auth/session/tokens.ts"] }) });
+    const seen: Record<string, string> = {};
+    r.ui.screens.push(async (c, render) => {
+      seen.list = render();
+      c.handleInput("\r");
+      seen.details = render();
+      c.handleInput("m");
+      seen.asking = render();
+      for (let i = 0; i < 300 && !render().includes("The model suggests"); i++) await new Promise((res) => setTimeout(res, 10));
+      seen.question = render();
+      c.handleInput("m");
+      seen.done = render();
+      c.handleInput("\x1b");
+    });
+    await r.prompt("/realctx2 review");
+    expect(r.errors).toEqual([]);
+    expect(seen.list).toContain(`› stale rule  [m:${id}] Callers must use TokenCache.refresh, never the raw fetch`);
+    expect(seen.details).toContain("m ask model");
+    expect(seen.asking).toContain("Asking the aux model how to settle this");
+    // a real aux session: read-only tools, the memory and its flags as data, keep / retire / rewrite
+    const call = r.auxCalls.at(-1)!;
+    expect(call.system).toContain("You are a read-only helper process for realctx2. Use your tools");
+    for (const d of ["- keep:", "- retire:", "- rewrite:", "- stale-rule: The paths it applied to were deleted or moved"]) expect(call.system).toContain(d);
+    expect(call.user).toContain(`<data label="MEMORY">`);
+    expect(call.user).toContain("stale paths (deleted or moved): src/auth/tokenCache.ts");
+    expect(call.user).toContain(`<data label="WHY FLAGGED">`);
+    expect(seen.question).toContain(`? The model suggests: rewrite [m:${id}]. Apply it?`);
+    expect(seen.question).toContain("New paths: src/auth/session/tokens.ts (instead of src/auth/tokenCache.ts)");
+    expect(seen.done).toContain(`✓ Applied the model's suggestion. Updated [m:${id}]: anchors. Its flags are cleared.`);
+    expect(seen.done).toContain("Nothing to review.");
+    // the rule is in force at its new file again
+    expect(await cmd("/realctx2 rules src/auth/session/tokens.ts")).toContain(`MUST   [m:${id}] Callers must use TokenCache.refresh, never the raw fetch.`);
+    expect(r.calls).toEqual([]);
+    await r.shutdown();
+  }, 20_000);
 });
 
 describe("pressure, compaction and name conflicts in pi", () => {

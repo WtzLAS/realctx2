@@ -5,10 +5,16 @@
  * per-item actions. Every action takes two separate keypresses: the first shows exactly what will
  * happen, the second (the same key again, or `y`) carries it out; any other key cancels. An edit
  * opens pi's editor, and the planned changes are confirmed the same way before anything is written.
+ * On a conflict or a flagged memory, "ask model" lets the aux model choose how to settle it (retire,
+ * rewrite or merge a conflict; keep, retire or rewrite a flagged memory); the screen waits for it
+ * (Esc stops), and its suggestion is confirmed the same way. A suggested rewrite or merge can be
+ * edited first (`e` at its question): pi's editor opens on its text, and the edited suggestion is
+ * checked and asked about again before anything is written.
  */
 import type { Component, TUI, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { decodeKittyPrintable, getKeybindings, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import type { ReviewActionSpec, ReviewModel, ReviewRow } from "../../commands/review.ts";
+import { isEditablePlan, type ReviewPlan, type ReviewActionSpec, type ReviewModel, type ReviewProposal, type ReviewRow } from "../../commands/review.ts";
+import { errMsg } from "../../util/errors.ts";
 import type { ReportTheme } from "./report-ui.ts";
 
 type Tone = "success" | "error" | "warning";
@@ -19,14 +25,17 @@ export interface ReviewScreenState {
   selected: number;
   scroll: number;
   flash: { text: string; tone: Tone } | null;
-  /** The action waiting for its second, separate confirmation. */
-  pending: { key: string; action: ReviewActionSpec; edited?: string; summary?: string; preview?: string[] } | null;
+  /** The action waiting for its second, separate confirmation: an edit, the aux model's suggestion, or a plain action. */
+  pending: { key: string; action: ReviewActionSpec; edited?: string; summary?: string; preview?: string[]; plan?: ReviewPlan; question?: string; destructive?: boolean; note?: string } | null;
+  /** The aux model is deciding about an item; every key but Esc (which stops it) waits. */
+  asking?: { key: string; since: number; controller: AbortController } | null;
 }
 
-export type ReviewScreenExit = { kind: "close" } | { kind: "edit"; key: string };
+/** `edit`: an item's own edit form; `revise`: the pending suggestion's text, which stays pending meanwhile. */
+export type ReviewScreenExit = { kind: "close" } | { kind: "edit"; key: string } | { kind: "revise"; key: string };
 
 export function initialReviewState(): ReviewScreenState {
-  return { view: "list", selected: 0, scroll: 0, flash: null, pending: null };
+  return { view: "list", selected: 0, scroll: 0, flash: null, pending: null, asking: null };
 }
 
 export interface Realctx2ReviewOptions {
@@ -56,6 +65,8 @@ export class Realctx2ReviewComponent implements Component {
   private cache: { key: string; lines: readonly string[] } | null = null;
   private lastDetailWidth = 76;
   private detailCache: { key: string; width: number; lines: string[] } | null = null;
+  /** Re-renders the elapsed time while the aux model is asked. */
+  private ticker: ReturnType<typeof setInterval> | null = null;
 
   constructor(opts: Realctx2ReviewOptions) {
     this.model = opts.model;
@@ -98,7 +109,15 @@ export class Realctx2ReviewComponent implements Component {
   private exit(x: ReviewScreenExit): void {
     if (this.exited) return;
     this.exited = true;
+    this.state.asking?.controller.abort();
+    this.state.asking = null;
+    this.stopTicker();
     this.onExit(x);
+  }
+
+  private stopTicker(): void {
+    if (this.ticker) clearInterval(this.ticker);
+    this.ticker = null;
   }
 
   private bodyRows(): number {
@@ -117,14 +136,21 @@ export class Realctx2ReviewComponent implements Component {
     const s = this.state;
     const kb = getKeybindings();
     const ch = printable(data);
+    const cancel = kb.matches(data, "tui.select.cancel") || matchesKey(data, Key.escape);
+    if (s.asking) {
+      // nothing to navigate while the model decides: Esc (or q, Ctrl+C) stops it, other keys wait
+      if (cancel || matchesKey(data, Key.ctrl("c")) || ch === "q" || ch === "Q") this.stopAsking();
+      return;
+    }
     if (s.pending) {
+      // the suggested text opens in the editor; it is asked about again when the screen comes back
+      if ((ch === "e" || ch === "E") && ch !== s.pending.action.key && this.revisable(s.pending)) return this.exit({ kind: "revise", key: s.pending.key });
       this.answerConfirmation(ch);
       this.changed();
       return;
     }
     if (matchesKey(data, Key.ctrl("c"))) return this.exit({ kind: "close" });
     s.flash = null;
-    const cancel = kb.matches(data, "tui.select.cancel") || matchesKey(data, Key.escape);
     const up = kb.matches(data, "tui.select.up") || ch === "k";
     const down = kb.matches(data, "tui.select.down") || ch === "j";
     const next = matchesKey(data, Key.right) || matchesKey(data, Key.tab) || ch === "l" || ch === "n";
@@ -162,7 +188,7 @@ export class Realctx2ReviewComponent implements Component {
   }
 
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-    if (this.exited || this.state.pending || event.type !== "wheel" || !event.wheelDelta) return undefined;
+    if (this.exited || this.state.pending || this.state.asking || event.type !== "wheel" || !event.wheelDelta) return undefined;
     if (this.state.view === "list") this.move(event.wheelDelta < 0 ? -1 : 1, false);
     else this.scrollTo(this.state.scroll + event.wheelDelta);
     this.changed();
@@ -198,7 +224,51 @@ export class Realctx2ReviewComponent implements Component {
       this.exit({ kind: "edit", key: row.key });
       return;
     }
+    // asking changes nothing: the model's suggestion is what gets confirmed
+    if (action.ask) return this.ask(row.key, action);
     this.state.pending = { key: row.key, action };
+  }
+
+  private ask(key: string, action: ReviewActionSpec): void {
+    const propose = this.model.propose?.bind(this.model);
+    if (!propose) return;
+    const controller = new AbortController();
+    this.state.asking = { key, since: Date.now(), controller };
+    this.stopTicker();
+    this.ticker = setInterval(() => this.changed(), 1000);
+    (this.ticker as { unref?: () => void }).unref?.();
+    const failed = (e: unknown): ReviewProposal => ({ ok: false, message: `The model could not decide: ${errMsg(e)}` });
+    let out: Promise<ReviewProposal>;
+    try {
+      out = propose(key, controller.signal).catch(failed);
+    } catch (e) {
+      out = Promise.resolve(failed(e));
+    }
+    void out.then((r) => this.proposed(key, action, controller, r));
+  }
+
+  private proposed(key: string, action: ReviewActionSpec, controller: AbortController, out: ReviewProposal): void {
+    const s = this.state;
+    if (this.exited || s.asking?.controller !== controller) return; // stopped meanwhile
+    s.asking = null;
+    this.stopTicker();
+    if (out.ok) s.pending = { key, action, plan: out.plan, question: out.confirm, preview: out.preview, destructive: out.destructive };
+    else s.flash = { text: out.message, tone: "error" };
+    this.changed();
+  }
+
+  private revisable(p: NonNullable<ReviewScreenState["pending"]>): boolean {
+    return !!p.plan && isEditablePlan(p.plan) && !!this.model.proposalForm && !!this.model.reviseProposal;
+  }
+
+  private stopAsking(): void {
+    const a = this.state.asking;
+    if (!a) return;
+    a.controller.abort();
+    this.state.asking = null;
+    this.stopTicker();
+    this.state.flash = { text: "Stopped asking the model: nothing changed.", tone: "warning" };
+    this.changed();
   }
 
   private answerConfirmation(ch: string | undefined): void {
@@ -206,10 +276,15 @@ export class Realctx2ReviewComponent implements Component {
     const p = s.pending!;
     s.pending = null;
     if (ch !== p.action.key && ch !== "y" && ch !== "Y") {
-      s.flash = { text: p.edited !== undefined ? "Edit discarded: nothing changed." : `Cancelled: ${p.action.label} was not applied.`, tone: "warning" };
+      s.flash = { text: p.edited !== undefined ? "Edit discarded: nothing changed." : p.plan ? "Suggestion discarded: nothing changed." : `Cancelled: ${p.action.label} was not applied.`, tone: "warning" };
       return;
     }
-    const out = p.edited !== undefined ? this.model.applyEdit(p.key, p.edited) : this.model.run(p.key, p.action.id);
+    const out =
+      p.edited !== undefined
+        ? this.model.applyEdit(p.key, p.edited)
+        : p.plan
+          ? (this.model.applyProposal?.(p.key, p.plan) ?? { ok: false, message: "This item cannot take a suggestion." })
+          : this.model.run(p.key, p.action.id);
     s.flash = { text: out.message, tone: out.ok ? "success" : "error" };
     s.scroll = 0;
     this.reload();
@@ -281,13 +356,28 @@ export class Realctx2ReviewComponent implements Component {
 
   private confirmationLines(width: number): string[] {
     const t = this.theme;
+    const asking = this.state.asking;
+    if (asking) {
+      const secs = Math.max(0, Math.floor((Date.now() - asking.since) / 1000));
+      return wrapTextWithAnsi(`${t.fg("accent", "…")} ${t.bold("Asking the aux model how to settle this")} ${t.fg("dim", `· ${secs} s · Esc stops (nothing changes until you confirm its suggestion)`)}`, width - 2).map((l) => ` ${l}`);
+    }
     const p = this.state.pending;
     if (p) {
-      const head = p.edited !== undefined ? `Apply edit to ${p.summary ?? "the memory"}?` : p.action.confirm;
-      const out = wrapTextWithAnsi(`${t.fg(p.action.destructive ? "warning" : "accent", "?")} ${t.bold(head)}`, width - 2).map((l) => ` ${l}`);
-      for (const l of (p.preview ?? []).slice(0, 8)) out.push(truncateToWidth(`   ${l.startsWith("! ") ? t.fg("warning", l) : t.fg("muted", l)}`, width));
-      if ((p.preview?.length ?? 0) > 8) out.push(t.fg("dim", `   (+${p.preview!.length - 8} more lines)`));
-      out.push(` ${t.fg("accent", `Press ${p.action.key} again or y to ${p.edited !== undefined ? "apply" : "confirm"}`)}${t.fg("dim", ` · any other key ${p.edited !== undefined ? "discards the edit" : "cancels"}`)}`);
+      const head = p.edited !== undefined ? `Apply edit to ${p.summary ?? "the memory"}?` : (p.question ?? p.action.confirm);
+      const out = wrapTextWithAnsi(`${t.fg((p.destructive ?? p.action.destructive) ? "warning" : "accent", "?")} ${t.bold(head)}`, width - 2).map((l) => ` ${l}`);
+      if (p.note) out.push(...wrapTextWithAnsi(`${t.fg("warning", "!")} ${p.note}`, width - 2).map((l) => ` ${l}`));
+      // the preview wraps (a suggested text is worth reading whole), within a bound
+      const max = p.plan ? 14 : 8;
+      const preview = (p.preview ?? []).flatMap((l) => {
+        const pad = /^\s*/.exec(l)![0];
+        const body = l.slice(pad.length);
+        const styled = body.startsWith("! ") ? t.fg("warning", body) : t.fg("muted", body);
+        return wrapTextWithAnsi(styled, Math.max(10, width - 4 - pad.length)).map((x) => `   ${pad}${x}`);
+      });
+      for (const l of preview.slice(0, max)) out.push(truncateToWidth(l, width));
+      if (preview.length > max) out.push(t.fg("dim", `   (+${preview.length - max} more lines)`));
+      const applies = p.edited !== undefined || !!p.plan;
+      out.push(` ${t.fg("accent", `Press ${p.action.key} again or y to ${applies ? "apply" : "confirm"}${this.revisable(p) ? " · e to edit it first" : ""}`)}${t.fg("dim", ` · any other key ${p.edited !== undefined ? "discards the edit" : p.plan ? "discards the suggestion" : "cancels"}`)}`);
       return out;
     }
     const f = this.state.flash;
@@ -298,11 +388,13 @@ export class Realctx2ReviewComponent implements Component {
 
   render(width: number): readonly string[] {
     const w = Math.max(40, width);
-    const rowsBudget = this.bodyRows();
-    const key = `${w}|${rowsBudget}|${this.version}`;
+    const key = `${w}|${this.bodyRows()}|${this.version}`;
     if (this.cache?.key === key) return this.cache.lines;
     const t = this.theme;
     const s = this.state;
+    const confirm = this.confirmationLines(w);
+    // a long question (a suggested text) takes its room from the body, so the screen keeps its height
+    const rowsBudget = Math.max(4, this.bodyRows() - Math.max(0, confirm.length - 3));
     const border = t.fg("border", "─".repeat(w));
     const divider = t.fg("borderMuted", ` ${"┄".repeat(Math.max(1, w - 2))} `);
     const cur = this.current();
@@ -325,7 +417,6 @@ export class Realctx2ReviewComponent implements Component {
     }
     lines.push(divider);
     for (const l of body) lines.push(truncateToWidth(l, w));
-    const confirm = this.confirmationLines(w);
     const hints = this.hints();
     lines.push(divider);
     if (confirm.length) {
@@ -339,7 +430,7 @@ export class Realctx2ReviewComponent implements Component {
   }
 
   private hints(): string[] {
-    if (this.state.pending) return [];
+    if (this.state.pending || this.state.asking) return [];
     const cur = this.current();
     const acts = cur ? this.model.actions(cur.key).map((a) => `${a.key} ${a.label}`) : [];
     const nav =
@@ -367,6 +458,10 @@ export async function runReviewScreen(
   for (;;) {
     const exit = await ui.custom((tui, theme, done) => new Realctx2ReviewComponent({ model, state, onExit: done, theme, tui }));
     if (!exit || exit.kind === "close") return;
+    if (exit.kind === "revise") {
+      await reviseSuggestion(model, ui, state, exit.key);
+      continue;
+    }
     const form = model.editForm(exit.key);
     const spec = model.actions(exit.key).find((a) => a.edit);
     if (!form || !spec) {
@@ -385,5 +480,43 @@ export async function runReviewScreen(
     }
     state.flash = null;
     state.pending = { key: exit.key, action: spec, edited, summary: plan.summary, preview: plan.preview };
+  }
+}
+
+const NOT_USED = "# ! Not used: ";
+
+/**
+ * Edit the aux model's pending suggestion in pi's editor. A saved edit is checked like the model's own
+ * answer and replaces the suggestion, which still waits for its confirmation. An edit that cannot be
+ * used reopens the editor with the reason on top; closing without saving keeps the suggestion as it was.
+ */
+async function reviseSuggestion(model: ReviewModel, ui: { editor(title: string, prefill: string): Promise<string | undefined> }, state: ReviewScreenState, key: string): Promise<void> {
+  const p = state.pending;
+  const form = p?.plan && p.key === key ? model.proposalForm?.(key, p.plan) : null;
+  if (!p?.plan || !form || !model.reviseProposal) {
+    state.pending = null;
+    state.flash = { text: "This suggestion can no longer be edited: nothing changed.", tone: "error" };
+    return;
+  }
+  let prefill = form.prefill;
+  for (;;) {
+    const edited = await ui.editor(form.title, prefill);
+    if (edited === undefined) {
+      state.pending = { ...p, note: "Edit closed without saving: the suggestion is as it was." };
+      return;
+    }
+    const out = model.reviseProposal(key, p.plan, edited);
+    if (out.ok) {
+      state.pending = { key, action: p.action, plan: out.plan, question: out.confirm, preview: out.preview, destructive: out.destructive };
+      return;
+    }
+    if (!out.fixable) {
+      state.pending = null;
+      state.flash = { text: out.message, tone: "error" };
+      return;
+    }
+    const lines = edited.split("\n");
+    while (lines[0]?.startsWith(NOT_USED)) lines.shift();
+    prefill = [`${NOT_USED}${out.message}. Fix it and save again, or close without saving to keep the suggestion as it was.`, ...lines].join("\n");
   }
 }

@@ -297,6 +297,7 @@ export type AuxRole =
   | "evo.operator"
   | "ingest.slicer"
   | "reverify"
+  | "review.resolve"
   | "decision.emulate";
 export type AuxTools = "none" | "read-only" | "read-only+bash";
 
