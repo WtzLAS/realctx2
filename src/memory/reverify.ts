@@ -378,6 +378,28 @@ export class Reverifier {
     return report;
   }
 
+  /**
+   * The user settled a review of this memory against the code as it is now (approved a change, or
+   * kept the text): its file anchors take the current blobs, so the same verdict is not queued again
+   * until the file changes. Anchors whose file is still changing (shared, against HEAD) are left.
+   */
+  acknowledge(ref: ScopedNode): void {
+    const g = this.s.graph;
+    if (!g.writable(ref.scope)) return;
+    const sd = g.sd(ref.scope);
+    const node = sd.getNode(ref.node.id);
+    if (!node) return;
+    for (const a of node.anchors) {
+      if ((a.kind !== "file" && a.kind !== "symbol") || a.status !== "live" || !a.pathId) continue;
+      const path = sd.pathOf(a.pathId);
+      if (path === null) continue;
+      const read = this.readFor(ref.scope, path);
+      if (!read.wait && read.blob && a.seenBlob !== read.blob) sd.setAnchor(node.id, { ...a, seenBlob: read.blob });
+    }
+    sd.patchNode(node.id, { verifiedAt: this.s.clock().toISOString(), flags: (node.flags ?? []).filter((f) => f !== "reverify") });
+    this.tried.delete(`${ref.scope}:${node.id}`);
+  }
+
   private queueReview(ref: ScopedNode, item: Pick<ReviewItem, "kind" | "suggestion" | "evidence">): void {
     this.review.add({ at: this.s.clock().toISOString(), scope: ref.scope, id: ref.node.id, ...item });
     const sd = this.s.graph.sd(ref.scope);

@@ -6,7 +6,7 @@ import type { Config } from "../core/config.ts";
 import type { Clock, MemoryNode, ScopeName, StrengthEvent, UseCounters } from "../core/types.ts";
 import { randomId8 } from "../util/ids.ts";
 import type { MemoryGraph } from "./graph.ts";
-import { recentUses, useSignals, worthClass } from "./strength.ts";
+import { recentUses, reviewWorthClass, useSignals } from "./strength.ts";
 import { escalation, violationCounter } from "./urgency.ts";
 
 interface Pending {
@@ -114,7 +114,7 @@ export class SessionAccounting {
       const sig = useSignals(node);
       if (sig.rewriteCandidate) flags.add("rewrite-candidate");
       if (sig.harmful) flags.add("harm");
-      if (worthClass(node.counters) === "low") flags.add("low-value");
+      if (reviewWorthClass(node) === "low") flags.add("low-value");
       // escalation: a memory that keeps being broken is pushed harder
       if ((p.counters[violationCounter(node.urgency)] ?? 0) > 0) {
         const esc = escalation(node, cfg);

@@ -7,7 +7,7 @@ import { randomId8 } from "../util/ids.ts";
 import { daysBetween } from "../util/text.ts";
 import type { MemoryGraph } from "./graph.ts";
 import type { MemoryServices } from "./services.ts";
-import { accessScore, foldPlan, importance, memoryWorth, retention, strengthAt, THETA_DEMOTE, THETA_PROMOTE, worthClass } from "./strength.ts";
+import { accessScore, foldPlan, importance, memoryWorth, retention, reviewWorthClass, strengthAt, THETA_DEMOTE, THETA_PROMOTE } from "./strength.ts";
 
 export interface HygieneReport {
   scope: ScopeName;
@@ -209,7 +209,7 @@ export class Lifecycle {
     }
     // Memory Worth low-value nodes: dormant and flagged for review (§6.7); long-term ones are only flagged
     for (const n of active) {
-      if (gone.has(n.id) || worthClass(n.counters) !== "low" || n.pinned) continue;
+      if (gone.has(n.id) || reviewWorthClass(n) !== "low" || n.pinned) continue;
       const flags = [...new Set([...(n.flags ?? []), "low-value"])];
       if (n.layer === "short") {
         sd.patchNode(n.id, { status: "dormant", statusReason: "forgetting: low Memory Worth", statusAt: nowIso, flags });

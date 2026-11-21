@@ -5,6 +5,7 @@ import type { CommandDef, CommandIO } from "../core/types.ts";
 import { errMsg } from "../util/errors.ts";
 import { parseArgs } from "./args.ts";
 import * as memory from "./memory.ts";
+import * as reviews from "./review.ts";
 import * as status from "./status.ts";
 import * as store from "./store.ts";
 
@@ -43,7 +44,7 @@ export const SUBCOMMANDS: Record<string, Sub> = {
   tree: { usage: "tree [<t: id>]", help: "The message tree under a consolidation, or the whole session's", run: (h, io, r) => status.tree(h, io, parseArgs(r).positional[0]) },
   search: { usage: "search <query> [--history] [--project]", help: "Search memories and turns, with scores, layers, scopes and urgency", run: (h, io, r) => memory.search(h, io, parseArgs(r)) },
   inspect: { usage: "inspect <id>", help: "Details of any ID", run: (h, io, r) => memory.inspect(h, io, parseArgs(r)) },
-  review: { usage: "review [--low-value | --harm | --conflicts | --escalations | --stale-rules | --actor <id>] | review approve|dismiss <id>", help: "Review queue: approve, pin, edit or forget", valued: ["actor"], run: (h, io, r) => memory.review(h, io, parseArgs(r, ["actor"])) },
+  review: { usage: "review [--low-value | --harm | --conflicts | --escalations | --stale-rules | --actor <id>] | review approve|dismiss <id>", help: "Review queue: browse pending items and their details; approve, dismiss, edit, pin or forget", valued: ["actor"], run: (h, io, r) => reviews.review(h, io, parseArgs(r, ["actor"])) },
   remember: { usage: "remember <text> [--scope …] [--kind …] [--severity …] [--urgency …] [--path …] [--command …]", help: "Add an explicit, pinned memory", valued: ["scope", "kind", "severity", "urgency", "path", "command"], run: (h, io, r) => memory.rememberCmd(h, io, parseArgs(r, ["scope", "kind", "severity", "urgency", "path", "command"])) },
   forget: { usage: "forget <id | query> [--purge] [--reason <text>]", help: "Retire a memory, or purge it with --purge. Acts at once.", valued: ["reason"], run: (h, io, r) => memory.forgetCmd(h, io, parseArgs(r, ["reason"])) },
   urgency: { usage: "urgency <id> <immediate | hint | caption | passive>", help: "Set a memory's urgency; the user's choice is final", run: (h, io, r) => memory.urgency(h, io, parseArgs(r)) },

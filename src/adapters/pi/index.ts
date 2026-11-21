@@ -13,6 +13,7 @@ import { Host } from "../../core/host.ts";
 import { SETTINGS_CATEGORIES } from "../../core/settings-schema.ts";
 import type { CommandIO, CommitBatch, ConsolidationRecord, ContextEdit, DecisionQuestion, SessionRecord } from "../../core/types.ts";
 import { SUBCOMMANDS } from "../../commands/index.ts";
+import type { ReviewModel } from "../../commands/review.ts";
 import type { PendingDelivery } from "../../context/engine.ts";
 import { GUIDANCE_TYPE } from "../../context/render.ts";
 import type { PathEvent } from "../../memory/delivery.ts";
@@ -22,6 +23,7 @@ import { pathEventOf, resultPathEventOf } from "../pathevents.ts";
 import { loadAnySession } from "../sessions.ts";
 import { type Draft, PiAdapter, STATUS_KEY } from "./adapter.ts";
 import { guidanceRenderer } from "./guidance-renderer.ts";
+import type { ReviewScreenExit } from "./review-ui.ts";
 
 export const DECISION_PROVIDER = "realctx2-decision";
 /** pi's Working row while a user message waits for Janus in `before_agent_start`. */
@@ -574,6 +576,15 @@ class PiExtension {
     else process.stderr.write(`${content}\n`);
   }
 
+  /** The interactive review screen; it closes for pi's editor during an edit and reopens as it was. */
+  private async openReview(ctx: ExtensionCommandContext, model: ReviewModel): Promise<void> {
+    const { runReviewScreen } = await import("./review-ui.ts");
+    await runReviewScreen(model, {
+      custom: (factory) => ctx.ui.custom<ReviewScreenExit>((tui, theme, _keybindings, done) => factory(tui, theme, done)),
+      editor: (title, prefill) => ctx.ui.editor(title, prefill),
+    });
+  }
+
   private async openSettings(ctx: ExtensionCommandContext, host: Host, category?: string): Promise<void> {
     const { Realctx2SettingsComponent } = await import("./settings-ui.ts");
     let availableModels: Array<{ id: string; provider: string; name?: string; contextWindow?: number }> = [];
@@ -675,6 +686,7 @@ class PiExtension {
           }
         : undefined,
       openSettings: host && isTui ? (category) => this.openSettings(ctx, host, category) : undefined,
+      review: host && isTui ? (model) => this.openReview(ctx, model) : undefined,
     };
     if (!host) {
       io.print("realctx2 is not running in this session (it starts with the session; see the extension errors pi reported at startup).");

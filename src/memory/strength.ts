@@ -2,7 +2,7 @@
  * Strength, importance, retention and Memory Worth (§6.5.1–§6.5.3, §6.7).
  * Everything here is a pure function of a node, so every machine derives the same values.
  */
-import type { MemoryNode, StrengthEvent, UseCounters } from "../core/types.ts";
+import { COUNTER_NAMES, type MemoryNode, type StrengthEvent, type UseCounters } from "../core/types.ts";
 import { clamp, daysBetween } from "../util/text.ts";
 
 const LAMBDA_BASE = 0.1; // per day (F)
@@ -146,12 +146,30 @@ export interface UseSignals {
   harmful: boolean;
 }
 
+/**
+ * The counters since the user last reviewed the memory (`reviewBaseline`): a review that kept the
+ * memory starts its review signals over, so an approved or dismissed flag returns only on new evidence.
+ */
+export function sinceReview(node: MemoryNode): UseCounters {
+  const base = node.reviewBaseline?.counters;
+  if (!base) return node.counters;
+  const c = { ...node.counters };
+  for (const k of COUNTER_NAMES) c[k] = Math.max(0, c[k] - (base[k] ?? 0));
+  return c;
+}
+
+/** Memory Worth class of the evidence since the last review: what flags a memory as low value. */
+export function reviewWorthClass(node: MemoryNode): WorthClass {
+  return worthClass(sinceReview(node));
+}
+
 export function useSignals(node: MemoryNode): UseSignals {
   const c = node.counters;
+  const r = sinceReview(node);
   return {
-    rewriteCandidate: c.delivered >= 6 && c.ignoredRelevant / c.delivered >= 0.5,
+    rewriteCandidate: r.delivered >= 6 && r.ignoredRelevant / r.delivered >= 0.5,
     deadWeight: node.kind !== "rule" && c.delivered >= 10 && c.used < 0.5,
-    harmful: c.harm >= 1.0,
+    harmful: r.harm >= 1.0,
   };
 }
 

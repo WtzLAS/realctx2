@@ -1,6 +1,6 @@
 ---
 name: review
-description: "realctx2: Review queue: approve, pin, edit or forget"
+description: "realctx2: Review queue: browse pending items and their details; approve, dismiss, edit, pin or forget"
 argument-hint: "[--low-value | --harm | --conflicts | --escalations | --stale-rules | --actor <id>] | review approve|dismiss <id>"
 disable-model-invocation: true
 allowed-tools: "Bash(realctx2-hook command *)"

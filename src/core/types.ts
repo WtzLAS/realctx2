@@ -239,6 +239,8 @@ export interface CommandIO {
   confirm(title: string, message: string): Promise<boolean>;
   edit?(title: string, prefill: string): Promise<string | undefined>;
   openSettings?(category?: string): Promise<void>;
+  /** Interactive review screen (pi's TUI); without it `/realctx2 review` prints a list. */
+  review?(model: import("../commands/review.ts").ReviewModel): Promise<void>;
   hasUI: boolean;
 }
 
@@ -521,6 +523,11 @@ export interface MemoryNode {
   flags?: string[];
   /** Urgency baseline per level after a user override lowered urgency (§6.10.4). */
   violationsBaseline?: Partial<Record<Urgency, number>>;
+  /**
+   * Counters when the user last approved or dismissed this memory's review flags: the review
+   * signals (low value, rewrite candidate, harm) count only from here on (§6.7).
+   */
+  reviewBaseline?: { at: string; counters: Partial<UseCounters> };
   /** Alias left by an ID collision (§8.1.2). */
   aliasOf?: string;
   /** Fused decay-rate divisor 1 + log|C| (FadeMem Eq. 13, §6.6.1). */

@@ -1659,6 +1659,8 @@ Evidence = usedSuccess + usedFailure.
 | Dead weight | `delivered` ≥ 10 and `used` < 0.5 (non-rule memories only) | Exclude from proactive injection. Preventive rules (`kind === "rule"`) are exempt, because silently obeying a rule records `complied` rather than `acted_on`. |
 | Harm | `harm` ≥ 1.0 | Exclude from proactive injection immediately and flag for review |
 
+**Review settles the flags.** Approving a flagged memory in `/realctx2 review` keeps it (flags cleared, marked verified, woken if dormant); dismissing clears the flags without other changes. Either way the node records `reviewBaseline` (the counters at that moment), and the low-value, irrelevance and harm signals count only from there on. A reviewed memory is flagged again only on new evidence, not on the counts the user already judged. Dead weight and Memory Worth for retrieval still use the full counters.
+
 **irrelevanceRate**, used in the retrieval score (§6.4.3), is `1 − effectiveUsed / delivered` once `delivered` ≥ 3, and 0 before that. For `rule` memories, `effectiveUsed = used + complied` (counting applicable compliance, not `not_applicable`), so well-obeyed preventive rules aren't penalized.
 
 ### 6.8 Path anchors and path tracking
@@ -2745,7 +2747,7 @@ Assume a 2-hour coding session with about 80 model steps, 10 intents and 2 Palim
 | `/realctx2 tree [<t: id>]` | Shows the message tree under a consolidation, or the whole session's |
 | `/realctx2 search <query>` | Searches memories and turns, with scores, layers, scopes and urgency |
 | `/realctx2 inspect <id>` | Shows the details of any ID (like `inspect`) |
-| `/realctx2 review [--low-value \| --harm \| --conflicts \| --escalations \| --stale-rules \| --actor <id>]` | Review queue: approve, pin, edit or forget |
+| `/realctx2 review [--low-value \| --harm \| --conflicts \| --escalations \| --stale-rules \| --actor <id>]` / `review approve\|dismiss <id>` | Review queue: queued re-verification changes, contradictions, flagged memories and shared strategy proposals. In pi it is a screen: ↑↓ cycles through the items, Enter opens an item's details (←→ steps through them), and each action (approve, dismiss, edit, pin, forget) runs only after a second, separate keypress that confirms exactly what will happen. An edit opens the editor, then confirms the planned changes. Elsewhere it prints the list. |
 | `/realctx2 remember <text>` | Adds an explicit, pinned memory |
 | `/realctx2 forget <id \| query> [--purge]` | Retires a memory, or purges it with `--purge`. Acts at once and prints what it removed (§6.5.6). |
 | `/realctx2 urgency <id> <immediate \| hint \| caption \| passive>` | Sets a memory's urgency; the user's choice is final (§6.10.1) |

@@ -5,7 +5,7 @@
  * Everything here is local to the machine (`evolution/`), never synced.
  */
 import { join } from "node:path";
-import { appendJsonl, readJson, readJsonl, writeJson } from "../util/fs.ts";
+import { appendJsonl, readJson, readJsonl, writeFileAtomic, writeJson } from "../util/fs.ts";
 import { median } from "../util/text.ts";
 
 export const OPERATORS = ["abstract", "refine", "bridge", "reframe"] as const;
@@ -505,6 +505,15 @@ export class EvolutionLog {
   propose(p: Record<string, unknown>): void {
     const f = this.file("proposals.jsonl");
     if (f) appendJsonl(f, p);
+  }
+  /** Drop the proposals the predicate matches; returns how many were dropped. */
+  dropProposals(match: (p: Record<string, unknown>) => boolean): number {
+    const f = this.file("proposals.jsonl");
+    if (!f) return 0;
+    const all = readJsonl<Record<string, unknown>>(f);
+    const rest = all.filter((p) => !match(p));
+    if (rest.length !== all.length) writeFileAtomic(f, rest.map((p) => JSON.stringify(p)).join("\n") + (rest.length ? "\n" : ""));
+    return all.length - rest.length;
   }
   lastSharedPass(): string | null {
     const f = this.file("shared-pass.json");

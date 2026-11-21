@@ -12,7 +12,7 @@ import { renderGuidance, renderLateCards, renderReminder } from "../src/context/
 import type { Intent } from "../src/core/types.ts";
 import { DEFAULT_CONFIG, Layout } from "../src/core/config.ts";
 import { resolveProject } from "../src/core/project.ts";
-import { readJsonl } from "../src/util/fs.ts";
+import { appendJsonl, readJsonl } from "../src/util/fs.ts";
 import { cleanupTmp, commitAll, initRepo, listTree, write } from "./helpers/fixtures.ts";
 import { filler } from "./helpers/harness.ts";
 import { type Decide, piRig, type Probs } from "./helpers/pi.ts";
@@ -356,6 +356,49 @@ describe("the Working row in before_agent_start", () => {
     expect(r.calls.at(-1)?.text).toContain("user: never mind, just say done");
     await r.shutdown();
   }, 20_000);
+});
+
+describe("the review screen in pi", () => {
+  it("opens /realctx2 review as its own screen; an action runs only on a second keypress", async () => {
+    const cwd = repo();
+    const r = await piRig({ cwd, mode: "tui" });
+    r.ui.screens.push((c) => c.handleInput("\x1b")); // the report of remember
+    await r.prompt('/realctx2 remember "Callers must use TokenCache.refresh." --kind rule --severity must --scope personal --path src/auth/tokenCache.ts');
+    const id = /\[m:([0-9a-z]{8})\]/.exec(r.ui.shown.at(-1)!)![1]!;
+    // re-verification queued a suggested rewrite
+    appendJsonl(join(new Layout(r.home).queueDir, "review.jsonl"), { at: new Date().toISOString(), scope: "personal", id, kind: "rule-change", suggestion: { text: "Callers must use TokenCache.renew." } });
+    const seen: Record<string, string> = {};
+    r.ui.screens.push((c, render) => {
+      seen.list = render();
+      c.handleInput("\r");
+      seen.details = render();
+      c.handleInput("a");
+      seen.question = render();
+      c.handleInput("\x1b"); // cancels the question, keeps the screen
+      seen.cancelled = render();
+      c.handleInput("a");
+      c.handleInput("a");
+      seen.done = render();
+      c.handleInput("\x1b");
+    });
+    await r.prompt("/realctx2 review");
+    expect(r.errors).toEqual([]);
+    expect(seen.list).toContain("realctx2 review");
+    expect(seen.list).toContain(`› rule change  [m:${id}] Callers must use TokenCache.refresh`);
+    expect(seen.list).toContain("suggested: Callers must use TokenCache.renew.");
+    expect(seen.details).toContain("Suggested text\n    Callers must use TokenCache.renew.");
+    expect(seen.question).toContain(`? Replace the text of [m:${id}] with the suggested text?`);
+    expect(seen.cancelled).toContain("Cancelled: approve (apply) was not applied.");
+    expect(seen.done).toContain(`✓ Approved [m:${id}]: the suggested text was applied.`);
+    expect(seen.done).toContain("Nothing to review.");
+    // the screen closed without a report; the change is in memory
+    expect(r.ui.shown).toHaveLength(2);
+    r.ui.screens.push((c) => c.handleInput("\x1b"));
+    await r.prompt(`/realctx2 inspect m:${id}`);
+    expect(r.ui.shown.at(-1)).toContain("Callers must use TokenCache.renew.");
+    expect(r.calls).toEqual([]); // commands never reach the model
+    await r.shutdown();
+  });
 });
 
 describe("pressure, compaction and name conflicts in pi", () => {

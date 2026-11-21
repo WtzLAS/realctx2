@@ -61,6 +61,7 @@ export const PLAIN_FIELDS = [
   "contentHash",
   "flags",
   "violationsBaseline",
+  "reviewBaseline",
   "aliasOf",
   "decayDivisor",
 ] as const;
@@ -192,6 +193,7 @@ export function nodeFromJson(id: string, j: unknown): MemoryNode | string {
     contentHash: str(j.contentHash),
     flags: Array.isArray(j.flags) ? (j.flags as string[]) : undefined,
     violationsBaseline: isRecord(j.violationsBaseline) ? (j.violationsBaseline as MemoryNode["violationsBaseline"]) : undefined,
+    reviewBaseline: isRecord(j.reviewBaseline) && typeof j.reviewBaseline.at === "string" && isRecord(j.reviewBaseline.counters) ? (j.reviewBaseline as MemoryNode["reviewBaseline"]) : undefined,
     aliasOf: typeof j.aliasOf === "string" ? j.aliasOf : undefined,
     decayDivisor: typeof j.decayDivisor === "number" ? j.decayDivisor : undefined,
   };

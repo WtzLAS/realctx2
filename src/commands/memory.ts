@@ -4,11 +4,11 @@ import { join, resolve } from "node:path";
 import type { Host } from "../core/host.ts";
 import type { CommandIO, PathAnchor, ScopedNode, ScopeName, Severity, TriggerAction, Urgency } from "../core/types.ts";
 import { URGENCY_ORDER } from "../core/types.ts";
-import { captionLine, day, mid, renderCard } from "../memory/cards.ts";
+import { day, mid, renderCard } from "../memory/cards.ts";
 import { scopeLabel } from "../memory/graph.ts";
 import type { MemoryRuntime } from "../memory/runtime.ts";
-import { memoryWorth, strengthAt, useSignals, worthClass } from "../memory/strength.ts";
-import { capUrgency, hasTrigger, violationsAtLevel } from "../memory/urgency.ts";
+import { strengthAt } from "../memory/strength.ts";
+import { capUrgency, hasTrigger } from "../memory/urgency.ts";
 import { anchorKey } from "../storage/schema.ts";
 import { errMsg } from "../util/errors.ts";
 import { globCompiles } from "../util/glob.ts";
@@ -22,13 +22,13 @@ const SCOPES: ScopeName[] = ["global", "personal", "shared"];
 const SEVERITIES: Severity[] = ["must", "should", "may", "info"];
 const ACTIONS: TriggerAction[] = ["read", "edit", "command", "commit", "test"];
 
-function need(host: Host, io: CommandIO): MemoryRuntime | null {
+export function need(host: Host, io: CommandIO): MemoryRuntime | null {
   if (!host.memory) io.print(`Memory is unavailable${host.memoryError ? `: ${host.memoryError}` : "."}`);
   return host.memory;
 }
 
 /** Explicit user actions are flushed right away (§7.5). */
-function flushNow(mem: MemoryRuntime, scope?: ScopeName): void {
+export function flushNow(mem: MemoryRuntime, scope?: ScopeName): void {
   try {
     mem.graph.flush({ scopes: scope ? [scope] : undefined, keepPurges: true });
   } catch (e) {
@@ -167,114 +167,32 @@ export async function pin(host: Host, io: CommandIO, p: Parsed, value: boolean):
   io.print(value ? `Pinned ${mid(ref.node)} "${ref.node.title}": it never decays and is never forgotten automatically.` : `Unpinned ${mid(ref.node)} "${ref.node.title}": it follows the normal lifecycle again.`);
 }
 
-// ───────────── review (§6.7, §6.8.4, §6.10.4)
-export async function review(host: Host, io: CommandIO, p: Parsed): Promise<void> {
-  const mem = need(host, io);
-  if (!mem) return;
-  const [action, id] = p.positional;
-  if (action === "approve" && id) {
-    const ref = mem.graph.get(id, { includePurged: false });
-    if (!ref) return io.print(`No memory ${id} is visible here.`);
-    if (!mem.graph.writable(ref.scope)) return io.print(`The ${ref.scope} store is read-only here.`);
-    const item = mem.review.list().find((r) => r.id === ref.node.id);
-    const sd = mem.graph.sd(ref.scope);
-    const patch: Parameters<typeof sd.patchNode>[1] = { flags: [], verifiedAt: mem.clock().toISOString() };
-    if (item?.suggestion && (item.kind === "rule-change" || item.kind === "proposal")) {
-      // approving a proposed change applies it
-      const text = sanitize(item.suggestion.text);
-      Object.assign(patch, { text, title: makeTitle(item.suggestion.title ?? text), contentHash: contentHash(text) });
-    }
-    if (ref.node.status === "dormant") Object.assign(patch, { status: "active", statusReason: null });
-    sd.patchNode(ref.node.id, patch);
-    if (item?.kind === "rule-obsolete") {
-      mem.lifecycle.forget({ scope: ref.scope, node: sd.getNode(ref.node.id)! }, "obsolete: confirmed in review", { byAgent: false });
-    }
-    mem.review.remove(ref.node.id);
-    mem.graph.commit(ref.scope, "review");
-    mem.graph.syncIndex(ref.scope);
-    flushNow(mem, ref.scope);
-    return io.print(`Approved ${mid(ref.node)}${item?.suggestion ? ": the suggested text was applied" : item?.kind === "rule-obsolete" ? ": retired as obsolete" : ": flags cleared"}.`);
-  }
-  if (action === "dismiss" && id) {
-    const ref = mem.graph.get(id);
-    mem.review.remove(parseIdLoose(id)?.id ?? id);
-    if (ref && mem.graph.writable(ref.scope)) {
-      mem.graph.sd(ref.scope).patchNode(ref.node.id, { flags: (ref.node.flags ?? []).filter((f) => f !== "review") });
-      mem.graph.commit(ref.scope, "review");
-    }
-    return io.print(`Dismissed the review item for ${id}.`);
-  }
-  const only = ["low-value", "harm", "conflicts", "escalations", "stale-rules"].filter((f) => p.flags.has(f));
-  const actor = flagValue(p, "actor");
-  const want = (name: string) => !only.length && !actor ? true : only.includes(name);
-  const all = mem.graph.all(undefined, (n) => n.status !== "purged");
-  const sections: string[] = [];
-  const line = (r: ScopedNode, note: string) => `  ${captionLine(r)} (${scopeLabel(r.scope)}${r.node.status !== "active" ? `, ${r.node.status}` : ""}) — ${note}`;
-  const add = (title: string, rows: string[]) => {
-    if (rows.length) sections.push(`${title} (${rows.length}):\n${rows.slice(0, 25).join("\n")}${rows.length > 25 ? `\n  (+${rows.length - 25} more)` : ""}`);
-  };
-  if (actor) {
-    add(`Memories written by ${actor}`, all.filter((r) => r.node.provenance.actor === actor).map((r) => line(r, `${r.node.kind}, created ${day(r.node.createdAt)}`)));
-    if (!sections.length) sections.push(`No memories by actor ${actor}. Actors seen: ${[...new Set(all.map((r) => r.node.provenance.actor))].join(", ") || "none"}`);
-  }
-  if (want("low-value")) {
-    add("Low value (Memory Worth ≤ 0.3 on ≥ 5 outcomes, or flagged)", all.filter((r) => worthClass(r.node.counters) === "low" || r.node.flags?.includes("low-value")).map((r) => line(r, `MW ${memoryWorth(r.node.counters).mw.toFixed(2)}, used ${r.node.counters.used.toFixed(1)}×`)));
-    add("Rewrite candidates (relevant but ignored, or still broken at the highest urgency)", all.filter((r) => useSignals(r.node).rewriteCandidate || r.node.flags?.includes("rewrite-candidate")).map((r) => line(r, `ignored-relevant ${r.node.counters.ignoredRelevant.toFixed(1)} of ${r.node.counters.delivered.toFixed(0)} deliveries`)));
-  }
-  if (want("harm")) add("Harm (acted on with a harmful effect)", all.filter((r) => useSignals(r.node).harmful || r.node.flags?.includes("harm")).map((r) => line(r, `harm ${r.node.counters.harm.toFixed(2)}`)));
-  if (want("conflicts")) {
-    const rows: string[] = [];
-    const seen = new Set<string>();
-    for (const r of all) {
-      for (const other of mem.graph.contradictions(r)) {
-        const key = [r.node.id, other.node.id].sort().join("|");
-        if (seen.has(key)) continue;
-        seen.add(key);
-        rows.push(`  ${mid(r.node)} ${r.node.title}\n    ⚠ conflicts with ${mid(other.node)} ${other.node.title}`);
-      }
-      if (r.node.flags?.includes("conflicts-instruction")) rows.push(line(r, "contradicts an ingested instruction; the instruction wins in delivery until reviewed"));
-    }
-    add("Conflicts", rows);
-  }
-  if (want("escalations")) {
-    add("Escalated urgency", all.filter((r) => r.node.urgencyBy === "escalation" || r.node.flags?.includes("escalated")).map((r) => line(r, `now ${r.node.urgency}, ${violationsAtLevel(r.node).toFixed(1)} violation(s) at this level`)));
-    add("Violated although the user set their urgency", all.filter((r) => r.node.flags?.includes("violated")).map((r) => line(r, `${r.node.counters.violated.toFixed(1)} violation(s); urgency ${r.node.urgency} was set by the user`)));
-  }
-  if (want("stale-rules")) add("Rules whose paths are gone", all.filter((r) => r.node.flags?.includes("stale-rule")).map((r) => line(r, "its anchored path was deleted or moved out of reach")));
-  if (!only.length && !actor) {
-    const items = mem.review.list();
-    add(
-      "Re-verification and proposals",
-      items.map((it) => {
-        const ref = mem.graph.get(it.id);
-        return `  [m:${it.id}] ${ref?.node.title ?? "(gone)"} — ${it.kind}${it.note ? `: ${it.note}` : ""}${it.suggestion ? `\n    suggested: ${it.suggestion.text.replace(/\s+/g, " ").slice(0, 200)}` : ""}`;
-      }),
-    );
-    const proposals = mem.evoLog.proposals();
-    if (proposals.length) add("Shared strategy proposals", proposals.map((x) => `  ${JSON.stringify(x).slice(0, 200)}`));
-  }
-  if (!sections.length) return io.print("Nothing to review.");
-  sections.push("Act on an item with: /realctx2 review approve <id> · review dismiss <id> · pin <id> · rules edit <id> · urgency <id> <level> · forget <id>");
-  io.print(sections.join("\n\n"));
+// ───────────── rules (§6.9.3)
+/** The live path anchors as the form shows them: a subtree ends in `/`. */
+function formAnchors(mem: MemoryRuntime, ref: ScopedNode): Array<{ spec: string; anchor: PathAnchor }> {
+  return mem.paths
+    .displayAnchors(ref)
+    .filter((a) => a.at && a.anchor.status === "live")
+    .map((a) => ({ spec: a.anchor.kind === "subtree" ? a.at!.replace(/\/\*\*$/, "/") : a.at!, anchor: a.anchor }));
 }
 
-// ───────────── rules (§6.9.3)
-function ruleForm(mem: MemoryRuntime, ref: ScopedNode): string {
+/** The edit form of a memory; `text` prefills the body (a suggested rewrite) instead of the current text. */
+export function memoryForm(mem: MemoryRuntime, ref: ScopedNode, opts: { text?: string; note?: string } = {}): string {
   const n = ref.node;
-  const anchors = mem.paths.displayAnchors(ref).filter((a) => a.at && a.anchor.status === "live");
   return [
     `# Editing ${mid(n)} (${scopeLabel(ref.scope)}). Lines starting with # are ignored. Save to apply; empty the text to cancel.`,
-    `severity: ${n.severity ?? "info"}`,
+    ...(opts.note ? opts.note.split("\n").map((l) => `# ${l}`) : []),
+    ...(n.kind === "rule" || n.severity ? [`severity: ${n.severity ?? "info"}`] : []),
     `# immediate | hint | caption | passive`,
     `urgency: ${n.urgency}`,
     `# repository paths or globs, comma-separated; a trailing / covers the subtree`,
-    `paths: ${anchors.map((a) => (a.anchor.kind === "subtree" ? a.at!.replace(/\/\*\*$/, "/") : a.at!)).join(", ")}`,
+    `paths: ${formAnchors(mem, ref).map((a) => a.spec).join(", ")}`,
     `# command patterns (globs over the command line), comma-separated`,
     `commands: ${(n.triggers?.commands ?? []).join(", ")}`,
     `# read | edit | command | commit | test`,
     `on: ${(n.triggers?.on ?? []).join(", ")}`,
     "---",
-    n.text,
+    opts.text ?? n.text,
   ].join("\n");
 }
 
@@ -300,6 +218,95 @@ function parseRuleForm(text: string): { severity?: Severity; urgency?: Urgency; 
   };
 }
 
+/** What an edited form would change, applied only by `apply()` (so a screen can confirm it first). */
+export interface EditPlan {
+  ref: ScopedNode;
+  /** Short names of the changes: `text`, `severity should`, `anchors`, … (empty: nothing changes). */
+  changes: string[];
+  /** Paths in the form that do not resolve; they are ignored. */
+  bad: string[];
+  /** The sanitized text the memory would have. */
+  text: string;
+  apply(): void;
+}
+
+export function planMemoryEdit(mem: MemoryRuntime, ref: ScopedNode, edited: string): EditPlan | { error: string } {
+  const form = parseRuleForm(edited);
+  if (!form || !form.text) return { error: "the form had no text below the --- line" };
+  const n = ref.node;
+  const text = sanitize(form.text);
+  const changes: string[] = [];
+  const patch: Parameters<ReturnType<typeof mem.graph.sd>["patchNode"]>[1] = {};
+  if (text !== n.text) {
+    Object.assign(patch, { text, title: makeTitle(text), contentHash: contentHash(text), verifiedAt: mem.clock().toISOString() });
+    changes.push("text");
+  }
+  if (form.severity && form.severity !== n.severity) {
+    patch.severity = form.severity;
+    changes.push(`severity ${form.severity}`);
+  }
+  // anchors: the listed paths replace the live `applies`/`about` anchors; unchanged ones are reused as they are
+  const role = n.anchors[0]?.role ?? (n.kind === "rule" || n.kind === "procedure" || n.kind === "preference" ? "applies" : "about");
+  const shown = new Map(formAnchors(mem, ref).map((a) => [a.spec, a.anchor]));
+  const wanted: PathAnchor[] = [];
+  const bad: string[] = [];
+  for (const spec of form.paths) {
+    const same = shown.get(spec);
+    if (same) {
+      wanted.push(same);
+      continue;
+    }
+    if (/[*?[\]{}]/.test(spec) && !globCompiles(spec)) {
+      bad.push(spec);
+      continue;
+    }
+    const a = mem.paths.makeAnchor(ref.scope, spec, role);
+    if (a) wanted.push(a);
+    else bad.push(spec);
+  }
+  const have = new Map(n.anchors.filter((a) => a.status === "live").map((a) => [anchorKey(a), a]));
+  const wantKeys = new Set(wanted.map(anchorKey));
+  const removed = [...have].filter(([k]) => !wantKeys.has(k)).map(([, a]) => a);
+  const added = wanted.filter((a) => !have.has(anchorKey(a)));
+  if (removed.length || added.length) changes.push("anchors");
+  const triggers = { ...(form.on.length || form.commands.length ? { on: [...new Set([...form.on, ...(form.commands.length ? (["command"] as TriggerAction[]) : [])])] } : {}), ...(form.commands.length ? { commands: form.commands } : {}) };
+  if (JSON.stringify(triggers) !== JSON.stringify(n.triggers ?? {})) {
+    patch.triggers = Object.keys(triggers).length ? triggers : null;
+    changes.push("triggers");
+  }
+  const triggered = wanted.length > 0 || form.commands.length > 0;
+  if (form.urgency && form.urgency !== n.urgency) {
+    patch.urgency = capUrgency(form.urgency, triggered);
+    patch.urgencyBy = "user";
+    changes.push(`urgency ${patch.urgency}`);
+  } else if (n.urgency === "immediate" && !triggered) {
+    patch.urgency = "hint"; // `immediate` needs a trigger (§6.10)
+    changes.push("urgency hint (no trigger left)");
+  }
+  return {
+    ref,
+    changes,
+    bad,
+    text,
+    apply: () => {
+      const sd = mem.graph.sd(ref.scope);
+      for (const a of removed) sd.removeAnchor(n.id, a);
+      for (const a of added) sd.setAnchor(n.id, a);
+      if (Object.keys(patch).length) sd.patchNode(n.id, patch);
+      mem.graph.commit(ref.scope, "rule-edit");
+      mem.graph.syncIndex(ref.scope);
+      mem.paths.invalidate();
+      flushNow(mem, ref.scope);
+    },
+  };
+}
+
+/** The report line of an applied edit. */
+export function describeEdit(plan: EditPlan): string {
+  const { ref, changes, bad } = plan;
+  return `Updated ${mid(ref.node)}: ${changes.join(", ")}.${ref.scope === "shared" ? " Teammates get the change with the next commit of the shared store." : ""}${bad.length ? `\nIgnored paths that do not resolve: ${bad.join(", ")}` : ""}`;
+}
+
 export async function rules(host: Host, io: CommandIO, p: Parsed): Promise<void> {
   const mem = need(host, io);
   if (!mem) return;
@@ -307,74 +314,14 @@ export async function rules(host: Host, io: CommandIO, p: Parsed): Promise<void>
     const ref = p.positional[1] ? mem.graph.get(p.positional[1]) : null;
     if (!ref) return io.print("Usage: /realctx2 rules edit <id>");
     if (!mem.graph.writable(ref.scope)) return io.print(`The ${ref.scope} store is read-only here.`);
-    if (!io.edit) return io.print(`Editing needs an interactive session. The rule now reads:\n\n${ruleForm(mem, ref)}`);
-    const edited = await io.edit(`Edit rule ${mid(ref.node)}`, ruleForm(mem, ref));
+    if (!io.edit) return io.print(`Editing needs an interactive session. The rule now reads:\n\n${memoryForm(mem, ref)}`);
+    const edited = await io.edit(`Edit rule ${mid(ref.node)}`, memoryForm(mem, ref));
     if (edited === undefined) return io.print("Cancelled.");
-    const form = parseRuleForm(edited);
-    if (!form || !form.text) return io.print("Cancelled: the form had no text below the --- line.");
-    const sd = mem.graph.sd(ref.scope);
-    const n = ref.node;
-    const text = sanitize(form.text);
-    const changes: string[] = [];
-    const patch: Parameters<typeof sd.patchNode>[1] = {};
-    if (text !== n.text) {
-      Object.assign(patch, { text, title: makeTitle(text), contentHash: contentHash(text), verifiedAt: mem.clock().toISOString() });
-      changes.push("text");
-    }
-    if (form.severity && form.severity !== n.severity) {
-      patch.severity = form.severity;
-      changes.push(`severity ${form.severity}`);
-    }
-    // anchors: the listed paths replace the live `applies`/`about` anchors
-    const role = n.anchors[0]?.role ?? (n.kind === "rule" || n.kind === "procedure" || n.kind === "preference" ? "applies" : "about");
-    const wanted: PathAnchor[] = [];
-    const bad: string[] = [];
-    for (const spec of form.paths) {
-      if (/[*?[\]{}]/.test(spec) && !globCompiles(spec)) {
-        bad.push(spec);
-        continue;
-      }
-      const a = mem.paths.makeAnchor(ref.scope, spec, role);
-      if (a) wanted.push(a);
-      else bad.push(spec);
-    }
-    const have = new Map(n.anchors.filter((a) => a.status === "live").map((a) => [anchorKey(a), a]));
-    const wantKeys = new Set(wanted.map(anchorKey));
-    let anchorsChanged = false;
-    for (const [k, a] of have) {
-      if (!wantKeys.has(k)) {
-        sd.removeAnchor(n.id, a);
-        anchorsChanged = true;
-      }
-    }
-    for (const a of wanted) {
-      if (!have.has(anchorKey(a))) {
-        sd.setAnchor(n.id, a);
-        anchorsChanged = true;
-      }
-    }
-    if (anchorsChanged) changes.push("anchors");
-    const triggers = { ...(form.on.length || form.commands.length ? { on: [...new Set([...form.on, ...(form.commands.length ? (["command"] as TriggerAction[]) : [])])] } : {}), ...(form.commands.length ? { commands: form.commands } : {}) };
-    if (JSON.stringify(triggers) !== JSON.stringify(n.triggers ?? {})) {
-      patch.triggers = Object.keys(triggers).length ? triggers : null;
-      changes.push("triggers");
-    }
-    const triggered = wanted.length > 0 || form.commands.length > 0;
-    if (form.urgency && form.urgency !== n.urgency) {
-      patch.urgency = capUrgency(form.urgency, triggered);
-      patch.urgencyBy = "user";
-      changes.push(`urgency ${patch.urgency}`);
-    } else if (n.urgency === "immediate" && !triggered) {
-      patch.urgency = "hint"; // `immediate` needs a trigger (§6.10)
-      changes.push("urgency hint (no trigger left)");
-    }
-    if (!changes.length) return io.print(`No changes to ${mid(n)}.${bad.length ? ` Unusable paths: ${bad.join(", ")}` : ""}`);
-    if (Object.keys(patch).length) sd.patchNode(n.id, patch);
-    mem.graph.commit(ref.scope, "rule-edit");
-    mem.graph.syncIndex(ref.scope);
-    mem.paths.invalidate();
-    flushNow(mem, ref.scope);
-    return io.print(`Updated ${mid(n)}: ${changes.join(", ")}.${ref.scope === "shared" ? " Teammates get the change with the next commit of the shared store." : ""}${bad.length ? `\nIgnored paths that do not resolve: ${bad.join(", ")}` : ""}`);
+    const plan = planMemoryEdit(mem, ref, edited);
+    if ("error" in plan) return io.print(`Cancelled: ${plan.error}.`);
+    if (!plan.changes.length) return io.print(`No changes to ${mid(ref.node)}.${plan.bad.length ? ` Unusable paths: ${plan.bad.join(", ")}` : ""}`);
+    plan.apply();
+    return io.print(describeEdit(plan));
   }
   const arg = p.positional[0] ?? ".";
   const rel = mem.paths.rel(arg);

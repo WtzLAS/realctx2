@@ -22,7 +22,7 @@ realctx2 commands:
   /realctx2:inspect <id>
       Details of any ID
   /realctx2:review [--low-value | --harm | --conflicts | --escalations | --stale-rules | --actor <id>] | review approve|dismiss <id>
-      Review queue: approve, pin, edit or forget
+      Review queue: browse pending items and their details; approve, dismiss, edit, pin or forget
   /realctx2:remember <text> [--scope …] [--kind …] [--severity …] [--urgency …] [--path …] [--command …]
       Add an explicit, pinned memory
   /realctx2:forget <id | query> [--purge] [--reason <text>]

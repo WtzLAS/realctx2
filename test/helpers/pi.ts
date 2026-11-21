@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import type { Component } from "@earendil-works/pi-tui";
 import realctx2 from "../../src/index.ts";
 import { ensureDir, writeJson } from "../../src/util/fs.ts";
 import { tmp } from "./fixtures.ts";
@@ -92,7 +93,7 @@ export interface PiRig {
   /** Aux roles answer by the JSON schema they were given: a handler per property name found in it. */
   aux: Array<{ when: string; reply: (user: string, system: string) => unknown }>;
   auxCalls: Array<{ system: string; user: string; tools: string[] }>;
-  ui: { notes: Array<{ text: string; level?: string }>; status: Map<string, string | undefined>; confirm: boolean[]; edits: Array<(prefill: string) => string | undefined>; /** `setWorkingMessage` / `setWorkingVisible` calls, as `message:…` and `visible:…`. */ working: string[]; /** `onTerminalInput` listeners subscribed now. */ input: Set<(data: string) => unknown> };
+  ui: { notes: Array<{ text: string; level?: string }>; status: Map<string, string | undefined>; confirm: boolean[]; edits: Array<(prefill: string) => string | undefined>; /** `setWorkingMessage` / `setWorkingVisible` calls, as `message:…` and `visible:…`. */ working: string[]; /** `onTerminalInput` listeners subscribed now. */ input: Set<(data: string) => unknown>; /** Drivers for `ctx.ui.custom` screens, one per screen opened; a screen without a driver closes at once. */ screens: Array<(c: Component & { handleInput(data: string): void }, render: () => string) => void>; /** Each custom screen as it first rendered (100 columns, no styling). */ shown: string[] };
   /** Terminal input as pi's TUI gets it: extension listeners first, then pi's editor (`app.interrupt` aborts a busy session). */
   press(data: string): void;
   errors: unknown[];
@@ -161,7 +162,7 @@ export async function piRig(o: { cwd: string; mode?: "rpc" | "tui"; config?: Rec
   const sessionDir = join(agentDir, "sessions");
   const sessionManager = o.sessionFile ? SessionManager.open(o.sessionFile, sessionDir) : SessionManager.create(o.cwd, sessionDir);
   const { session } = await createAgentSession({ cwd: o.cwd, agentDir, model: faux.getModel(), thinkingLevel: "off", modelRuntime, resourceLoader, sessionManager, settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, ...(o.settings ?? {}) } as never) });
-  const ui: PiRig["ui"] = { notes: [], status: new Map(), confirm: [], edits: [], working: [], input: new Set() };
+  const ui: PiRig["ui"] = { notes: [], status: new Map(), confirm: [], edits: [], working: [], input: new Set(), screens: [], shown: [] };
   const errors: unknown[] = [];
   const uiContext = new Proxy(
     {
@@ -175,6 +176,17 @@ export async function piRig(o: { cwd: string; mode?: "rpc" | "tui"; config?: Rec
       },
       confirm: async () => ui.confirm.shift() ?? true,
       editor: async (_title: string, prefill?: string) => ui.edits.shift()?.(prefill ?? ""),
+      custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (r: unknown) => void) => Component | Promise<Component>) =>
+        new Promise((resolve) => {
+          const theme = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => t, bold: (t: string) => t };
+          void Promise.resolve(factory({ requestRender: () => undefined, terminal: { rows: 40 } }, theme, {}, resolve)).then((c) => {
+            const render = () => c.render(100).join("\n");
+            ui.shown.push(render());
+            const drive = ui.screens.shift();
+            if (drive) drive(c as Component & { handleInput(data: string): void }, render);
+            else resolve(undefined);
+          });
+        }),
       select: async () => undefined,
       input: async () => undefined,
     } as Record<string, unknown>,

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { Layout } from "../src/core/config.ts";
 import { Host } from "../src/core/host.ts";
+import { type ReviewModel, ReviewSession } from "../src/commands/review.ts";
 import type { CommandIO, ToolDef } from "../src/core/types.ts";
 import { rawTurnId } from "../src/storage/turnindex.ts";
 import { promptSection } from "../src/tools/index.ts";
@@ -486,6 +487,128 @@ describe("/realctx2 commands (§10)", () => {
     expect(r.host.ignoresInstructionFile(join(r.repo, "AGENTS.md"))).toBe(true);
     expect(await r.run("status")).toContain("Instruction files that reappeared after ingest");
     expect(await r.run("export agents")).toMatch(/Wrote 1 AGENTS\.md file\(s\)|No rules to export/);
+    await r.host.shutdown({ spawnWorker: false });
+  });
+
+  it("review hands an interactive harness one model of every pending item, and its actions settle them", async () => {
+    const r = await rig();
+    const mem = r.host.memory!;
+    const at = new Date(r.now.t).toISOString();
+    const rule = idOf(await r.run('remember "Callers must use TokenCache.refresh." --kind rule --severity must --scope personal --path src/auth/tokenCache.ts'));
+    const old = idOf(await r.run('remember "Callers must await TokenCache.warmup at startup." --kind rule --severity should --scope personal --path src/auth/tokenCache.ts'));
+    const a = idOf(await r.run('remember "Deploys run on Fridays." --scope personal'));
+    const b = idOf(await r.run('remember "Deploys never run on Fridays." --scope personal'));
+    const harmful = idOf(await r.run('remember "Clean the build with rm -rf on the repository root." --scope personal'));
+    // what re-verification, the write path, attribution and evolution leave behind
+    mem.review.add({ at, scope: "personal", id: rule, kind: "rule-change", suggestion: { text: "Callers must use TokenCache.renew." }, evidence: [{ path: "src/auth/tokenCache.ts", quote: "renew() {}" }] });
+    mem.review.add({ at, scope: "personal", id: old, kind: "rule-obsolete", evidence: [{ path: "src/auth/tokenCache.ts", quote: "export class TokenCache" }] });
+    mem.review.add({ at, scope: "personal", id: "zz9other", kind: "rule-change", suggestion: { text: "another project's rule" } });
+    const sd = mem.graph.sd("personal");
+    for (const id of [rule, old]) sd.patchNode(id, { flags: ["review"] });
+    mem.graph.link(mem.graph.get(a)!, "contradicts", mem.graph.get(b)!);
+    mem.graph.link(mem.graph.get(b)!, "contradicts", mem.graph.get(a)!);
+    mem.graph.commit("personal");
+    mem.accounting.bump("personal", harmful, "harm", 1.2);
+    mem.accounting.flush(mem.graph, r.host.cfg);
+    expect(mem.graph.get(harmful)!.node.flags).toContain("harm");
+    mem.evoLog.propose({ at, scope: "personal", action: { operator: "refine", candidate: 0 }, summary: 'hub "Deploys run on Fridays."' });
+
+    // without the screen: a plain list
+    const text = await r.run("review");
+    expect(text).toContain(`Re-verification and proposals (2):\n  [m:${rule}]`);
+    expect(text).toContain("suggested: Callers must use TokenCache.renew.");
+    expect(text).toContain("Conflicts (1):");
+    expect(text).toContain(`Harm (acted on with a harmful effect) (1):\n  [m:${harmful}]`);
+    expect(text).toContain("Shared strategy proposals (1):\n  refine in personal");
+    expect(text).not.toContain("another project's rule"); // the queue is per machine; other projects' items stay out
+
+    // with the screen: the command hands over the model and prints nothing
+    const models: ReviewModel[] = [];
+    r.io.review = async (m) => void models.push(m);
+    expect(await r.run("review")).toBe("");
+    const model = models[0]!;
+    const rows = model.rows();
+    expect(rows.map((x) => x.label)).toEqual(["rule change", "obsolete rule", "conflict", "harm", "strategy proposal"]);
+    const key = (label: string) => rows.find((x) => x.label === label)!.key;
+    const change = model.details(key("rule change"));
+    expect(change).toContain("Current text\n  Callers must use TokenCache.refresh.");
+    expect(change).toContain("Suggested text\n  Callers must use TokenCache.renew.");
+    expect(change).toContain('src/auth/tokenCache.ts  "renew() {}"');
+    expect(change).toContain("Memory Worth"); // the memory's own details follow
+    expect(model.actions(key("rule change")).map((x) => `${x.key} ${x.id}`)).toEqual(["a approve", "d dismiss", "e edit", "f forget", "p unpin"]); // remembered by the user: pinned
+    expect(model.actions(key("strategy proposal")).map((x) => x.id)).toEqual(["dismiss"]);
+    expect(model.actions(key("rule change"))[0]!.confirm).toBe(`Replace the text of [m:${rule}] with the suggested text?`);
+
+    // approve applies the suggestion and settles the item
+    expect(model.run(key("rule change"), "approve")).toEqual({ ok: true, message: `Approved [m:${rule}]: the suggested text was applied.` });
+    let n = mem.graph.get(rule)!.node;
+    expect(n.text).toBe("Callers must use TokenCache.renew.");
+    expect(n.flags ?? []).not.toContain("review");
+    expect(n.verifiedAt).toBe(at);
+    expect(mem.review.list().map((x) => x.id)).not.toContain(rule);
+    // dismissing an obsolete verdict keeps the rule, verified against the file as it is now
+    expect(model.run(key("obsolete rule"), "dismiss").ok).toBe(true);
+    n = mem.graph.get(old)!.node;
+    expect(n.status).toBe("active");
+    expect(n.flags ?? []).not.toContain("review");
+    expect(n.anchors.every((x) => x.kind !== "file" || x.seenBlob)).toBe(true);
+    // not a conflict: the contradiction goes, both memories stay
+    expect(model.run(key("conflict"), "dismiss").ok).toBe(true);
+    expect(mem.graph.contradictions(mem.graph.get(a)!)).toEqual([]);
+    expect([mem.graph.get(a)!.node.status, mem.graph.get(b)!.node.status]).toEqual(["active", "active"]);
+    // keeping a harmful memory clears the flag; it returns only on new harm since the review
+    expect(model.run(key("harm"), "approve")).toEqual({ ok: true, message: `Approved [m:${harmful}]: flags cleared.` });
+    expect(mem.graph.get(harmful)!.node.reviewBaseline).toMatchObject({ at, counters: { harm: 1.2 } });
+    mem.accounting.bump("personal", harmful, "harm", 0.5);
+    mem.accounting.flush(mem.graph, r.host.cfg);
+    expect(mem.graph.get(harmful)!.node.flags ?? []).not.toContain("harm");
+    expect(model.run(key("strategy proposal"), "dismiss")).toEqual({ ok: true, message: "Dropped the strategy proposal." });
+    expect(mem.evoLog.proposals()).toEqual([]);
+    expect(model.rows()).toEqual([]);
+    mem.accounting.bump("personal", harmful, "harm", 0.6);
+    mem.accounting.flush(mem.graph, r.host.cfg);
+    model.refresh();
+    expect(model.rows().map((x) => [x.label, x.id])).toEqual([["harm", `[m:${harmful}]`]]);
+    // an action that is not offered for an item does nothing
+    expect(model.run(model.rows()[0]!.key, "edit").ok).toBe(false);
+    await r.host.shutdown({ spawnWorker: false });
+  });
+
+  it("review edits go through the form, are planned first and settle the item when applied", async () => {
+    const r = await rig();
+    const mem = r.host.memory!;
+    const at = new Date(r.now.t).toISOString();
+    const rule = idOf(await r.run('remember "Callers must use TokenCache.refresh." --kind rule --severity must --scope personal --path src/auth/tokenCache.ts'));
+    const keep = idOf(await r.run('remember "Staging deploys use the blue cluster." --scope personal'));
+    const drop = idOf(await r.run('remember "Staging deploys use the green cluster." --scope personal'));
+    mem.review.add({ at, scope: "personal", id: rule, kind: "rule-change", suggestion: { text: "Callers must use TokenCache.renew." } });
+    mem.graph.link(mem.graph.get(keep)!, "contradicts", mem.graph.get(drop)!);
+    mem.graph.commit("personal");
+    const model = new ReviewSession(r.host, mem);
+    const [change, conflict] = model.rows();
+    expect(conflict!.label).toBe("conflict");
+    // the form is prefilled with the suggested text
+    const form = model.editForm(change!.key)!;
+    expect(form.title).toBe(`Edit [m:${rule}] (prefilled with the suggested text)`);
+    expect(form.prefill).toContain("severity: must\n");
+    expect(form.prefill.endsWith("---\nCallers must use TokenCache.renew.")).toBe(true);
+    const edited = form.prefill.replace("Callers must use TokenCache.renew.", "Callers must use TokenCache.renew; never call fetchToken.").replace("urgency: hint", "urgency: caption");
+    // planning changes nothing yet
+    expect(model.planEdit(change!.key, edited)).toEqual({ ok: true, summary: `[m:${rule}]: text, urgency caption`, preview: ["New text", "  Callers must use TokenCache.renew; never call fetchToken."] });
+    expect(mem.graph.get(rule)!.node.text).toBe("Callers must use TokenCache.refresh.");
+    expect(model.planEdit(change!.key, "no separator")).toEqual({ ok: false, message: "Not applied: the form had no text below the --- line." });
+    const out = model.applyEdit(change!.key, edited);
+    expect(out).toEqual({ ok: true, message: `Updated [m:${rule}]: text, urgency caption. The review is settled.` });
+    expect(mem.graph.get(rule)!.node).toMatchObject({ text: "Callers must use TokenCache.renew; never call fetchToken.", urgency: "caption", urgencyBy: "user" });
+    expect(mem.review.list()).toEqual([]);
+    // an unchanged form plans nothing
+    expect(model.planEdit(conflict!.key, model.editForm(conflict!.key)!.prefill)).toMatchObject({ ok: false, message: expect.stringContaining("No changes") });
+    // keep one side of a conflict: the other is retired (reversibly)
+    const primary = model.rows()[0]!;
+    const other = primary.id === `[m:${keep}]` ? drop : keep;
+    expect(model.run(primary.key, "approve").message).toContain(`Retired [m:${other}]`);
+    expect(mem.graph.get(other)!.node.status).toBe("archived");
+    expect(model.rows()).toEqual([]);
     await r.host.shutdown({ spawnWorker: false });
   });
 });
