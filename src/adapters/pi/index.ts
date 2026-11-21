@@ -11,7 +11,7 @@ import { getKeybindings, matchesKey } from "@earendil-works/pi-tui";
 import { type DecisionProviderConfig, Layout, loadGlobalConfig, normalizeEnvVarName, resolveApiKey, saveConfig } from "../../core/config.ts";
 import { Host } from "../../core/host.ts";
 import { SETTINGS_CATEGORIES } from "../../core/settings-schema.ts";
-import type { CommandIO, CommitBatch, ConsolidationRecord, ContextEdit, DecisionQuestion, SessionRecord } from "../../core/types.ts";
+import type { CommandIO, CommitBatch, ConsolidationRecord, ContextEdit, DecisionQuestion, GuidanceMessage, SessionRecord } from "../../core/types.ts";
 import { SUBCOMMANDS } from "../../commands/index.ts";
 import type { ReviewModel } from "../../commands/review.ts";
 import type { PendingDelivery } from "../../context/engine.ts";
@@ -156,6 +156,13 @@ function textOf(content: unknown): string {
   return Array.isArray(content) ? (content as Part[]).filter((p) => p?.type === "text" && typeof p.text === "string").map((p) => p.text).join("\n") : "";
 }
 
+function userTextOf(content: unknown): string {
+  const text = textOf(content);
+  if (text) return text;
+  if (Array.isArray(content) && (content as Part[]).some((p) => p?.type === "image")) return "[image]";
+  return "";
+}
+
 /**
  * Apply context edits to the messages of one request (the `context` hook). The messages carry
  * no entry ids, so they are aligned with the session projection first; when the two do not line
@@ -228,6 +235,10 @@ class PiExtension {
   private readonly events = new Map<string, PathEvent | undefined>();
   private pendingBash: PathEvent[] = [];
   private pendingCompaction: ConsolidationRecord | null = null;
+  /** True while waiting for the `message_end` of the user prompt already handled in `before_agent_start`. */
+  private expectInitialUser = false;
+  /** Steering / follow-up user messages persisted since the last request, waiting for `context`. */
+  private pendingUserMessages: AgentMessage[] = [];
   private rechecked = false;
   private providerRegistered = false;
   private notified = new Set<string>();
@@ -341,6 +352,8 @@ class PiExtension {
     this.events.clear();
     this.pendingBash = [];
     this.pendingCompaction = null;
+    this.expectInitialUser = false;
+    this.pendingUserMessages = [];
     this.adapter.clearDeferred();
   }
 
@@ -408,7 +421,11 @@ class PiExtension {
       if (kept.length !== opts.contextFiles.length) opts.contextFiles.splice(0, opts.contextFiles.length, ...kept);
     }
     // extension-triggered custom runs skip user-turn Janus
-    if (event.messageType !== "user") return undefined;
+    if (event.messageType !== "user") {
+      this.expectInitialUser = false;
+      return undefined;
+    }
+    this.expectInitialUser = true;
     // pi shows its Working row only at the first turn_start, after every before_agent_start
     // handler; until then the prompt has left the editor and nothing says the run is waiting
     const runs = this.runsStarted;
@@ -490,15 +507,49 @@ class PiExtension {
     return drafts.length ? { entries: [...event.entries, ...drafts] } : undefined;
   }
 
+  private onMessageEnd(event: { message?: AgentMessage }): undefined {
+    const msg = event.message;
+    if (!msg || (msg as { role?: string }).role !== "user") return undefined;
+    if (this.expectInitialUser) {
+      this.expectInitialUser = false;
+      return undefined;
+    }
+    this.pendingUserMessages.push(msg);
+    return undefined;
+  }
+
   private async onContext(event: { messages: AgentMessage[] }, ctx: ExtensionContext) {
     const host = this.host;
     if (!host) return undefined;
+    const queued = this.pendingUserMessages.splice(0);
+    let guidance: GuidanceMessage[] = [];
+    if (queued.length && !ctx.signal?.aborted) {
+      host.noteInput();
+      host.refreshConfig();
+      this.flushBash();
+      const text = queued.map((m) => userTextOf((m as { content?: unknown }).content)).filter(Boolean).join("\n\n");
+      const batch = await host.engine.onUserMessage(text, ctx.signal, { inTranscript: queued.length });
+      this.adapter.deferred.records.push(...batch.records);
+      this.adapter.deferred.edits.push(...batch.edits);
+      this.adapter.deferred.messages.push(...batch.messages);
+      guidance = batch.messages;
+      host.updateStatus();
+    }
     // normally nothing: an unchanged list keeps pi's cache-friendly path (§4.4)
     const edits = await host.engine.onContext();
-    if (!edits?.length) return undefined;
-    const projection = ctx.sessionManager.buildSessionProjection().entries.map((p) => ({ id: p.sourceEntry.id, messages: p.messages }));
-    const messages = applyEditsToMessages(event.messages, projection, edits);
-    if (!messages) host.telemetry.event("pi.context_unaligned", { edits: edits.length });
+    let messages: AgentMessage[] | null = null;
+    if (edits?.length) {
+      const projection = ctx.sessionManager.buildSessionProjection().entries.map((p) => ({ id: p.sourceEntry.id, messages: p.messages }));
+      messages = applyEditsToMessages(event.messages, projection, edits);
+      if (!messages) host.telemetry.event("pi.context_unaligned", { edits: edits.length });
+    }
+    if (guidance.length) {
+      const next = messages ?? [...event.messages];
+      for (const msg of guidance) {
+        next.push({ role: "custom", customType: msg.customType, content: msg.content, display: msg.display, details: msg.details, timestamp: Date.now() } as AgentMessage);
+      }
+      messages = next;
+    }
     return messages ? { messages } : undefined;
   }
 
@@ -715,7 +766,12 @@ class PiExtension {
     pi.on("agent_start", () => {
       this.runsStarted++;
     });
+    pi.on("message_end", this.safe("message_end", (e) => this.onMessageEnd(e)));
     pi.on("context", this.safe("context", (e, ctx) => this.onContext(e, ctx)));
+    pi.on("agent_end", () => {
+      this.expectInitialUser = false;
+      this.pendingUserMessages = [];
+    });
     pi.on("tool_call", this.safe("tool_call", (e, ctx) => this.onToolCall(e, ctx)));
     pi.on("tool_result", this.safe("tool_result", (e, ctx) => this.onToolResult(e, ctx)));
     pi.on(
@@ -732,6 +788,8 @@ class PiExtension {
     pi.on(
       "agent_settled",
       this.safe("agent_settled", () => {
+        this.expectInitialUser = false;
+        this.pendingUserMessages = [];
         this.flushBash();
         this.host?.noteSettled(); // queued Precip now, maintenance after the idle period
         return undefined;

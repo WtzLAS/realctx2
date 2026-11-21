@@ -1073,3 +1073,394 @@ describe("pressure, compaction and name conflicts in pi", () => {
     expect(calls).toBe(MODEL_COOLDOWN_STRIKES + 2);
   });
 });
+
+describe("intent tracking for pi steering and follow-up", () => {
+  it("tracks a steering redirect: abandons prior intent before the steer message, injects guidance and path memories on the next request, and settles cleanly", async () => {
+    const cwd = repo();
+    const r = await piRig({ cwd });
+    // seed a path memory on src/db/schema.ts to verify mention delivery on steering
+    r.decision.handler = janus([]);
+    await r.prompt('/realctx2 remember "users rows are soft-deleted via deletedAt." --scope personal --urgency hint --path src/db/schema.ts');
+    const fact = /\[m:([0-9a-z]{8})\]/.exec(r.ui.notes.at(-1)!.text)![1]!;
+    r.decision.requests.length = 0;
+
+    // 1. prompt kindles "Fix auth race"
+    // 2. turn 1 tool_call Janus keeps it open
+    // 3. steering message redirects (new_root + redirect=0.95) -> abandons "Fix auth race", kindles "Check users schema"
+    // 4. agent_before_settle closes "Check users schema" as success
+    const scribeLabels = ["Fix auth race", "Check users schema"];
+    r.aux.push({
+      when: '"label"',
+      reply: () => {
+        const label = scribeLabels.shift() ?? "Extra";
+        return { label, reason: `because ${label}`, success: `${label} is done`, failure: `${label} cannot be done` };
+      },
+    });
+    const steerRequests: Array<{ names: string[]; state: any }> = [];
+    r.decision.handler = (names, state, questions) => {
+      if (state?.user_message) steerRequests.push({ names, state });
+      const out: Record<string, number | Probs> = {};
+      if (names.includes("focus")) {
+        const um = String(state?.user_message ?? "");
+        if (um.includes("fix auth")) {
+          out.focus = { new_root: 0.94 };
+          out.redirect = 0.1;
+        } else if (um.includes("forget auth")) {
+          for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.85, abandoned: 0.15 };
+          out.focus = { new_root: 0.94 };
+          out.redirect = 0.95;
+        } else {
+          for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
+          out.focus = { continue: 0.95 };
+        }
+        return out;
+      }
+      // agent_before_settle: close-only
+      for (const n of names) {
+        if (n.startsWith("close.")) {
+          const label = /"([^"]+)"/.exec(questions[n]!.instructions)?.[1] ?? "";
+          out[n] = label === "Check users schema" ? { success: 0.94, open: 0.03 } : { open: 0.96 };
+        }
+      }
+      return out;
+    };
+
+    let steered = false;
+    r.main.push(
+      async () => {
+        // user steers while turn 1 is in progress (before tool batch finishes)
+        if (!steered) {
+          steered = true;
+          await r.session.steer("Actually, forget auth — check src/db/schema.ts instead");
+        }
+        return { text: "Reading tokenCache.", tools: [{ name: "read", args: { path: "src/auth/tokenCache.ts" } }] };
+      },
+      { text: "Checked src/db/schema.ts; users uses deletedAt." },
+    );
+
+    await r.prompt("fix auth in src/auth/tokenCache.ts");
+    expect(r.errors).toEqual([]);
+    // Janus saw both the initial prompt and the steering message, with redirect question on steer
+    expect(steerRequests.map((x) => x.state.user_message)).toEqual([
+      "fix auth in src/auth/tokenCache.ts",
+      "Actually, forget auth — check src/db/schema.ts instead",
+    ]);
+    expect(steerRequests[1]!.names).toContain("redirect");
+    expect(steerRequests[1]!.state.recent_rounds).toContain("Reading tokenCache.");
+    expect(steerRequests[1]!.state.recent_rounds).not.toContain("Actually, forget auth");
+
+    // Turn 2's LLM request immediately received the steering guidance AND path memory
+    expect(r.calls).toHaveLength(2);
+    expect(r.calls[1]!.text).toContain("user: Actually, forget auth — check src/db/schema.ts instead");
+    expect(r.calls[1]!.text).toContain('[intent] I finished "Fix auth race": set aside.\nI\'m now working on "Check users schema".');
+    expect(r.calls[1]!.text).toContain(`[m:${fact}]`);
+
+    // Check persisted branch records: closedEntryId of first intent is BEFORE the steering user message,
+    // and second intent's guidanceEntryId is the assistant reply after the steering user message
+    const b = r.branch();
+    const steerIdx = b.findIndex((e) => e.role === "user" && e.text === "Actually, forget auth — check src/db/schema.ts instead");
+    expect(steerIdx).toBeGreaterThan(0);
+    const turn2Assistant = b.slice(steerIdx + 1).find((e) => e.role === "assistant")!;
+    expect(turn2Assistant.text).toContain("Checked src/db/schema.ts");
+
+    const intentRecords = b.flatMap((e) => {
+      if (e.customType === "realctx2.intent") return [e.raw.data.intent];
+      const carried = e.raw?.details?.records;
+      if (Array.isArray(carried)) return carried.filter((x: any) => x.type === "realctx2.intent").map((x: any) => x.intent);
+      return [];
+    });
+    const byLabel = new Map<string, any>();
+    for (const intent of intentRecords) byLabel.set(intent.label, intent);
+
+    const authIntent = byLabel.get("Fix auth race");
+    expect(authIntent.status).toBe("abandoned");
+    const closedIdx = b.findIndex((e) => e.id === authIntent.closedEntryId);
+    expect(closedIdx).toBeGreaterThanOrEqual(0);
+    expect(closedIdx).toBeLessThan(steerIdx);
+
+    const schemaIntent = byLabel.get("Check users schema");
+    expect(schemaIntent.status).toBe("success");
+    expect(schemaIntent.guidanceEntryId).toBe(turn2Assistant.id);
+    // guidance custom_message for the steering turn was persisted
+    expect(b.some((e) => e.customType === "realctx2.guidance" && e.text.includes('I\'m now working on "Check users schema".'))).toBe(true);
+    expect(b.some((e) => e.customType === "realctx2.guidance" && e.text.includes('I finished "Check users schema": succeeded.'))).toBe(true);
+
+    // Resume from disk: rebuilt state reflects both closed intents with zero open intents
+    const sessionFile = r.session.sessionManager.getSessionFile()!;
+    await r.shutdown();
+    const r2 = await piRig({ cwd, agentDir: r.agentDir, sessionFile });
+    r2.ui.notes.length = 0;
+    await r2.prompt("/realctx2 status");
+    expect(r2.errors).toEqual([]);
+    expect(r2.ui.notes[0]!.text).toContain("Open intents: none");
+    await r2.shutdown();
+  }, 30_000);
+
+  it("tracks queued follow-up messages after a multi-turn task finishes, including chained follow-ups", async () => {
+    const cwd = repo();
+    const r = await piRig({ cwd });
+    const scribeLabels = ["Fix auth", "Inspect schema", "Summarize both"];
+    r.aux.push({
+      when: '"label"',
+      reply: () => {
+        const label = scribeLabels.shift() ?? "Extra";
+        return { label, reason: `because ${label}`, success: `${label} is done`, failure: `${label} cannot be done` };
+      },
+    });
+
+    const userMessagesSeen: string[] = [];
+    r.decision.handler = (names, state, questions) => {
+      const um = String(state?.user_message ?? "");
+      if (um) userMessagesSeen.push(um);
+      const out: Record<string, number | Probs> = {};
+      if (names.includes("focus")) {
+        if (um.includes("fix auth")) {
+          out.focus = { new_root: 0.94 };
+          out.redirect = 0.1;
+        } else if (um.includes("inspect schema")) {
+          for (const n of names) {
+            if (!n.startsWith("close.")) continue;
+            const label = /"([^"]+)"/.exec(questions[n]!.instructions)?.[1] ?? "";
+            out[n] = label === "Fix auth" ? { success: 0.95, open: 0.02 } : { open: 0.96 };
+          }
+          out.focus = { new_root: 0.93 };
+          out.redirect = 0.1;
+        } else if (um.includes("summarize both")) {
+          for (const n of names) {
+            if (!n.startsWith("close.")) continue;
+            const label = /"([^"]+)"/.exec(questions[n]!.instructions)?.[1] ?? "";
+            out[n] = label === "Inspect schema" ? { success: 0.95, open: 0.02 } : { open: 0.96 };
+          }
+          out.focus = { new_root: 0.93 };
+          out.redirect = 0.1;
+        } else {
+          for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
+          out.focus = { continue: 0.95 };
+        }
+        return out;
+      }
+      // agent_before_settle: close "Summarize both"
+      for (const n of names) {
+        if (n.startsWith("close.")) {
+          const label = /"([^"]+)"/.exec(questions[n]!.instructions)?.[1] ?? "";
+          out[n] = label === "Summarize both" ? { success: 0.95, open: 0.02 } : { open: 0.96 };
+        }
+      }
+      return out;
+    };
+
+    let queuedFollowUps = false;
+    let sawFollowUp1BeforeTurn2 = false;
+    r.main.push(
+      async () => {
+        // queue two follow-ups while turn 1's tool call is about to run
+        if (!queuedFollowUps) {
+          queuedFollowUps = true;
+          await r.session.followUp("Now inspect schema");
+          await r.session.followUp("Finally summarize both");
+        }
+        return { text: "Reading auth.", tools: [{ name: "read", args: { path: "src/auth/tokenCache.ts" } }] };
+      },
+      (call) => {
+        // Turn 2 wraps up task 1: follow-up 1 must NOT have been injected yet
+        sawFollowUp1BeforeTurn2 = call.text.includes("Now inspect schema") || userMessagesSeen.includes("Now inspect schema");
+        return { text: "Auth fix complete." };
+      },
+      { text: "Schema inspected." },
+      { text: "Summary of auth and schema complete." },
+    );
+
+    await r.prompt("fix auth");
+    expect(r.errors).toEqual([]);
+    expect(sawFollowUp1BeforeTurn2).toBe(false);
+    expect(userMessagesSeen).toEqual(["fix auth", "Now inspect schema", "Finally summarize both"]);
+
+    // Turn 3 sees follow-up 1 + closing "Fix auth" + opening "Inspect schema"
+    expect(r.calls).toHaveLength(4);
+    expect(r.calls[2]!.text).toContain("user: Now inspect schema");
+    expect(r.calls[2]!.text).toContain('[intent] I finished "Fix auth": succeeded.\nI\'m now working on "Inspect schema".');
+    // Turn 4 sees follow-up 2 + closing "Inspect schema" + opening "Summarize both"
+    expect(r.calls[3]!.text).toContain("user: Finally summarize both");
+    expect(r.calls[3]!.text).toContain('[intent] I finished "Inspect schema": succeeded.\nI\'m now working on "Summarize both".');
+
+    // Verify all three intents closed cleanly and no follow-up message was inside a prior intent's span
+    const b = r.branch();
+    const f1Idx = b.findIndex((e) => e.role === "user" && e.text === "Now inspect schema");
+    const f2Idx = b.findIndex((e) => e.role === "user" && e.text === "Finally summarize both");
+    expect(f1Idx).toBeGreaterThan(0);
+    expect(f2Idx).toBeGreaterThan(f1Idx);
+
+    const intentRecords = b.flatMap((e) => {
+      if (e.customType === "realctx2.intent") return [e.raw.data.intent];
+      const carried = e.raw?.details?.records;
+      if (Array.isArray(carried)) return carried.filter((x: any) => x.type === "realctx2.intent").map((x: any) => x.intent);
+      return [];
+    });
+    const byLabel = new Map<string, any>();
+    for (const intent of intentRecords) byLabel.set(intent.label, intent);
+
+    expect(byLabel.get("Fix auth").status).toBe("success");
+    expect(b.findIndex((e) => e.id === byLabel.get("Fix auth").closedEntryId)).toBeLessThan(f1Idx);
+    expect(byLabel.get("Inspect schema").status).toBe("success");
+    expect(b.findIndex((e) => e.id === byLabel.get("Inspect schema").closedEntryId)).toBeLessThan(f2Idx);
+    expect(byLabel.get("Summarize both").status).toBe("success");
+    await r.shutdown();
+  }, 30_000);
+
+  it("batches multiple steering messages in 'all' mode as one Janus turn and opens a sub-intent on interruption", async () => {
+    const cwd = repo();
+    const r = await piRig({ cwd, settings: { steeringMode: "all" } });
+    const scribeLabels = ["Fix auth", "Check schema types"];
+    r.aux.push({
+      when: '"label"',
+      reply: () => {
+        const label = scribeLabels.shift() ?? "Extra";
+        return { label, reason: `because ${label}`, success: `${label} is done`, failure: `${label} cannot be done` };
+      },
+    });
+    const userMessagesSeen: string[] = [];
+    r.decision.handler = (names, state, questions) => {
+      const um = String(state?.user_message ?? "");
+      if (um) userMessagesSeen.push(um);
+      const out: Record<string, number | Probs> = {};
+      if (names.includes("focus")) {
+        if (um.includes("fix auth")) {
+          out.focus = { new_root: 0.94 };
+          out.redirect = 0.1;
+        } else if (um.includes("wait, check schema")) {
+          // interruption (new_root with low redirect -> deepens inside parent!)
+          for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
+          out.focus = { new_root: 0.94 };
+          out.redirect = 0.2;
+        } else {
+          // turn 2 tool_call closes the sub-intent and returns to parent
+          for (const n of names) {
+            if (!n.startsWith("close.")) continue;
+            const label = /"([^"]+)"/.exec(questions[n]!.instructions)?.[1] ?? "";
+            out[n] = label === "Check schema types" ? { success: 0.95, open: 0.02 } : { open: 0.96 };
+          }
+          out.focus = { continue: 0.95 };
+        }
+        return out;
+      }
+      for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
+      return out;
+    };
+
+    let steered = false;
+    r.main.push(
+      async () => {
+        if (!steered) {
+          steered = true;
+          await r.session.steer("wait, check schema first");
+          await r.session.steer("specifically check deletedAt");
+        }
+        return { text: "Reading auth.", tools: [{ name: "read", args: { path: "src/auth/tokenCache.ts" } }] };
+      },
+      { text: "Checking schema.", tools: [{ name: "read", args: { path: "src/db/schema.ts" } }] },
+      { text: "Schema has deletedAt: null; resuming auth.", tools: [{ name: "read", args: { path: "src/auth/tokenCache.ts" } }] },
+      { text: "Back to auth." },
+    );
+
+    await r.prompt("fix auth");
+    expect(r.errors).toEqual([]);
+    // Both steering messages arrived in one batch, combined into one Janus decision
+    expect(userMessagesSeen).toEqual(["fix auth", "wait, check schema first\n\nspecifically check deletedAt"]);
+    expect(r.calls[1]!.text).toContain('I\'m now working on "Check schema types" (inside: Fix auth).');
+    // Once the agent examined the schema read result, Turn 3 closed the sub-intent and returned focus to "Fix auth"
+    expect(r.calls[3]!.text).toContain('I finished "Check schema types": succeeded.\nI\'m back to "Fix auth".');
+    await r.shutdown();
+  }, 30_000);
+
+  it("tracks steering queued during before_agent_start without double-processing the initial prompt, and handles a late scribe on steering", async () => {
+    const cwd = repo();
+    const r = await piRig({ cwd, config: { janus: { lateWaitMs: 200, timeoutMs: 250 } } });
+    const scribeLabels = ["Initial task", "Immediate steer task", "Late steer task"];
+    let releaseLateScribe: (() => void) | null = null;
+    const lateScribeGate = new Promise<void>((res) => {
+      releaseLateScribe = res;
+    });
+    let scribeCalls = 0;
+    r.aux.push({
+      when: '"label"',
+      reply: async () => {
+        scribeCalls++;
+        const label = scribeLabels.shift() ?? "Extra";
+        if (label === "Late steer task") await lateScribeGate;
+        return { label, reason: `because ${label}`, success: `${label} is done`, failure: `${label} cannot be done` };
+      },
+    });
+
+    const userMessagesSeen: string[] = [];
+    let queuedDuringBeforeStart = false;
+    r.decision.handler = async (names, state) => {
+      const um = String(state?.user_message ?? "");
+      if (um) userMessagesSeen.push(um);
+      if (um === "start initial task" && !queuedDuringBeforeStart) {
+        queuedDuringBeforeStart = true;
+        // User queues a steering message while before_agent_start is still awaiting Janus
+        await r.session.steer("also handle edge case");
+      }
+      const out: Record<string, number | Probs> = {};
+      if (names.includes("focus")) {
+        if (um === "start initial task") {
+          out.focus = { new_root: 0.94 };
+          out.redirect = 0.1;
+        } else if (um === "also handle edge case") {
+          for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
+          out.focus = { deepen: 0.94 };
+          out.redirect = 0.1;
+        } else if (um === "slow steer task") {
+          for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
+          out.focus = { deepen: 0.94 };
+          out.redirect = 0.1;
+        } else {
+          for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
+          out.focus = { continue: 0.95 };
+        }
+        return out;
+      }
+      for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
+      return out;
+    };
+
+    let queuedSlowSteer = false;
+    r.main.push(
+      async () => {
+        if (!queuedSlowSteer) {
+          queuedSlowSteer = true;
+          await r.session.steer("slow steer task");
+        }
+        return { text: "Handled initial and edge case.", tools: [{ name: "read", args: { path: "src/auth/tokenCache.ts" } }] };
+      },
+      async () => {
+        // Release the late scribe while Turn 2 is executing so turn_end picks it up via takeLateKindle
+        releaseLateScribe?.();
+        return { text: "Handling slow steer task." };
+      },
+    );
+
+    await r.prompt("start initial task");
+    expect(r.errors).toEqual([]);
+    // Initial prompt processed ONCE (before_agent_start), each steering message processed ONCE (context)
+    expect(userMessagesSeen).toEqual(["start initial task", "also handle edge case", "slow steer task"]);
+    expect(scribeCalls).toBe(3);
+    expect(r.calls).toHaveLength(2);
+    expect(r.calls[0]!.text).toContain('I\'m now working on "Initial task".');
+    expect(r.calls[0]!.text).toContain("user: also handle edge case");
+    expect(r.calls[0]!.text).toContain('I\'m now working on "Immediate steer task" (inside: Initial task).');
+    // The late scribe missed Turn 2's prompt budget, so Turn 2 did not get its guidance yet...
+    expect(r.calls[1]!.text).toContain("user: slow steer task");
+    expect(r.calls[1]!.text).not.toContain('I\'m now working on "Late steer task"');
+    // ...and opened at Turn 2's turn_end with guidanceEntryId pointing to Turn 2's assistant message
+    const b = r.branch();
+    const slowSteerIdx = b.findIndex((e) => e.role === "user" && e.text === "slow steer task");
+    const slowSteerAssistant = b.slice(slowSteerIdx + 1).find((e) => e.role === "assistant")!;
+    const intentRecords = b.flatMap((e) => (e.customType === "realctx2.intent" ? [e.raw.data.intent] : []));
+    const lateIntent = intentRecords.find((i: any) => i.label === "Late steer task");
+    expect(lateIntent).toBeDefined();
+    expect(lateIntent.guidanceEntryId).toBe(slowSteerAssistant.id);
+    expect(b.some((e) => e.customType === "realctx2.guidance" && e.text.includes('I\'m now working on "Late steer task" (inside: Immediate steer task).'))).toBe(true);
+    await r.shutdown();
+  }, 30_000);
+});

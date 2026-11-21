@@ -494,6 +494,50 @@ describe("Janus decision rules (§5.2.4)", () => {
     expect(contents).toEqual(['[intent] Still working on "Fix flaky auth test". Done when: the check passes Give up when: three attempts fail', '[intent] Still working on "Fix flaky auth test". Done when: the check passes Give up when: three attempts fail']);
   });
 
+  it("handles in-transcript user messages (steering/follow-up): excludes them from prior evidence and closures, and anchors the new intent at the response after them", async () => {
+    const { s, steps } = await withIntent();
+    scribe(s.aux, [{ label: "Fix users schema" }]);
+    const tools = [{ name: "bash", args: { command: "echo step" }, output: "step" }];
+    steps.push(keepOpen());
+    await s.round("checking auth", tools);
+    const priorLeaf = (await s.h.listEntries()).at(-1)!.id;
+
+    // Pi persists steering/follow-up messages before `context` fires
+    const steerId = s.h.user("forget auth, fix src/db/schema.ts instead");
+    const run = script(s.decision, [
+      (qs) => ({ ...Object.fromEntries(qs.filter((q) => q.startsWith("close.")).map((q) => [q, { open: 0.85, abandoned: 0.15 }])), focus: { new_root: 0.94 }, redirect: 0.95 }),
+    ]);
+    const batch = await s.engine.onUserMessage("forget auth, fix src/db/schema.ts instead", undefined, { inTranscript: 1 });
+    // evidence does not duplicate the steering message inside recent_rounds
+    expect(run.evidence[0].user_message).toBe("forget auth, fix src/db/schema.ts instead");
+    expect(run.evidence[0].recent_rounds).not.toContain("forget auth, fix src/db/schema.ts instead");
+    expect(run.evidence[0].recent_rounds).toContain("checking auth");
+    // the closed intent ends before the steering message, never swallowing it
+    const closed = [...s.engine.state.intents.values()].find((i) => i.label === "Fix flaky auth test")!;
+    expect(closed.status).toBe("abandoned");
+    expect(closed.closedEntryId).toBe(priorLeaf);
+    expect(closed.closedEntryId).not.toBe(steerId);
+    // the new intent opens, and its guidance message is ready to inject
+    const opened = s.engine.state.innermost()!;
+    expect(opened.label).toBe("Fix users schema");
+    expect(opened.guidanceEntryId).toBe("");
+    expect(batch.messages[0]?.content).toContain('I finished "Fix flaky auth test": set aside.');
+    expect(batch.messages[0]?.content).toContain('I\'m now working on "Fix users schema".');
+
+    // next assistant response lands right after the steering message; guidance commits at turn_end
+    const a2 = s.h.assistant("inspecting schema.ts");
+    await s.h.commit({ records: batch.records, edits: batch.edits, messages: [] });
+    const turnEnd = await s.engine.onTurnEnd();
+    await s.h.commit({ records: turnEnd.records, edits: turnEnd.edits, messages: batch.messages });
+    // guidanceEntryId resolved to the assistant response after the steering message (not after the guidance)
+    expect(opened.guidanceEntryId).toBe(a2.id);
+    // because a2 is inside [guidanceEntryId..], one complete round is enough to close at settle
+    script(s.decision, [closeAll("success")]);
+    const settled = await s.engine.onBeforeSettle();
+    expect(settled.messages[0]?.content).toContain('I finished "Fix users schema": succeeded.');
+    expect(s.engine.state.stack).toEqual([]);
+  });
+
   it("renders closures, returns and cards in guidance", () => {
     const i = (label: string): Intent => ({ id: "x", parentId: null, label, reason: "r", success: "s.", failure: "f.", guidanceEntryId: "", openedRound: 0, status: "open" });
     expect(renderGuidance({ closed: [{ intent: i("A"), outcome: "success" }], backTo: i("Parent") })).toBe('[intent] I finished "A": succeeded.\nI\'m back to "Parent". Done when: s.');

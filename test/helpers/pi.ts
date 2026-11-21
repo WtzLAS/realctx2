@@ -143,7 +143,7 @@ export async function piRig(o: { cwd: string; mode?: "rpc" | "tui"; config?: Rec
       const tools: string[] = systems.flatMap((m) => (m.tools ?? []).map((t: any) => t.name));
       rig.auxCalls.push({ system, user, tools });
       const h = rig.aux.find((a) => system.includes(a.when));
-      const out = h ? h.reply(user, system) : null;
+      const out = h ? await h.reply(user, system) : null;
       if (out === null) return fauxAssistantMessage("I cannot help with that.");
       if (tools.includes("submit_result")) return fauxAssistantMessage([fauxToolCall("submit_result", out as never)], { stopReason: "toolUse" });
       return fauxAssistantMessage(JSON.stringify(out));

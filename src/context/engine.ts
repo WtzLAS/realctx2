@@ -180,6 +180,8 @@ export class ContextEngine {
   private lateCards: LateCards[] = [];
   /** A kindle whose scribe missed its commit point's budget: the intent opens at the next one. */
   private lateKindle: LateKindle | null = null;
+  /** Kindled intents whose guidance is deferred past the next assistant response (steering/follow-up). */
+  private pendingStarts = new Map<string, KindleStart>();
   private janusStartedThisTurn = false;
   private closeProb: Record<string, number> = {};
   private precipJobs: PrecipJob[] = [];
@@ -290,6 +292,7 @@ export class ContextEngine {
     this.lateJanus = null;
     this.lateCards = [];
     this.lateKindle = null;
+    this.pendingStarts.clear();
     this.janusGen++;
     this.janusStartedThisTurn = false;
     this.closeProb = {};
@@ -320,9 +323,23 @@ export class ContextEngine {
   /** Fill in entry ids the harness assigned after we handed it guidance and tool results. */
   private resolveIds(): void {
     for (const intent of this.state.stack) {
-      if (intent.guidanceEntryId && this.index.has(intent.guidanceEntryId)) continue;
+      if (intent.guidanceEntryId && this.index.has(intent.guidanceEntryId)) {
+        this.pendingStarts.delete(intent.id);
+        continue;
+      }
+      const start = this.pendingStarts.get(intent.id);
+      if (start) {
+        const first = this.entryAfter(start);
+        if (first) {
+          this.pendingStarts.delete(intent.id);
+          intent.guidanceEntryId = first;
+          this.emit({ type: "realctx2.intent", intent: { ...intent } }, false);
+          continue;
+        }
+      }
       const e = this.entries.find((x) => x.kind === "custom_message" && x.customType === GUIDANCE_TYPE && (x.details as { intentId?: string } | undefined)?.intentId === intent.id);
       if (e && intent.guidanceEntryId !== e.id) {
+        this.pendingStarts.delete(intent.id);
         intent.guidanceEntryId = e.id;
         this.emit({ type: "realctx2.intent", intent: { ...intent } }, false);
       }
@@ -445,24 +462,33 @@ export class ContextEngine {
   }
 
   // ───────────── Janus plumbing
-  private janusInput(mode: "full" | "closure", userMessage?: string): JanusInput {
-    return { state: this.state, entries: this.entries, units: this.units, userMessage, mode, round: this.round, cacheKey: `${this.sessionId}.janus` };
+  private janusInput(mode: "full" | "closure", userMessage?: string, scope?: { entries: EntryView[]; units: Unit[] }): JanusInput {
+    const entries = scope?.entries ?? this.entries;
+    const units = scope?.units ?? this.units;
+    return { state: this.state, entries, units, userMessage, mode, round: roundCount(units), cacheKey: `${this.sessionId}.janus` };
   }
 
   /**
    * Turn a Janus plan into records and at most one guidance message. With a `deadline` (a user
    * message or `turn_end`), the scribe and the proactive cards get only the time left: a late
    * scribe opens its intent at the next commit point, late cards follow. `userMessage` marks a
-   * plan for a user message that is not in the transcript yet.
+   * plan for a user message that is not in the transcript yet; when the harness already appended
+   * the user message (steering/follow-up), `closeAt`, `kindleStart`, and `deferredGuidance` keep
+   * closures before it and the new intent starting after it.
    */
-  private async applyPlan(plan: JanusPlan, input: JanusInput, opts: { deferPrecip?: boolean; extraPaths?: string; deadline?: number; userMessage?: boolean } = {}): Promise<GuidanceMessage | null> {
+  private async applyPlan(
+    plan: JanusPlan,
+    input: JanusInput,
+    opts: { deferPrecip?: boolean; extraPaths?: string; deadline?: number; userMessage?: boolean; closeAt?: string; kindleStart?: KindleStart; deferredGuidance?: boolean } = {},
+  ): Promise<GuidanceMessage | null> {
     Object.assign(this.closeProb, plan.closeProb);
-    const leaf = this.entries[this.entries.length - 1]?.id ?? "";
+    const leaf = opts.closeAt ?? (this.entries[this.entries.length - 1]?.id ?? "");
     const closedNow: Array<{ intent: Intent; outcome: IntentOutcome }> = [];
     // closures, innermost first; only intents that are still open on this branch
     for (const c of plan.closures) {
       const cur = this.state.intents.get(c.intent.id);
       if (!cur || cur.status !== "open") continue;
+      this.pendingStarts.delete(cur.id);
       const closed: Intent = { ...cur, status: c.outcome, closedEntryId: leaf };
       const level = this.state.stack.findIndex((i) => i.id === cur.id) + 1;
       this.emit({ type: "realctx2.intent", intent: closed });
@@ -478,10 +504,13 @@ export class ContextEngine {
     let k: Kindled | null = null;
     // a kindle whose scribe is still running: its intent opens at the next commit point
     let pending = false;
+    const start: KindleStart = opts.kindleStart ?? { afterId: leaf, skipUser: opts.userMessage === true };
     if (plan.kindle && input.mode === "full") {
-      const scribed = await this.scribeBy(input, plan.kindle, opts.deadline, { afterId: leaf, skipUser: opts.userMessage === true });
-      if (scribed) k = await this.kindle(scribed, plan.kindle, { signal: input.signal, extraPaths: opts.extraPaths, deadline: opts.deadline });
-      else pending = this.lateKindle?.kindle === plan.kindle;
+      const scribed = await this.scribeBy(input, plan.kindle, opts.deadline, start);
+      if (scribed) {
+        k = await this.kindle(scribed, plan.kindle, { signal: input.signal, extraPaths: opts.extraPaths, deadline: opts.deadline });
+        if (opts.deferredGuidance) this.pendingStarts.set(k.intent.id, start);
+      } else pending = this.lateKindle?.kindle === plan.kindle;
     }
     const pathText = k ? k.pathText : (opts.extraPaths ?? "");
     if (!closedNow.length && !k) {
@@ -685,12 +714,16 @@ export class ContextEngine {
   }
 
   /**
-   * A new user message (`before_agent_start`, `UserPromptSubmit`): full Janus, synchronously,
-   * with the message included. Returns records to append and at most one guidance message.
-   * An abort of `signal` (the user cancelled the prompt) ends every wait at once: what is not
-   * decided by then is dropped, not deferred, and the next commit point decides anew.
+   * A new user message (`before_agent_start`, `UserPromptSubmit`, or pi steering/follow-up):
+   * full Janus, synchronously, with the message included. Returns records to append and at most
+   * one guidance message. When `opts.inTranscript` is set, that many trailing user entries are
+   * already in the transcript (pi persisted steering/follow-up messages before `context`): Janus
+   * sees the prior transcript plus `text`, closures end before them, and any kindled intent starts
+   * at the first entry after them. An abort of `signal` (the user cancelled the prompt) ends every
+   * wait at once: what is not decided by then is dropped, not deferred, and the next commit point
+   * decides anew.
    */
-  async onUserMessage(text: string, signal?: AbortSignal): Promise<CommitBatch> {
+  async onUserMessage(text: string, signal?: AbortSignal, opts?: { inTranscript?: number }): Promise<CommitBatch> {
     await this.refresh();
     this.turnPathTokens = 0;
     this.gatedThisTurn.clear();
@@ -711,6 +744,21 @@ export class ContextEngine {
         }
       }
     }
+    const inTranscript = opts?.inTranscript ?? 0;
+    let priorEntries = this.entries;
+    let priorUnits = this.units;
+    let priorLeaf = this.entries[this.entries.length - 1]?.id ?? "";
+    let userLeaf = priorLeaf;
+    if (inTranscript > 0) {
+      let cut = this.entries.length;
+      for (let n = 0; n < inTranscript && cut > 0 && this.entries[cut - 1]!.kind === "user"; n++) cut--;
+      if (cut < this.entries.length) {
+        priorEntries = this.entries.slice(0, cut);
+        priorUnits = toUnits(priorEntries);
+        priorLeaf = priorEntries[priorEntries.length - 1]?.id ?? "";
+        userLeaf = this.entries[this.entries.length - 1]!.id;
+      }
+    }
     let msg: GuidanceMessage | null = null;
     // a kindle for the previous message that never reached a commit point: this message decides anew
     this.lateKindle = null;
@@ -718,19 +766,28 @@ export class ContextEngine {
       // the prompt waits for all of this, with no Working row in pi until the first turn starts:
       // one budget for the decision, the scribe and the cards; what misses it applies later
       const deadline = Date.now() + this.promptBudgetMs();
-      const input = { ...this.janusInput("full", text), signal };
+      const scope = inTranscript > 0 ? { entries: priorEntries, units: priorUnits } : undefined;
+      const input = { ...this.janusInput("full", text, scope), signal };
       let plan = await this.janusNow(input, deadline);
       let from: JanusInput = input;
       if (signal?.aborted) plan = null;
+      else if (plan?.answered) this.lateJanus = null;
       else if (!plan && this.lateJanus) {
         // an answer that was still on its way at the last commit point applies here
         const late = this.lateJanus;
         this.lateJanus = null;
         plan = this.current(late);
-        from = { ...late.input, entries: this.entries, units: this.units, round: this.round, state: this.state, signal };
+        from = { ...late.input, entries: priorEntries, units: priorUnits, round: roundCount(priorUnits), state: this.state, signal };
       }
-      if (plan) msg = await this.applyPlan(plan, from, { extraPaths: mention, deadline, userMessage: true });
-      else if (mention) msg = this.guidance(mention, { key: randomId8() });
+      if (plan) {
+        msg = await this.applyPlan(
+          plan,
+          from,
+          inTranscript > 0
+            ? { extraPaths: mention, deadline, userMessage: true, closeAt: priorLeaf, kindleStart: { afterId: userLeaf, skipUser: false }, deferredGuidance: true }
+            : { extraPaths: mention, deadline, userMessage: true },
+        );
+      } else if (mention) msg = this.guidance(mention, { key: randomId8() });
     } else if (mention) msg = this.guidance(mention, { key: randomId8() });
     if (msg) {
       if (mention && msg.content.includes(mention)) this.deliverShown(mentionShown, "path", { guidanceKey: String(msg.details?.key ?? "") });
