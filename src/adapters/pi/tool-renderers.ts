@@ -6,7 +6,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type Component, truncateToWidth } from "@earendil-works/pi-tui";
 
 // Untrusted terminal data (queries, memory text, ids): strip ANSI escape and control sequences.
-function clean(value: unknown, max = 200): string {
+export function clean(value: unknown, max = 200): string {
   return String(value ?? "")
     .replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, "")
     .replace(/[\x00-\x1f\x7f-\x9f]/g, " ")
@@ -29,7 +29,8 @@ function compact(v: unknown, maxItems = 3): string {
   return shown.join(", ") + (items.length > maxItems ? ` +${items.length - maxItems}` : "");
 }
 
-class SummaryComponent implements Component {
+/** Fixed lines, each cut to the width (no wrapping); reusable via `set` across re-renders. */
+export class SummaryComponent implements Component {
   private lines: string[];
 
   constructor(lines: string[]) {

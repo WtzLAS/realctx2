@@ -128,6 +128,26 @@ describe("HttpDecisionClient", () => {
     await expect(c2.decide("e", [QUESTIONS[0]!], { callSite: "t", timeoutMs: 3000, cacheKey: "k" })).rejects.toThrow(/questions must not be empty/);
     expect(other.calls.length).toBe(1);
   });
+  it("drops options rejected with 422 too, in every chunk of a split request", async () => {
+    // validation-style servers answer 422; the chunks are in flight together, so the second one's
+    // rejection arrives after the first already dropped the option
+    const strict = fakeFetch((_u, body) => {
+      if ("prompt_cache_key" in body) return { status: 422, delayMs: 20, json: { detail: [{ loc: ["body", "prompt_cache_key"], msg: "extra fields not permitted" }] } };
+      return { json: { answers: body.questions.map((q: { name: string }) => ({ type: "predicate", name: q.name, probability: 0.75 })) } };
+    });
+    const c = new HttpDecisionClient({ format: "decisions", url: "http://x/v1/decisions", model: "m", maxQuestions: 1 }, { fetch: strict.fetch });
+    const two: DecisionQuestion[] = [QUESTIONS[0]!, { kind: "binary", name: "again", instructions: "Again?", yes: "yes", no: "no" }];
+    const ans = await c.decide("e", two, { callSite: "janus", timeoutMs: 3000, noRetry: true, cacheKey: "sess.janus" });
+    expect([ans.redirect!.p, ans.again!.p]).toEqual([0.75, 0.75]);
+    expect(strict.calls.map((x) => "prompt_cache_key" in x.body)).toEqual([true, true, false, false]);
+    expect([...c.unsupported]).toEqual(["prompt_cache_key"]);
+    expect(c.available()).toBe(true);
+    // a 422 that names nothing the payload holds still fails
+    const other = fakeFetch(() => ({ status: 422, json: { detail: "input too long" } }));
+    const c2 = new HttpDecisionClient({ format: "decisions", url: "http://x/v1/decisions", model: "m" }, { fetch: other.fetch });
+    await expect(c2.decide("e", [QUESTIONS[0]!], { callSite: "t", timeoutMs: 3000, noRetry: true, cacheKey: "k" })).rejects.toThrow(/input too long/);
+    expect(other.calls.length).toBe(1);
+  });
   it("opens the breaker after 5 consecutive failures for 60 s", () => {
     let now = 0;
     const b = new CircuitBreaker(5, 60_000, () => now);

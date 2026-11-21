@@ -31,6 +31,8 @@ export async function extractHttpError(res: { status: number; text(): Promise<st
           (typeof errObj?.message === "string" && errObj.message.trim()) ||
           (typeof rec.message === "string" && rec.message.trim()) ||
           (typeof rec.detail === "string" && rec.detail.trim()) ||
+          // validation errors (FastAPI/pydantic 422): a list naming the offending fields
+          (Array.isArray(rec.detail) && rec.detail.length ? JSON.stringify(rec.detail) : "") ||
           "";
         if (msg) return `${prefix}: ${msg.slice(0, 240)}`;
         return prefix;
@@ -347,6 +349,7 @@ export class HttpDecisionClient implements DecisionClient {
     const started = Date.now();
     const attempts = opts.noRetry ? 1 : 2;
     let lastErr = "";
+    let drops = 0;
     for (let attempt = 0; attempt < attempts; attempt++) {
       if (attempt > 0) await sleep(150 + Math.random() * 350, opts.signal);
       const remaining = opts.timeoutMs - (Date.now() - started);
@@ -360,7 +363,8 @@ export class HttpDecisionClient implements DecisionClient {
         const res = await this.fetchImpl(url, { method: "POST", headers, body: payload, signal });
         if (!res.ok) {
           lastErr = await extractHttpError(res);
-          if (this.dropRejected(res.status, lastErr, payload, opts.callSite)) {
+          if (drops < DECISIONS_FEATURES.length && this.dropRejected(res.status, lastErr, payload, opts.callSite)) {
+            drops++;
             // the same request without what the server rejected; not a failed attempt
             payload = build();
             attempt--;
@@ -399,16 +403,20 @@ export class HttpDecisionClient implements DecisionClient {
   }
 
   /**
-   * A Decisions-compatible server that lacks an optional feature answers 400 and names it
+   * A Decisions-compatible server that lacks an optional feature answers 400 or 422 and names it
    * ("unknown field 'prompt_cache_key'", "Unsupported input content type 'input_json'"). Without
    * this, every request fails, the breaker opens, and all decisions fall back to slow emulation.
+   * A feature another chunk of the same call already dropped counts too: this payload was built
+   * before. The rebuilt payload leaves it out, so the same rejection cannot match twice.
    */
   private dropRejected(status: number, error: string, payload: string, callSite: string): boolean {
     if (this.config.format === "systemone" || (status !== 400 && status !== 422)) return false;
-    const feature = DECISIONS_FEATURES.find((f) => !this.unsupported.has(f) && error.includes(f) && payload.includes(`"${f}"`));
+    const feature = DECISIONS_FEATURES.find((f) => error.includes(f) && payload.includes(`"${f}"`));
     if (!feature) return false;
-    this.unsupported.add(feature);
-    this.telemetry?.event("decision.feature_dropped", { feature, callSite });
+    if (!this.unsupported.has(feature)) {
+      this.unsupported.add(feature);
+      this.telemetry?.event("decision.feature_dropped", { feature, callSite });
+    }
     return true;
   }
 }

@@ -117,6 +117,54 @@ describe("Precip (§5.3)", () => {
     expect(layer.match(/\[r:[0-9a-z]{8}\]/g)!.length).toBe(record.children.length);
   });
 
+  it("consolidates a late intent from its user message on: the round before its guidance is included", async () => {
+    const s = new Session({ cfg: testConfig({ context: { maxWindow: 32000 }, janus: { lateWaitMs: 30, timeoutMs: 100 } }) });
+    consolidators(s.aux);
+    const plan = director(s.decision, s.aux);
+    await s.start();
+    plan.push({});
+    await s.user("hello");
+    await s.round("hi, what should I do?", []);
+    // the scribe misses the user message's budget: the intent opens at the first turn_end
+    const held: Array<() => void> = [];
+    s.aux.on("janus.scribe", async () => {
+      await new Promise<void>((r) => held.push(r));
+      return { label: "Fix the flaky auth test", reason: "the user asked", success: "the suite passes", failure: "no cause found" };
+    });
+    plan.push({ kindle: "Fix the flaky auth test" });
+    expect((await s.user("please fix the flaky auth test")).messages).toEqual([]);
+    held.shift()!();
+    await new Promise((r) => setTimeout(r, 15));
+    plan.push({});
+    const b1 = await s.round("first I'll read the test", work(0));
+    expect(b1.messages[0]!.content).toContain('I\'m now working on "Fix the flaky auth test"');
+    const intent = s.engine.state.stack[0]!;
+    const entries = await s.h.listEntries();
+    const user = entries.findIndex((e) => e.kind === "user" && e.text === "please fix the flaky auth test");
+    const first = entries[user + 1]!;
+    expect(first).toMatchObject({ kind: "assistant" });
+    expect(intent.guidanceEntryId).toBe(first.id);
+    const guidance = entries.find((e) => (e.details as { intentId?: string } | undefined)?.intentId === intent.id)!;
+    expect(entries.indexOf(guidance)).toBeGreaterThan(user + 1);
+    // the start is in the intent's record: a rebuild keeps it, and resolving ids does not move it
+    await s.engine.onSessionStart();
+    expect(s.engine.state.stack[0]!.guidanceEntryId).toBe(first.id);
+    for (let i = 1; i < 3; i++) {
+      plan.push({});
+      await s.round(`investigating ${i}`, work(i));
+    }
+    plan.push({ close: ["Fix the flaky auth test"] });
+    await s.round("the suite passes now", work(3));
+    await s.drain();
+    plan.push({});
+    const b2 = await s.round("wrapping up", work(4, 50));
+    const record = b2.records.find((r) => r.type === "realctx2.consolidation")!.record as ConsolidationRecord;
+    expect(record).toMatchObject({ kind: "precip", intentId: intent.id, anchorId: guidance.id });
+    expect(record.children[0]).toEqual({ entryId: first.id });
+    expect(await s.h.contextText()).not.toContain("first I'll read the test");
+    await hiddenReachable(s);
+  });
+
   it("skips the replacement when the span is small, and consolidates intent-only closures together", async () => {
     const s = new Session({ cfg: cfg() });
     const log = consolidators(s.aux);
@@ -707,6 +755,53 @@ describe("memory in the loop", () => {
     const b3 = await s.round("more", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
     expect(b3.messages.filter((m) => m.content.includes("Memory that may help"))).toEqual([]);
     while (gates.length) await release();
+  });
+
+  it("keeps late cards for each intent: a second kindle does not drop the first one's", async () => {
+    const { mem, s } = await setup();
+    const forFix = await remember(mem, "TokenCache.refresh must be single-flight; concurrent refreshes race on pending.", {});
+    const forTest = await remember(mem, "TokenCache refresh race tests run under vitest with fake timers.", {});
+    s.decision.isCalibrated = false; // aux-emulated and slow (§9.1.4)
+    const gates: Array<{ site: string; open: () => void }> = [];
+    const real = s.decision.decide.bind(s.decision);
+    s.decision.decide = async (ev, qs, opts) => {
+      if (opts.callSite === "janus" || opts.callSite === "proactive.gate") await new Promise<void>((r) => gates.push({ site: opts.callSite, open: r }));
+      return real(ev, qs, opts);
+    };
+    const release = async (site: string) => {
+      gates.splice(gates.findIndex((g) => g.site === site), 1)[0]!.open();
+      await new Promise((r) => setTimeout(r, 15));
+    };
+    // each intent's gate picks the memory for its own purpose
+    s.decision.on("proactive.gate", (ev, qs) => {
+      const want = String(ev.purpose.label).includes("regression") ? "vitest" : "single-flight";
+      return Object.fromEntries(qs.map((q) => [q.name, q.name.startsWith("rel.") ? (ev.memories[Number(q.name.slice(4))].text.includes(want) ? 0.9 : 0.01) : 0.9]));
+    });
+    const labels = ["Fix the TokenCache refresh race", "Write a regression test for the refresh race"];
+    let n = 0;
+    s.aux.on("janus.scribe", () => ({ label: labels[n++]!, reason: "r", success: "s", failure: "f" }));
+    s.decision.on("janus", (_e, qs) => {
+      const out: Answers = { focus: { [n === 0 ? "new_root" : "deepen"]: 0.9 } };
+      for (const q of qs) if (q.name.startsWith("close.")) out[q.name] = { open: 0.95 };
+      return out;
+    });
+    const tools = [{ name: "bash", args: { command: "true" }, output: "ok" }];
+    await s.user("the token cache refresh races, please fix");
+    await release("janus"); // the answer for the message arrives while the model works
+    await s.round("reading the cache", tools); // kindles the first intent; its gate is still running
+    expect(s.engine.state.stack.map((i) => i.label)).toEqual([labels[0]]);
+    await release("janus"); // the round's own run, from before the intent: it cannot kindle
+    await s.round("found the race", tools);
+    await release("janus"); // this round's run deepens
+    await s.round("a regression test first", tools); // kindles the second intent; its gate is still running too
+    expect(s.engine.state.stack.map((i) => i.label)).toEqual(labels);
+    expect(gates.filter((g) => g.site === "proactive.gate").length).toBe(2);
+    await release("proactive.gate");
+    await release("proactive.gate");
+    const b = await s.round("writing it", tools);
+    const late = b.messages.filter((m) => m.content.startsWith("[intent] Memory that may help")).map((m) => m.content);
+    expect(late).toEqual([expect.stringContaining(`with "${labels[0]}":\n[m:${forFix}]`), expect.stringContaining(`with "${labels[1]}":\n[m:${forTest}]`)]);
+    while (gates.length) await release(gates[0]!.site);
   });
 
   it("offers proactive cards only when an intent is kindled, and writes episodes and knowledge on the way out", async () => {

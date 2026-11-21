@@ -111,6 +111,34 @@ interface Kindled {
   pathShown: Shown[];
 }
 
+/** Proactive cards whose (emulated) gate was still running when their intent was kindled. */
+interface LateCards {
+  intentId: string;
+  gen: number;
+  done: boolean;
+  result: Awaited<ReturnType<Retriever["proactive"]>> | null;
+}
+
+/**
+ * Where a late intent starts: the entry after `afterId` (the leaf when its kindle was planned),
+ * past the user message it answers when it was planned for one.
+ */
+interface KindleStart {
+  afterId: string;
+  skipUser: boolean;
+}
+
+/** A kindle whose scribe missed its commit point's budget: the intent opens at a later one. */
+interface LateKindle {
+  kindle: KindlePlan;
+  gen: number;
+  intents: number;
+  done: boolean;
+  scribed: ScribedIntent | null;
+  settled: Promise<void>;
+  start: KindleStart;
+}
+
 const ROOT = "root";
 
 /** Milliseconds until `deadline` (a `Date.now()` value), never negative. */
@@ -148,10 +176,10 @@ export class ContextEngine {
   private janusSeq = 0;
   private janusGen = 0;
   private janusInFlight = 0;
-  /** Proactive cards whose (emulated) gate was still running when their intent was kindled. */
-  private lateCards: { intentId: string; gen: number; done: boolean; result: Awaited<ReturnType<Retriever["proactive"]>> | null } | null = null;
-  /** A kindle whose scribe missed the user message's budget: the intent opens at the next `turn_end`. */
-  private lateKindle: { kindle: KindlePlan; gen: number; intents: number; done: boolean; scribed: ScribedIntent | null } | null = null;
+  /** Proactive cards that missed their kindle, one entry per intent, delivered when they arrive. */
+  private lateCards: LateCards[] = [];
+  /** A kindle whose scribe missed its commit point's budget: the intent opens at the next one. */
+  private lateKindle: LateKindle | null = null;
   private janusStartedThisTurn = false;
   private closeProb: Record<string, number> = {};
   private precipJobs: PrecipJob[] = [];
@@ -260,7 +288,7 @@ export class ContextEngine {
     this.appliedNow = [];
     this.janusRun = null;
     this.lateJanus = null;
-    this.lateCards = null;
+    this.lateCards = [];
     this.lateKindle = null;
     this.janusGen++;
     this.janusStartedThisTurn = false;
@@ -423,10 +451,11 @@ export class ContextEngine {
 
   /**
    * Turn a Janus plan into records and at most one guidance message. With a `deadline` (a user
-   * message, which pi shows nothing for while it waits), the scribe and the proactive cards get
-   * only the time left: a late scribe opens its intent at the next `turn_end`, late cards follow.
+   * message or `turn_end`), the scribe and the proactive cards get only the time left: a late
+   * scribe opens its intent at the next commit point, late cards follow. `userMessage` marks a
+   * plan for a user message that is not in the transcript yet.
    */
-  private async applyPlan(plan: JanusPlan, input: JanusInput, opts: { deferPrecip?: boolean; extraPaths?: string; deadline?: number } = {}): Promise<GuidanceMessage | null> {
+  private async applyPlan(plan: JanusPlan, input: JanusInput, opts: { deferPrecip?: boolean; extraPaths?: string; deadline?: number; userMessage?: boolean } = {}): Promise<GuidanceMessage | null> {
     Object.assign(this.closeProb, plan.closeProb);
     const leaf = this.entries[this.entries.length - 1]?.id ?? "";
     const closedNow: Array<{ intent: Intent; outcome: IntentOutcome }> = [];
@@ -447,16 +476,20 @@ export class ContextEngine {
     if (closedNow.length) this.queuePrecip(closedNow, opts.deferPrecip === true);
 
     let k: Kindled | null = null;
+    // a kindle whose scribe is still running: its intent opens at the next commit point
+    let pending = false;
     if (plan.kindle && input.mode === "full") {
-      const scribed = await this.scribeBy(input, plan.kindle, opts.deadline);
+      const scribed = await this.scribeBy(input, plan.kindle, opts.deadline, { afterId: leaf, skipUser: opts.userMessage === true });
       if (scribed) k = await this.kindle(scribed, plan.kindle, { signal: input.signal, extraPaths: opts.extraPaths, deadline: opts.deadline });
+      else pending = this.lateKindle?.kindle === plan.kindle;
     }
     const pathText = k ? k.pathText : (opts.extraPaths ?? "");
     if (!closedNow.length && !k) {
       if (pathText) return this.guidance(pathText, { key: randomId8() });
-      return this.reminder();
+      return pending ? null : this.reminder();
     }
-    const backTo = !k && closedNow.length ? this.state.innermost() : null;
+    // not "back to" the parent when the next commit point says "now working on" something else
+    const backTo = !k && !pending && closedNow.length ? this.state.innermost() : null;
     return this.kindleGuidance(k, { closed: closedNow, backTo, paths: pathText, focus: plan.focus });
   }
 
@@ -476,13 +509,13 @@ export class ContextEngine {
 
   /**
    * The scribe for a kindle. Past `deadline` it keeps running and its intent opens at the next
-   * `turn_end`, unless another intent was kindled or the branch changed in the meantime.
+   * commit point, unless another intent was kindled or the branch changed in the meantime.
    */
-  private async scribeBy(input: JanusInput, kindle: KindlePlan, deadline?: number): Promise<ScribedIntent | null> {
+  private async scribeBy(input: JanusInput, kindle: KindlePlan, deadline: number | undefined, start: KindleStart): Promise<ScribedIntent | null> {
     const scribing = this.janus.scribe(input, kindle, this.state.stack);
     if (deadline === undefined) return scribing;
-    const late: NonNullable<ContextEngine["lateKindle"]> = { kindle, gen: this.janusGen, intents: this.state.intents.size, done: false, scribed: null };
-    const settled = scribing.then(
+    const late: LateKindle = { kindle, gen: this.janusGen, intents: this.state.intents.size, done: false, scribed: null, settled: Promise.resolve(), start };
+    late.settled = scribing.then(
       (s) => {
         late.scribed = s;
         late.done = true;
@@ -492,7 +525,7 @@ export class ContextEngine {
         this.telemetry?.event("janus.scribe_failed", { error: errMsg(e) });
       },
     );
-    await raceTimeout(settled, timeLeft(deadline));
+    await raceTimeout(late.settled, timeLeft(deadline));
     if (late.done) return late.scribed;
     this.lateKindle = late;
     this.telemetry?.event("janus.kindle_late", {});
@@ -500,10 +533,12 @@ export class ContextEngine {
   }
 
   /** Open a scribed intent, with its proactive cards and the path memories it names. */
-  private async kindle(scribed: ScribedIntent, kindle: KindlePlan, o: { signal?: AbortSignal; extraPaths?: string; deadline?: number }): Promise<Kindled> {
+  private async kindle(scribed: ScribedIntent, kindle: KindlePlan, o: { signal?: AbortSignal; extraPaths?: string; deadline?: number; startEntryId?: string }): Promise<Kindled> {
     const parent = kindle.parentId ? this.state.intents.get(kindle.parentId) : undefined;
     const parentId = parent?.status === "open" ? parent.id : kindle.parentId && this.state.stack.length ? this.state.innermost()!.id : null;
     const intent = this.janus.newIntent(scribed, parentId, this.round);
+    // a late intent governs from where it was planned, not from its guidance (resolveIds keeps it)
+    if (o.startEntryId) intent.guidanceEntryId = o.startEntryId;
     if (parentId === null) {
       // a new root: ordinary folds start again from the root prefix
       this.state.stats.frontier = 0;
@@ -537,14 +572,29 @@ export class ContextEngine {
     return k;
   }
 
-  /** An intent whose scribe finished after its user message: it opens now, with its own guidance. */
-  private async takeLateKindle(signal?: AbortSignal): Promise<GuidanceMessage | null> {
+  /**
+   * An intent whose scribe missed its commit point: it opens now, with its own guidance. It
+   * governs from where it was planned, so the rounds in between consolidate with it. The scribe
+   * gets until `deadline`; one still running then stays pending.
+   */
+  private async takeLateKindle(deadline: number, signal?: AbortSignal): Promise<GuidanceMessage | null> {
     const late = this.lateKindle;
-    if (!late?.done) return null;
+    if (!late) return null;
+    if (!late.done) await raceTimeout(late.settled, timeLeft(deadline));
+    if (!late.done || this.lateKindle !== late) return null;
     this.lateKindle = null;
     if (!late.scribed || late.gen !== this.janusGen || this.state.intents.size !== late.intents) return null;
-    const k = await this.kindle(late.scribed, late.kindle, { signal });
+    const k = await this.kindle(late.scribed, late.kindle, { signal, deadline, startEntryId: this.entryAfter(late.start) });
     return this.kindleGuidance(k, { closed: [], backTo: null, paths: k.pathText, focus: null });
+  }
+
+  /** The first entry a late intent governs, if the transcript has it. */
+  private entryAfter(s: KindleStart): string | undefined {
+    let i = s.afterId ? this.index.get(s.afterId) : -1;
+    if (i === undefined) return undefined;
+    i++;
+    if (s.skipUser && this.entries[i]?.kind === "user") i++;
+    return this.entries[i]?.id;
   }
 
   /** How long a user message waits for Janus in all: the decision, the scribe and the proactive cards. */
@@ -561,7 +611,7 @@ export class ContextEngine {
     const run = this.memory!.retriever.proactive({ label: intent.label, reason: intent.reason, parentLabel }, { signal });
     const wait = waitMs ?? (this.janus.slow() ? this.cfg.janus.lateWaitMs : undefined);
     if (wait === undefined) return run;
-    const late: NonNullable<ContextEngine["lateCards"]> = { intentId: intent.id, gen: this.janusGen, done: false, result: null };
+    const late: LateCards = { intentId: intent.id, gen: this.janusGen, done: false, result: null };
     const settled = run.then(
       (r) => {
         late.result = r;
@@ -576,26 +626,30 @@ export class ContextEngine {
     );
     await raceTimeout(settled, wait);
     if (late.done) return late.result;
-    this.lateCards = late;
+    this.lateCards.push(late);
     return null;
   }
 
-  /** Cards that arrived after their intent's guidance: one more guidance message, if the intent is still open. */
-  private takeLateCards(): GuidanceMessage | null {
-    const late = this.lateCards;
-    if (!late?.done) return null;
-    this.lateCards = null;
-    const intent = this.state.intents.get(late.intentId);
-    if (late.gen !== this.janusGen || !intent || intent.status !== "open" || !this.memory) return null;
-    // what became visible in the meantime (path memories, search) is not repeated
-    const fresh = (late.result?.cards ?? []).filter((c) => !this.isVisible(c.ref.node.id));
-    if (!fresh.length) return null;
-    const captionIds = new Set(fresh.filter((c) => !c.full).map((c) => c.ref.node.id));
-    const rendered = renderCards(fresh.map((c) => c.ref), this.memory.graph, this.memory.paths, { budgetTokens: this.cfg.memory.proactive.maxTokens, captionIds });
-    if (!rendered.shown.length) return null;
-    const key = randomId8();
-    this.deliverShown(rendered.shown, "proactive", { guidanceKey: key });
-    return this.guidance(renderLateCards(intent, rendered.text), { key, cardsFor: intent.id });
+  /** Cards that arrived after their intent's guidance: one more guidance message per intent that is still open. */
+  private takeLateCards(): GuidanceMessage[] {
+    const ready = this.lateCards.filter((l) => l.done);
+    if (!ready.length) return [];
+    this.lateCards = this.lateCards.filter((l) => !l.done);
+    const out: GuidanceMessage[] = [];
+    for (const late of ready) {
+      const intent = this.state.intents.get(late.intentId);
+      if (late.gen !== this.janusGen || !intent || intent.status !== "open" || !this.memory) continue;
+      // what became visible in the meantime (path memories, search, earlier cards) is not repeated
+      const fresh = (late.result?.cards ?? []).filter((c) => !this.isVisible(c.ref.node.id));
+      if (!fresh.length) continue;
+      const captionIds = new Set(fresh.filter((c) => !c.full).map((c) => c.ref.node.id));
+      const rendered = renderCards(fresh.map((c) => c.ref), this.memory.graph, this.memory.paths, { budgetTokens: this.cfg.memory.proactive.maxTokens, captionIds });
+      if (!rendered.shown.length) continue;
+      const key = randomId8();
+      this.deliverShown(rendered.shown, "proactive", { guidanceKey: key });
+      out.push(this.guidance(renderLateCards(intent, rendered.text), { key, cardsFor: intent.id }));
+    }
+    return out;
   }
 
   private guidance(content: string, details: Record<string, unknown>): GuidanceMessage {
@@ -669,7 +723,7 @@ export class ContextEngine {
         plan = this.current(late);
         from = { ...late.input, entries: this.entries, units: this.units, round: this.round, state: this.state, signal };
       }
-      if (plan) msg = await this.applyPlan(plan, from, { extraPaths: mention, deadline });
+      if (plan) msg = await this.applyPlan(plan, from, { extraPaths: mention, deadline, userMessage: true });
       else if (mention) msg = this.guidance(mention, { key: randomId8() });
     } else if (mention) msg = this.guidance(mention, { key: randomId8() });
     if (msg) {
@@ -864,9 +918,12 @@ export class ContextEngine {
     const ctxOn = this.contextEnabled();
     if (!this.light) {
       if (ctxOn) {
-        // an intent whose scribe missed the user message opens first, so a plan below that was
+        // one deadline for everything this commit point waits on (§5.2.1): a late intent, the
+        // Janus answer, and a kindle's scribe and cards; what misses it applies at the next one
+        const deadline = Date.now() + this.cfg.janus.lateWaitMs;
+        // an intent whose scribe missed its commit point opens first, so a plan below that was
         // made before it cannot kindle a second one (`current()`)
-        const kindled = await this.takeLateKindle(signal);
+        const kindled = await this.takeLateKindle(deadline, signal);
         if (kindled) batch.messages.push(kindled);
         // an answer that came too late last step applies now
         const late = this.lateJanus;
@@ -877,7 +934,7 @@ export class ContextEngine {
         let plan: JanusPlan | null = null;
         let input: JanusInput | null = null;
         if (run) {
-          if (!run.done) await raceTimeout(run.promise.catch(() => null), this.cfg.janus.lateWaitMs);
+          if (!run.done) await raceTimeout(run.promise.catch(() => null), timeLeft(deadline));
           if (run.done) {
             plan = this.current(run);
             input = run.input;
@@ -892,18 +949,17 @@ export class ContextEngine {
         }
         if (plan && input) {
           const fresh = { ...input, entries: this.entries, units: this.units, round: this.round, state: this.state, signal };
-          const msg = await this.applyPlan(plan, fresh);
+          const msg = await this.applyPlan(plan, fresh, { deadline });
           if (msg) batch.messages.push(msg);
-        } else {
+        } else if (!this.lateKindle) {
           const r = this.reminder();
           if (r) batch.messages.push(r);
         }
-        const cards = this.takeLateCards();
-        if (cards) batch.messages.push(cards);
+        batch.messages.push(...this.takeLateCards());
       } else {
         this.janusRun = null;
         this.lateJanus = null;
-        this.lateCards = null;
+        this.lateCards = [];
         this.lateKindle = null;
         this.janusStartedThisTurn = false;
       }
@@ -934,6 +990,11 @@ export class ContextEngine {
     await this.refresh();
     const batch = emptyBatch();
     if (!this.contextEnabled()) return batch;
+    if (!this.light) {
+      // an intent whose scribe missed the last turn_end opens here, before the next message drops it
+      const kindled = await this.takeLateKindle(Date.now() + this.cfg.janus.lateWaitMs, signal);
+      if (kindled) batch.messages.push(kindled);
+    }
     if (!this.light && this.cfg.context.settleConsolidation && this.state.stack.length) {
       const input = { ...this.janusInput("closure"), signal };
       const plan = await this.janusNow(input);
@@ -941,6 +1002,7 @@ export class ContextEngine {
       const msg = plan ? await this.applyPlan(plan, input, { deferPrecip: true }) : null;
       if (msg) batch.messages.push(msg);
     }
+    if (!this.light) batch.messages.push(...this.takeLateCards());
     this.commitReady();
     this.flushStats(false);
     const taken = this.take();
@@ -1203,7 +1265,9 @@ export class ContextEngine {
     if (!out) return null;
     const id = this.consolidator.newId(state);
     const text = renderPrecip(id, intent, outcome, out.memory);
-    return planReplace(entries, state, from, to, { id, kind: "precip", text, preferAnchorId: intent.guidanceEntryId, intent, outcome, telos, model: this.adapter.modelName(), now: this.now(), sidecar: out.sidecar, shadow: this.level === 0 });
+    // anchored at the intent's guidance, which a late intent has after its first entry
+    const guidance = entries.find((e) => e.kind === "custom_message" && e.customType === GUIDANCE_TYPE && (e.details as { intentId?: string } | undefined)?.intentId === intent.id);
+    return planReplace(entries, state, from, to, { id, kind: "precip", text, preferAnchorId: guidance?.id ?? intent.guidanceEntryId, intent, outcome, telos, model: this.adapter.modelName(), now: this.now(), sidecar: out.sidecar, shadow: this.level === 0 });
   }
 
   // ───────────── committing plans

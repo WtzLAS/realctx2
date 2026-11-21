@@ -13,12 +13,14 @@ import { SETTINGS_CATEGORIES } from "../../core/settings-schema.ts";
 import type { CommandIO, CommitBatch, ConsolidationRecord, ContextEdit, DecisionQuestion, SessionRecord } from "../../core/types.ts";
 import { SUBCOMMANDS } from "../../commands/index.ts";
 import type { PendingDelivery } from "../../context/engine.ts";
+import { GUIDANCE_TYPE } from "../../context/render.ts";
 import type { PathEvent } from "../../memory/delivery.ts";
 import { PROMPT_SECTION_ID, RULES_SECTION_ID, type ToolKey } from "../../tools/index.ts";
 import { errMsg } from "../../util/errors.ts";
 import { pathEventOf, resultPathEventOf } from "../pathevents.ts";
 import { loadAnySession } from "../sessions.ts";
 import { type Draft, PiAdapter, STATUS_KEY } from "./adapter.ts";
+import { guidanceRenderer } from "./guidance-renderer.ts";
 
 export const DECISION_PROVIDER = "realctx2-decision";
 /** pi's Working row while a user message waits for Janus in `before_agent_start`. */
@@ -27,8 +29,14 @@ export const WORKING_MESSAGE = "Working · realctx2 is reading the prompt";
 /**
  * pi's Working row, shown early. Cosmetic: a mode or pi version whose UI context lacks these
  * methods (rpc, print, older releases) gets no row, and the hook still runs.
+ *
+ * pi's UI context has setters only, so the row cannot be put back exactly as it was: `restore()`
+ * returns the message to pi's default and leaves the row enabled, which overrides a custom message
+ * or a hidden row another extension set. pi clears the row at `agent_end`; when it fails to start
+ * the run after this hook (a later step of its preparation throws), no `agent_end` comes. So
+ * `restore()` watches until the run starts (`started`), and clears the row if pi goes idle first.
  */
-function workingRow(ctx: ExtensionContext): { show(message: string): void; restore(): void } {
+export function workingRow(ctx: Pick<ExtensionContext, "hasUI" | "ui" | "isIdle">, o: { started: () => boolean; pollMs?: number; maxWaitMs?: number }): { show(message: string): void; restore(): void } {
   const ui = (ctx.hasUI ? ctx.ui : undefined) as Partial<Pick<ExtensionContext["ui"], "setWorkingMessage" | "setWorkingVisible">> | undefined;
   const call = (f: () => void) => {
     try {
@@ -37,13 +45,38 @@ function workingRow(ctx: ExtensionContext): { show(message: string): void; resto
       // the row is cosmetic
     }
   };
+  const visible = (v: boolean) => {
+    if (typeof ui?.setWorkingVisible === "function") call(() => ui.setWorkingVisible!(v));
+  };
+  let shown = false;
   return {
     show(message) {
       if (typeof ui?.setWorkingMessage === "function") call(() => ui.setWorkingMessage!(message));
-      if (typeof ui?.setWorkingVisible === "function") call(() => ui.setWorkingVisible!(true));
+      visible(true);
+      shown = typeof ui?.setWorkingVisible === "function";
     },
     restore() {
       if (typeof ui?.setWorkingMessage === "function") call(() => ui.setWorkingMessage!());
+      if (!shown) return;
+      const until = Date.now() + (o.maxWaitMs ?? 120_000);
+      const timer = setInterval(() => {
+        let idle = false;
+        try {
+          idle = !o.started() && ctx.isIdle();
+        } catch {
+          // a context gone stale with its session: nothing to clear any more
+          clearInterval(timer);
+          return;
+        }
+        if (!idle && !o.started() && Date.now() < until) return;
+        clearInterval(timer);
+        if (idle) {
+          // hidden, then enabled again: no row now, pi's default for the next run
+          visible(false);
+          visible(true);
+        }
+      }, o.pollMs ?? 500);
+      (timer as { unref?: () => void }).unref?.();
     },
   };
 }
@@ -130,6 +163,8 @@ class PiExtension {
   private rechecked = false;
   private providerRegistered = false;
   private notified = new Set<string>();
+  /** `agent_start` events seen: tells the Working row whether pi started the run it waited for. */
+  private runsStarted = 0;
 
   constructor(pi: ExtensionAPI) {
     this.pi = pi;
@@ -308,7 +343,8 @@ class PiExtension {
     if (event.messageType !== "user") return undefined;
     // pi shows its Working row only at the first turn_start, after every before_agent_start
     // handler; until then the prompt has left the editor and nothing says the run is waiting
-    const working = workingRow(ctx);
+    const runs = this.runsStarted;
+    const working = workingRow(ctx, { started: () => this.runsStarted !== runs });
     working.show(WORKING_MESSAGE);
     let batch: CommitBatch;
     try {
@@ -593,6 +629,9 @@ class PiExtension {
       }),
     );
     pi.on("before_agent_start", this.safe("before_agent_start", (e, ctx) => this.onBeforeAgentStart(e, ctx)));
+    pi.on("agent_start", () => {
+      this.runsStarted++;
+    });
     pi.on("context", this.safe("context", (e, ctx) => this.onContext(e, ctx)));
     pi.on("tool_call", this.safe("tool_call", (e, ctx) => this.onToolCall(e, ctx)));
     pi.on("tool_result", this.safe("tool_result", (e, ctx) => this.onToolResult(e, ctx)));
@@ -669,6 +708,8 @@ class PiExtension {
       }),
     );
     pi.on("session_shutdown", this.safe("session_shutdown", (e) => this.onShutdown(e)));
+    // guidance messages are shown like realctx2's tools; older pi versions without the API keep the default box
+    if (typeof pi.registerMessageRenderer === "function") pi.registerMessageRenderer(GUIDANCE_TYPE, guidanceRenderer());
 
     pi.registerCommand("realctx2", {
       description: "Context and memory manager: status, settings, search, review, ingest, forget, doctor…",

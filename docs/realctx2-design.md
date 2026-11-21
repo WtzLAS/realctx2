@@ -18,8 +18,8 @@ Owner: laserrks · Harnesses (v1): [pi](https://docs.pi.dev/latest/extensions) (
 
 - **Decisions without a decision model work in practice.** Emulated answers took 5–10 s against a 1.5 s timeout, so none arrived. `decision.emulate` now runs without thinking and has a timeout floor, and a commit point waits for it at most `janus.lateWaitMs`: Janus's answer and proactive cards that miss it apply at the next commit point (§5.2.1, §6.4.1, §9.1.4, §9.3.4).
 - **Janus waits longer by default.** `janus.timeoutMs` is 30 s (was 1.5 s) and `janus.lateWaitMs` 10 s (was 200 ms), so a slow answer is more often used at the commit point it was asked for instead of the next one (§5.2.1, §5.2.7, §5.7, §9.1.5, §9.4).
-- **A user message has one budget.** pi shows no Working row before the first turn starts, so the prompt left the editor and nothing moved while the decision, the scribe and the proactive gate ran one after another (about 18 s with emulated decisions). They now share one budget, `janus.timeoutMs` with a decision model and `janus.lateWaitMs` without; a scribe that misses it opens its intent at the next `turn_end`, and realctx2 shows pi's Working row while the hook waits (§4.2, §5.2.1).
-- **Decisions-compatible servers without every option.** A server that answers 400 naming `prompt_cache_key` or `input_json` gets the request again without it, and later requests leave it out: the cache key is dropped, and JSON evidence is sent as text. Before, every request failed and all decisions fell back to emulation (§9.1).
+- **A user message has one budget.** pi shows no Working row before the first turn starts, so the prompt left the editor and nothing moved while the decision, the scribe and the proactive gate ran one after another (about 18 s with emulated decisions). They now share one budget, `janus.timeoutMs` with a decision model and `janus.lateWaitMs` without; a scribe that misses it opens its intent at the next commit point, and the intent still governs the rounds since its user message. `turn_end` has one deadline as well, `janus.lateWaitMs`, for the late intent, Janus's answer, the scribe and the cards together. realctx2 shows pi's Working row while the hook waits (§4.2, §5.2.1).
+- **Decisions-compatible servers without every option.** A server that answers 400 or 422 naming `prompt_cache_key` or `input_json` gets the request again without it, and later requests leave it out: the cache key is dropped, and JSON evidence is sent as text. Before, every request failed and all decisions fell back to emulation (§9.1).
 - **Remembered memories start short-term.** An unpinned `remember` goes to SML and earns LML by the usual rules; in LML the first hygiene pass demoted it (§6.3).
 - **Read-only sessions keep the shared store clean.** Path reconciliation writes nothing for unchanged paths, and keeps the checkout's last reconciled commit in the local index (§6.8.2–6.8.3); the shared journal records whether it holds counter-only changes, so the worker doesn't flush them (§7.5).
 - **pi details.** Tools register in `session_start` and are re-checked at the first `before_agent_start` (§4.1, §8.1.3); records decided in `before_agent_start` travel in the guidance message's `details` (§4.2, §5.1); the compaction record is written in `session_compact` (§4.2, §5.4.5); summaries and `!` runs can't be edited (§4.3). `aux.pi.extensions` is dropped.
@@ -273,7 +273,7 @@ flowchart LR
 
 | Loop | Runs | Work | Latency budget |
 |---|---|---|---|
-| **Hot** | Before each model request (`before_agent_start`, `turn_end`) | 1. Janus decision. 2. Intent state transitions and guidance. 3. Commit any finished async Precip/Palim edits and trigger new ones in the background. 4. Pressure control. | User messages wait for Janus, the scribe and the proactive gate together for at most one budget (`janus.timeoutMs`, 30 s; `janus.lateWaitMs` without a decision model); otherwise it runs while tools execute, and `turn_end` waits for it at most `janus.lateWaitMs` (10 s) (§5.2.1). Precip and Palim run asynchronously (single-turn, tool-free) and commit at the next `turn_end`, while pressure folds are prepared ahead (§4.4, §5.4.3). |
+| **Hot** | Before each model request (`before_agent_start`, `turn_end`) | 1. Janus decision. 2. Intent state transitions and guidance. 3. Commit any finished async Precip/Palim edits and trigger new ones in the background. 4. Pressure control. | User messages wait for Janus, the scribe and the proactive gate together for at most one budget (`janus.timeoutMs`, 30 s; `janus.lateWaitMs` without a decision model); otherwise it runs while tools execute, and `turn_end` waits for it, the scribe and the proactive gate together at most `janus.lateWaitMs` (10 s) (§5.2.1). Precip and Palim run asynchronously (single-turn, tool-free) and commit at the next `turn_end`, while pressure folds are prepared ahead (§4.4, §5.4.3). |
 | **Warm** | On tool calls and tool results | Record deliveries. Guard against oversized tool output. Extract paths and commands, run the gate for `immediate` memories (§6.10.3), append path memories, track moves (§6.8). | ≤ 50 ms (no model calls; path lookups hit the local index) |
 | **Cold, model-free** | Detached worker: at session end, or on command | Path reconciliation, forgetting pass, strength folding, shared flush, compaction (§7.7), index rebuild | Seconds to minutes |
 | **Cold, model-dependent** | Inside a session while it is idle (§6.6.8); work left over is queued for the next session | Harvest, re-verification, re-slicing changed imports, conflict re-checks, fusion, EvoDisco attempts and policy update | Minutes, within a budget; yields as soon as the user acts |
@@ -425,7 +425,7 @@ If any invariant fails, the batch is dropped and the failure is logged. Consolid
 - **Batching.** All ready edits from one step commit together, so the prompt cache breaks at most once per step, at the earliest edited entry.
 - **Append, don't edit.** Guidance and cards are *appended*. The static realctx2 instructions and "Project rules" go through `systemPromptOptions.sections` on every `before_agent_start`; because their strings are cached and only change when rules change, pi's section differ emits no patch and keeps the cache warm.
 - **Minimize `context` rewrites.** pi replays the system prompt and tool declarations when a `context` handler changes the messages, so the handler is used only in two situations: (1) an emergency request that must go out above capacity before a commit point, and (2) applying a deferred Palim fold on the first request after a cold-cache gap (`cacheTtlSeconds`, §5.4.2), where replaying the prompt breaks no warm cache. In both cases, pending edits are persisted at the next `turn_end`.
-- **Cache-friendly decision requests.** They put the stable part of the evidence first. Decisions-format endpoints then reuse their input cache: an implicit breakpoint at the end of `input`, a prefix of at least 1,024 tokens, and `prompt_cache_key` = session id + call site. A server that rejects `prompt_cache_key` or `input_json` parts with a 400 naming them gets requests without them from then on (JSON evidence as text).
+- **Cache-friendly decision requests.** They put the stable part of the evidence first. Decisions-format endpoints then reuse their input cache: an implicit breakpoint at the end of `input`, a prefix of at least 1,024 tokens, and `prompt_cache_key` = session id + call site. A server that rejects `prompt_cache_key` or `input_json` parts with a 400 or 422 naming them gets requests without them from then on (JSON evidence as text). Chunks of one call already in flight retry without them as well.
 
 ### 4.5 Adapter interface and capability levels
 
@@ -608,7 +608,7 @@ interface Intent {
   reason: string;
   success: string;            // observable exit condition
   failure: string;            // observable give-up condition
-  guidanceEntryId: string;    // b_j: first entry the intent governs
+  guidanceEntryId: string;    // b_j: first entry the intent governs (its guidance; for a late kindle, §5.2.1, the first entry after the point it was planned at)
   openedRound: number;
   status: "open" | "success" | "failure" | "abandoned";
   closedEntryId?: string;
@@ -629,7 +629,7 @@ interface Intent {
 | Moment | Mode | Timing |
 |---|---|---|
 | `before_agent_start`: a new user message | Full (closure and focus), with the user message included | Synchronous: the request waits for the answer, within `janus.timeoutMs` (default 30 s) |
-| A model response with tool calls | Full | Off the critical path (decided in v0.5). Janus starts at the turn's first `tool_call`, while the tools run, with evidence ending at the new assistant message. `turn_end` uses the answer if it arrives within `janus.lateWaitMs` (default 10 s) of the tools finishing; otherwise the answer applies at the next commit point. |
+| A model response with tool calls | Full | Off the critical path (decided in v0.5). Janus starts at the turn's first `tool_call`, while the tools run, with evidence ending at the new assistant message. `turn_end` waits at most `janus.lateWaitMs` (default 10 s) from the tools finishing, for the answer and for a kindle's scribe and proactive gate together; an answer that misses it applies at the next commit point, a scribe that misses it as below. |
 | `agent_before_settle` | Closure only, with no kindle | Synchronous |
 
 - **What it costs.** A closure that only shows in the tool results, such as a test that now passes, is seen one step later, when the next run's evidence includes those results. A late closure only delays consolidation (§5.2.7). Kindles usually show in the assistant's own message ("now I'll look at …"), so they are rarely late.
@@ -637,6 +637,8 @@ interface Intent {
 - **Claude Code.** The same moments are `UserPromptSubmit`; the first `PreToolUse` of a batch, with the answer applied at `PostToolBatch`; and `Stop` (§4.6.2).
 - **Without a decision model** (§9.1.4), answers take seconds, so no moment waits for the full timeout. A user message and settle wait at most `janus.lateWaitMs` (default 10 s), like `turn_end`, and an answer that misses its moment applies at the next commit point. One Janus request is in flight at a time: while it runs, later steps don't start another. A plan applied late can't kindle an intent if another intent was kindled since its evidence was taken.
 - **A user message's budget.** pi shows its Working row only from the first turn, so realctx2 shows it while `before_agent_start` waits, and the decision, the scribe (§5.2.5) and the proactive gate (§6.4.1) share one budget: `janus.timeoutMs` with a decision model, `janus.lateWaitMs` without. A scribe that misses it keeps running, and its intent opens at the next `turn_end` with its own guidance, unless another intent was kindled or the branch changed in the meantime; the next user message drops it. Cards that miss it follow as below.
+- **A late intent.** A scribe that misses `turn_end`'s deadline is handled the same way, and `agent_before_settle` opens a late intent too, so the last turn of a run doesn't lose it. The next commit point waits for a late scribe within its own deadline. The intent governs from the point it was planned at, not from its guidance: b_j is the first entry after the user message (or after the `turn_end` it missed), so the rounds before its guidance consolidate with it, and Precip still anchors at the guidance. While its scribe runs, the guidance for closures in the same plan doesn't say "back to" the parent, and no reminder goes out.
+- **pi's Working row.** pi's UI context has setters only. When the hook ends, realctx2 sets pi's default message back and leaves the row enabled, which overrides a custom message or a hidden row set by another extension. If pi fails to start the run after the hook, no `agent_end` clears the row, so realctx2 clears it when pi goes idle before an `agent_start`.
 
 #### 5.2.2 Evidence
 
@@ -686,7 +688,7 @@ These run deterministically after the answers arrive.
 
 - Guidance is rendered from a template with no LLM call, written in the first person as Hippocam specifies.
 - It is appended as a `custom_message` with customType `realctx2.guidance`.
-- The TUI shows a one-line summary.
+- In pi's TUI it is drawn like realctx2's tools, through `pi.registerMessageRenderer` (`src/adapters/pi/guidance-renderer.ts`): a box on the tool background titled `realctx2 intent` (`memory` for late cards, `reminder`, `paths`), one line per closed intent (`✓`/`✗`/`•` and its outcome) and per opened one (`→ now working on`, `↩ back to`), the done-when condition, and a count of cards and path notes. Why, give-up and the cards and path notes themselves appear when pi's tool-expand key expands it. This is display-only: the model receives the text unchanged, and labels and card text are stripped of terminal control sequences.
 
 ```text
 [intent] I finished "Reproduce the flaky login test": succeeded.
@@ -1273,7 +1275,7 @@ centrality(v) = log(1 + Σ_{active e ∋ v} w_e · κ(layer(src_e), layer(dst_e)
    - Otherwise inject the cards with P ≥ 0.6, at most 5 cards and 1,200 tokens.
    - Cards are rendered without an LLM (§6.4.5) and recorded as deliveries. `immediate` and `hint` memories get full cards; `caption` memories get one line each.
 
-**Without a decision model** (§9.1.4), the gate's emulated answer takes seconds. The kindle waits for it at most `janus.lateWaitMs` (default 10 s), or what is left of a user message's budget (§5.2.1); if it is still running then, the guidance goes out without cards, and the cards follow at the next commit point as their own guidance message (`[intent] Memory that may help with "…":`), if the intent is still open. Cards that became visible in the meantime, for example through a path delivery, are left out.
+**Without a decision model** (§9.1.4), the gate's emulated answer takes seconds. The kindle waits for it at most `janus.lateWaitMs` (default 10 s), or what is left of the commit point's budget (§5.2.1). With a decision model, it also gets no more than that budget. If it is still running then, the guidance goes out without cards, and the cards follow at the next commit point as their own guidance message (`[intent] Memory that may help with "…":`), if the intent is still open. Several intents can have cards pending at once; each gets its own message. Cards that became visible in the meantime, for example through a path delivery, are left out.
 
 This gate targets MemUse's finding that 71–99% of delivered entries were irrelevant. It is also why proactive cards are offered only at intent boundaries, when the agent can act on them.
 

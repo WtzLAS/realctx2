@@ -150,10 +150,11 @@ export class Janus {
       plan.closeProb[intent.id] = 1 - pOpen;
       const tau = a!.calibrated === false ? Math.max(cfg.tauClose, UNCALIBRATED.tauClose) : cfg.tauClose;
       if (1 - pOpen < tau) break;
-      // 2. minimum evidence: at least one complete round since its guidance
+      // 2. minimum evidence: at least one complete round since its guidance (a late intent's
+      // first entry can be the assistant message of the round it was planned in)
       const at = intent.guidanceEntryId ? index.get(intent.guidanceEntryId) : undefined;
       if (at === undefined) break;
-      const since = input.units.filter((u) => u.round && u.complete && u.start > at).length;
+      const since = input.units.filter((u) => u.round && u.complete && u.start >= at).length;
       if (since < 1) break;
       const outcome = (["success", "failure", "abandoned"] as const).map((o) => [o, probs[o] ?? 0] as const).sort((x, y) => y[1] - x[1])[0]![0];
       plan.closures.push({ intent, outcome });

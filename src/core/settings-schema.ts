@@ -1538,7 +1538,7 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
               kind: "integer",
               path: "janus.lateWaitMs",
               label: "Late-answer wait window",
-              description: "Milliseconds to wait for an in-flight Janus response at a commit boundary before proceeding and applying the answer at the next commit point. Without a decision model, also the most a user message waits for Janus, the scribe and proactive cards together.",
+              description: "The most a turn boundary waits for Janus, the scribe and proactive cards together; an answer or intent that misses it applies at the next commit point. Without a decision model, also the most a user message waits for them.",
               unit: "ms",
               min: 0,
               max: 120_000,

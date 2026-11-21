@@ -16,7 +16,12 @@ export interface Intent {
   reason: string;
   success: string; // observable exit condition
   failure: string; // observable give-up condition
-  guidanceEntryId: string; // b_j: first entry the intent governs ("" until the harness has assigned it)
+  /**
+   * b_j: first entry the intent governs. Normally its guidance message ("" until the harness has
+   * assigned it); for an intent whose scribe missed its commit point, the first entry after the
+   * point it was planned at, so the rounds before its guidance belong to it.
+   */
+  guidanceEntryId: string;
   openedRound: number;
   status: IntentStatus;
   closedEntryId?: string;

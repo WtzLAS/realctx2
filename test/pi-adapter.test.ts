@@ -4,8 +4,12 @@ import { afterAll, describe, expect, it } from "vitest";
 import { PiAdapter } from "../src/adapters/pi/adapter.ts";
 import { MODEL_COOLDOWN_STRIKES, PiAuxRunner } from "../src/adapters/pi/aux.ts";
 import { projectedEntries } from "../src/adapters/pi/entries.ts";
-import { applyEditsToMessages, DECISION_PROVIDER, WORKING_MESSAGE } from "../src/adapters/pi/index.ts";
+import { applyEditsToMessages, DECISION_PROVIDER, WORKING_MESSAGE, workingRow } from "../src/adapters/pi/index.ts";
+import { CustomMessageComponent, initTheme } from "@earendil-works/pi-coding-agent";
+import { guidanceLines, guidanceRenderer, parseGuidance } from "../src/adapters/pi/guidance-renderer.ts";
 import { toolRenderers } from "../src/adapters/pi/tool-renderers.ts";
+import { renderGuidance, renderLateCards, renderReminder } from "../src/context/render.ts";
+import type { Intent } from "../src/core/types.ts";
 import { DEFAULT_CONFIG, Layout } from "../src/core/config.ts";
 import { resolveProject } from "../src/core/project.ts";
 import { readJsonl } from "../src/util/fs.ts";
@@ -103,6 +107,24 @@ describe("realctx2 as a pi extension (§4.1–4.4)", () => {
     expect(guidance.text).toBe('[intent] I\'m now working on "Add an email column".\nWhy: because Add an email column\nDone when: Add an email column is done\nGive up when: Add an email column cannot be done');
     // the intent record rides in the guidance message, after the user message it belongs to
     expect(guidance.raw.details.records.map((x: { type: string }) => x.type)).toEqual(["realctx2.intent"]);
+    // pi's chat shows it through realctx2's registered renderer, styled like a tool, not as the default custom-message box
+    const renderer = r.session.extensionRunner.getMessageRenderer("realctx2.guidance")!;
+    expect(renderer).toBeDefined();
+    initTheme("dark");
+    let piTheme: Parameters<typeof renderer>[2] | undefined;
+    const view = new CustomMessageComponent({ role: "custom", customType: guidance.raw.customType, content: guidance.raw.content, display: true, details: guidance.raw.details, timestamp: 0 }, (m, o, t) => {
+      piTheme = t;
+      return renderer(m, o, t);
+    });
+    const collapsed = view.render(100);
+    const sgr = (token: "toolSuccessBg" | "customMessageBg") => piTheme!.bg(token, "\u0000").split("\u0000")[0]!;
+    expect(sgr("toolSuccessBg")).not.toBe(sgr("customMessageBg"));
+    const plain = (lines: readonly string[]) => lines.map((l) => l.replace(/\x1b\[[0-9;:]*m/g, "").trimEnd()).filter(Boolean);
+    expect(collapsed.some((l) => l.includes(sgr("toolSuccessBg")))).toBe(true);
+    expect(collapsed.some((l) => l.includes(sgr("customMessageBg")))).toBe(false);
+    expect(plain(collapsed)).toEqual([" realctx2 intent", ' → now working on "Add an email column"', "   Done when: Add an email column is done", " expand to view"]); // no keybindings are loaded in tests
+    view.setExpanded(true);
+    expect(plain(view.render(100))).toEqual([" realctx2 intent", ' → now working on "Add an email column"', "   Why: because Add an email column", "   Done when: Add an email column is done", "   Give up when: Add an email column cannot be done"]);
     // the first request already carries the section and the guidance
     expect(r.calls[0]!.system).toContain("<realctx2>\n## Context and memory (realctx2)\n- Messages that start with [t:…] are my own earlier work");
     expect(r.calls[0]!.text).toContain('user: add an email column to users\nuser: [intent] I\'m now working on "Add an email column".');
@@ -231,6 +253,45 @@ describe("the context hook", () => {
     expect(applyEditsToMessages(messages, projection, [{ targetId: "nope", replacement: null }])).toBeNull();
     // a projection that does not line up changes nothing
     expect(applyEditsToMessages([sys, u("other", 7)], projection, [{ targetId: "e2", replacement: null }])).toBeNull();
+  });
+});
+
+describe("the Working row in before_agent_start", () => {
+  const ctxWith = (idle: () => boolean) => {
+    const calls: string[] = [];
+    const ui = { setWorkingMessage: (m?: string) => void calls.push(`message:${m ?? ""}`), setWorkingVisible: (v: boolean) => void calls.push(`visible:${v}`) };
+    return { calls, ctx: { hasUI: true, ui: ui as never, isIdle: idle } };
+  };
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  it("clears the row it raised when pi goes idle without starting the run", async () => {
+    // pi's preparation failed after the hook: no agent_start, no agent_end to clear the row
+    const { calls, ctx } = ctxWith(() => true);
+    const row = workingRow(ctx, { started: () => false, pollMs: 5 });
+    row.show(WORKING_MESSAGE);
+    row.restore();
+    await wait(40);
+    expect(calls).toEqual([`message:${WORKING_MESSAGE}`, "visible:true", "message:", "visible:false", "visible:true"]);
+  });
+
+  it("leaves the row to pi once the run starts, and waits while pi is still preparing", async () => {
+    let started = false;
+    let idle = false;
+    const { calls, ctx } = ctxWith(() => idle);
+    const row = workingRow(ctx, { started: () => started, pollMs: 5 });
+    row.show(WORKING_MESSAGE);
+    row.restore();
+    await wait(30); // preparing: neither started nor idle
+    started = true;
+    await wait(20);
+    idle = true; // the run finished: agent_end already cleared the row
+    await wait(20);
+    expect(calls).toEqual([`message:${WORKING_MESSAGE}`, "visible:true", "message:"]);
+    // a context without the UI methods (rpc, print) gets no row and nothing to restore
+    const bare = workingRow({ hasUI: false, ui: {} as never, isIdle: () => true }, { started: () => false, pollMs: 5 });
+    bare.show(WORKING_MESSAGE);
+    bare.restore();
+    await wait(20);
   });
 });
 
@@ -632,6 +693,61 @@ describe("pressure, compaction and name conflicts in pi", () => {
     const remember = toolRenderers("remember", "remember");
     const remErr = remember.renderResult!({ content: [{ type: "text", text: "bad input" }], isError: true } as any, { expanded: false, isPartial: false }, theme, { isError: true } as any).render(120);
     expect(remErr[0]).toContain("✗ bad input");
+  });
+
+  it("renders every guidance form tool-style: closures, kindles, back-to, late cards, reminders and path notes, sanitized", () => {
+    const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s, bg: (_c: string, s: string) => s } as any;
+    const intent = (id: string, label: string, parentId: string | null = null): Intent => ({ id, parentId, label, reason: `because ${label}`, success: `${label} is done`, failure: `${label} is stuck`, guidanceEntryId: "", openedRound: 0, status: "open" });
+    const cards = '[m:abcd1234] personal · fact · as of 2026-11-20\nTokenCache must be single-flight.\n  "we saw a stampede" — t:12345678\n\n[m:efgh5678] shared · rule MUST\nNever edit generated files.';
+    const paths = "[paths] src/auth/cache.ts\nsrc/auth\n- [m:ijkl9012] caption";
+
+    // closures and a kindle with cards and path notes: summary collapsed, everything expanded
+    const text = renderGuidance({ closed: [{ intent: intent("a", 'Explore the "auth" code'), outcome: "success" }, { intent: intent("b", "Try a lock"), outcome: "abandoned" }], kindled: intent("c", "Make the cache single-flight", "p"), parentLabel: "Fix login", cards, paths });
+    expect(parseGuidance(text)).toMatchObject({ kind: "intent", closed: [{ label: 'Explore the "auth" code', outcome: "succeeded" }, { label: "Try a lock", outcome: "set aside" }], now: { label: "Make the cache single-flight", inside: "Fix login" }, memories: 2, paths: ["src/auth/cache.ts"] });
+    const collapsed = guidanceLines(text, false, theme, (d) => `ctrl+o ${d}`);
+    expect(collapsed.hidden).toBe(true);
+    expect(collapsed.lines).toEqual([
+      "realctx2 intent  2 memories · paths src/auth/cache.ts",
+      '✓ finished "Explore the "auth" code" · succeeded',
+      '• finished "Try a lock" · set aside',
+      '→ now working on "Make the cache single-flight"  inside: Fix login',
+      "  Done when: Make the cache single-flight is done",
+      "ctrl+o to expand",
+    ]);
+    const expanded = guidanceLines(text, true, theme).lines;
+    expect(expanded).toEqual(expect.arrayContaining(["  Why: because Make the cache single-flight", "  Give up when: Make the cache single-flight is stuck", "Memory that may help:", "TokenCache must be single-flight.", '  "we saw a stampede" — t:12345678', "[paths] src/auth/cache.ts", "- [m:ijkl9012] caption"]));
+    expect(expanded).not.toContain("ctrl+o to expand");
+
+    // closure with back-to: nothing hidden, no hint
+    const back = guidanceLines(renderGuidance({ closed: [{ intent: intent("d", "Run tests"), outcome: "failure" }], backTo: intent("p", "Fix login") }), false, theme);
+    expect(back).toEqual({ hidden: false, lines: ["realctx2 intent", '✗ finished "Run tests" · failed', '↩ back to "Fix login"', "  Done when: Fix login is done"] });
+
+    // late cards, reminder, a path-only note and unrecognized text
+    expect(guidanceLines(renderLateCards(intent("c", "Make the cache single-flight"), cards), false, theme, (d) => d).lines).toEqual(["realctx2 memory  2 memories", 'for "Make the cache single-flight"', "to expand"]);
+    expect(guidanceLines(renderReminder(intent("c", "Make the cache single-flight"), "Fix login"), true, theme).lines).toEqual([
+      "realctx2 reminder",
+      '→ still working on "Make the cache single-flight"  inside: Fix login',
+      "  Done when: Make the cache single-flight is done",
+      "  Give up when: Make the cache single-flight is stuck",
+    ]);
+    expect(guidanceLines(paths, false, theme, (d) => d).lines).toEqual(["realctx2 paths  paths src/auth/cache.ts", "to expand"]);
+    expect(guidanceLines("something else\nsecond line", false, theme).lines).toEqual(["realctx2  something else", "expand to view"]);
+
+    // untrusted labels and card text cannot inject terminal sequences
+    const evil = renderGuidance({ closed: [], kindled: intent("e", "Fix \x1b[31mred\x1b]0;title\x07 bug"), cards: "[m:abcd1234] personal\n\x1b[2Jwipe" });
+    const shown = guidanceLines(evil, true, theme).lines.join("\n");
+    expect(shown).not.toMatch(/[\x00-\x09\x0b-\x1f\x7f]/);
+    expect(shown).toContain('→ now working on "Fix red bug"');
+
+    // the component: a box on the tool background, collapsed lines cut to the width, expanded lines wrapped
+    const bgTheme = { ...theme, bg: (c: string, s: string) => `<${c}>${s}` };
+    const message = { role: "custom" as const, customType: "realctx2.guidance", content: [{ type: "text" as const, text }], display: true, timestamp: 0 };
+    const opts = { outputPad: 1, keyText: () => "ctrl+o", keyHint: (_k: unknown, d: string) => `ctrl+o ${d}` } as any;
+    const box = guidanceRenderer()(message, { ...opts, expanded: false }, bgTheme)!.render(40);
+    expect(box.every((l) => l.startsWith("<toolSuccessBg>"))).toBe(true);
+    expect(box).toHaveLength(collapsed.lines.length + 2); // vertical padding
+    const wrapped = guidanceRenderer()(message, { ...opts, expanded: true }, bgTheme)!.render(40);
+    expect(wrapped.length).toBeGreaterThan(expanded.length + 2);
   });
 
   it("counts pi cache_warm usage entries in PiAdapter.lastCacheWriteAt and warns on competing context managers", () => {

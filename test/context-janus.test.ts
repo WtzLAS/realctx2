@@ -289,6 +289,122 @@ describe("Janus decision rules (§5.2.4)", () => {
     expect(s2.engine.state.intents.size).toBe(0);
   });
 
+  /** A scribe that answers only when the test releases it. */
+  function heldScribe(s: Session, labels: string[], from = 0): Array<() => void> {
+    const held: Array<() => void> = [];
+    let n = 0;
+    s.aux.on("janus.scribe", async () => {
+      const label = labels[Math.min(n, labels.length - 1)]!;
+      if (n++ >= from) await new Promise<void>((r) => held.push(r));
+      return { label, reason: "r", success: "s", failure: "f" };
+    });
+    return held;
+  }
+  const settle = () => new Promise((r) => setTimeout(r, 15));
+  const answer = (s: Session, f: (names: string[]) => Answers) => s.decision.on("janus", (_e, qs) => f(qs.map((q) => q.name)));
+
+  it("with emulated decisions, bounds a user message by janus.lateWaitMs, the scribe included", async () => {
+    // janus.timeoutMs is far longer: the budget without a decision model is janus.lateWaitMs
+    const s = new Session({ cfg: testConfig({ context: { maxWindow: 32000 }, janus: { lateWaitMs: 50, timeoutMs: 5000 } }) });
+    await s.start();
+    s.decision.isCalibrated = false; // the aux-emulated fallback (§9.1.4)
+    const held = heldScribe(s, ["Fix flaky auth test"]);
+    answer(s, keepOpen({ new_root: 0.9 }));
+    const t0 = Date.now();
+    const b0 = await s.user("fix the flaky auth test");
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(b0.messages).toEqual([]);
+    expect(s.engine.state.stack).toEqual([]);
+    held.shift()!();
+    await settle();
+    answer(s, keepOpen());
+    const b1 = await s.round("looking at the test", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
+    expect(b1.messages.map((m) => m.content)).toEqual([expect.stringContaining('[intent] I\'m now working on "Fix flaky auth test".')]);
+  });
+
+  it("drops a late kindle when the branch changes before it lands", async () => {
+    const s = new Session({ cfg: testConfig({ context: { maxWindow: 32000 }, janus: { lateWaitMs: 50, timeoutMs: 150 } }) });
+    await s.start();
+    const held = heldScribe(s, ["A purpose from another branch"]);
+    answer(s, keepOpen({ new_root: 0.9 }));
+    await s.user("fix the flaky auth test");
+    // `/tree` (or a fork or resume) rebuilds the engine from the active branch
+    await s.engine.onSessionStart();
+    held.shift()!();
+    await settle();
+    answer(s, keepOpen());
+    const b1 = await s.round("looking at the test", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
+    expect(b1.messages).toEqual([]);
+    expect(s.engine.state.intents.size).toBe(0);
+    expect(await s.engine.onBeforeSettle()).toMatchObject({ messages: [] });
+  });
+
+  it("gives turn_end one deadline: a late scribe opens its intent at the next commit point, settle included", async () => {
+    const s = new Session({ cfg: testConfig({ context: { maxWindow: 32000 }, janus: { lateWaitMs: 50, timeoutMs: 5000 } }) });
+    await s.start();
+    const held = heldScribe(s, ["Fix flaky auth test", "Find the race in TokenCache", "Write a regression test"], 1);
+    answer(s, keepOpen({ new_root: 0.9 }));
+    await s.user("fix the flaky auth test");
+    expect(s.engine.state.stack.map((i) => i.label)).toEqual(["Fix flaky auth test"]);
+    const tools = [{ name: "bash", args: { command: "true" }, output: "ok" }];
+    // the round's plan deepens, and its scribe does not answer within janus.lateWaitMs
+    answer(s, keepOpen({ deepen: 0.9 }));
+    const t0 = Date.now();
+    const b1 = await s.round("I need to find the race first", tools);
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(b1.messages).toEqual([]);
+    expect(s.engine.state.stack.length).toBe(1);
+    const leaf = (await s.h.listEntries()).at(-1)!.id;
+    held.shift()!();
+    await settle();
+    answer(s, keepOpen());
+    const b2 = await s.round("grepping for refresh", tools);
+    expect(b2.messages.map((m) => m.content)).toEqual([expect.stringContaining('I\'m now working on "Find the race in TokenCache" (inside: Fix flaky auth test).')]);
+    // it governs from the turn_end it missed on, not from its guidance
+    const entries = await s.h.listEntries();
+    const start = entries[entries.findIndex((e) => e.id === leaf) + 1]!;
+    expect(start).toMatchObject({ kind: "assistant" });
+    expect(s.engine.state.stack[1]!.guidanceEntryId).toBe(start.id);
+    expect(s.engine.state.regions(entries).at(-1)!.from).toBe(entries.indexOf(start));
+    // a scribe that misses the run's last turn_end opens its intent at settle
+    answer(s, keepOpen({ deepen: 0.9 }));
+    await s.round("a regression test comes next", tools);
+    answer(s, keepOpen());
+    s.h.assistant("Writing it now.");
+    const end = await s.engine.onTurnEnd();
+    expect(end.messages).toEqual([]);
+    await s.h.commit(end);
+    held.shift()!();
+    await settle();
+    const atSettle = await s.engine.onBeforeSettle();
+    expect(atSettle.messages.map((m) => m.content)).toEqual([expect.stringContaining('I\'m now working on "Write a regression test" (inside: Find the race in TokenCache).')]);
+    expect(s.engine.state.stack.map((i) => i.label)).toEqual(["Fix flaky auth test", "Find the race in TokenCache", "Write a regression test"]);
+  });
+
+  it("does not say it is back to the parent while a successor's scribe is still running", async () => {
+    const { s, steps } = await withIntent({ cfg: testConfig({ context: { maxWindow: 32000 }, janus: { lateWaitMs: 50, timeoutMs: 5000 } }) });
+    const tools = [{ name: "bash", args: { command: "true" }, output: "ok" }];
+    steps.push(keepOpen({ deepen: 0.9 }));
+    await s.round("I'll look for the race first", tools);
+    const child = s.engine.state.stack[1]!;
+    steps.push(keepOpen());
+    await s.round("found the race", tools);
+    const held = heldScribe(s, ["Write a regression test"]);
+    steps.push((names) => {
+      const out: Answers = { focus: { successor: 0.9 } };
+      for (const n of names) if (n.startsWith("close.")) out[n] = n === `close.${child.id}` ? { open: 0.05, success: 0.9 } : { open: 0.95 };
+      return out;
+    });
+    const b1 = await s.round("fixed; a regression test is next", tools);
+    // the closure only: "I'm back to" the parent would be followed by "I'm now working on" the successor
+    expect(b1.messages.map((m) => m.content)).toEqual(['[intent] I finished "Find the race in TokenCache.refresh": succeeded.']);
+    held.shift()!();
+    await settle();
+    steps.push(keepOpen());
+    const b2 = await s.round("writing the test", tools);
+    expect(b2.messages.map((m) => m.content)).toEqual([expect.stringContaining('I\'m now working on "Write a regression test" (inside: Fix flaky auth test).')]);
+  });
+
   it("never holds a commit point for emulated decisions: they apply one step late, and a stale kindle is dropped", async () => {
     const s = new Session({ cfg: cfg() });
     await s.start();
