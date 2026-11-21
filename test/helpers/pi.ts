@@ -10,7 +10,7 @@ import { tmp } from "./fixtures.ts";
 
 export type Probs = Record<string, number>;
 /** Answers by question name: a number for binary questions, a distribution for choice and score. */
-export type Decide = (names: string[], state: any, questions: Record<string, { type: string; instructions: string; criteria?: unknown }>) => Record<string, number | Probs>;
+export type Decide = (names: string[], state: any, questions: Record<string, { type: string; instructions: string; criteria?: unknown }>) => Record<string, number | Probs> | Promise<Record<string, number | Probs>>;
 
 export interface DecisionServer {
   url: string;
@@ -31,12 +31,12 @@ export async function decisionServer(): Promise<DecisionServer> {
   const server: Server = createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
-    req.on("end", () => {
+    req.on("end", async () => {
       try {
         const json = JSON.parse(body) as { state: unknown; questions: Record<string, { type: string; instructions: string; criteria?: unknown }> };
         const names = Object.keys(json.questions);
         self.requests.push({ names, state: json.state });
-        const raw = self.handler(names, json.state, json.questions);
+        const raw = await self.handler(names, json.state, json.questions);
         const answers: Record<string, unknown> = {};
         for (const name of names) {
           const v = raw[name];
@@ -92,7 +92,9 @@ export interface PiRig {
   /** Aux roles answer by the JSON schema they were given: a handler per property name found in it. */
   aux: Array<{ when: string; reply: (user: string, system: string) => unknown }>;
   auxCalls: Array<{ system: string; user: string; tools: string[] }>;
-  ui: { notes: Array<{ text: string; level?: string }>; status: Map<string, string | undefined>; confirm: boolean[]; edits: Array<(prefill: string) => string | undefined>; /** `setWorkingMessage` / `setWorkingVisible` calls, as `message:…` and `visible:…`. */ working: string[] };
+  ui: { notes: Array<{ text: string; level?: string }>; status: Map<string, string | undefined>; confirm: boolean[]; edits: Array<(prefill: string) => string | undefined>; /** `setWorkingMessage` / `setWorkingVisible` calls, as `message:…` and `visible:…`. */ working: string[]; /** `onTerminalInput` listeners subscribed now. */ input: Set<(data: string) => unknown> };
+  /** Terminal input as pi's TUI gets it: extension listeners first, then pi's editor (`app.interrupt` aborts a busy session). */
+  press(data: string): void;
   errors: unknown[];
   prompt(text: string): Promise<void>;
   /** Fire `session_shutdown` and dispose the session. */
@@ -105,7 +107,7 @@ function contentText(content: unknown): string {
   return Array.isArray(content) ? content.map((p: any) => (p?.type === "text" ? p.text : p?.type === "toolCall" ? `→ ${p.name}(${JSON.stringify(p.arguments)})` : "")).join("\n") : "";
 }
 
-export async function piRig(o: { cwd: string; config?: Record<string, unknown>; home?: string; agentDir?: string; contextWindow?: number; models?: Array<{ id: string; contextWindow: number; maxTokens?: number }>; decision?: DecisionServer; sessionFile?: string; settings?: Record<string, unknown> } = { cwd: "" }): Promise<PiRig> {
+export async function piRig(o: { cwd: string; mode?: "rpc" | "tui"; config?: Record<string, unknown>; home?: string; agentDir?: string; contextWindow?: number; models?: Array<{ id: string; contextWindow: number; maxTokens?: number }>; decision?: DecisionServer; sessionFile?: string; settings?: Record<string, unknown> } = { cwd: "" }): Promise<PiRig> {
   const agentDir = o.agentDir ?? tmp("pi-agent-");
   const home = o.home ?? join(agentDir, "realctx2");
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -159,7 +161,7 @@ export async function piRig(o: { cwd: string; config?: Record<string, unknown>; 
   const sessionDir = join(agentDir, "sessions");
   const sessionManager = o.sessionFile ? SessionManager.open(o.sessionFile, sessionDir) : SessionManager.create(o.cwd, sessionDir);
   const { session } = await createAgentSession({ cwd: o.cwd, agentDir, model: faux.getModel(), thinkingLevel: "off", modelRuntime, resourceLoader, sessionManager, settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, ...(o.settings ?? {}) } as never) });
-  const ui: PiRig["ui"] = { notes: [], status: new Map(), confirm: [], edits: [], working: [] };
+  const ui: PiRig["ui"] = { notes: [], status: new Map(), confirm: [], edits: [], working: [], input: new Set() };
   const errors: unknown[] = [];
   const uiContext = new Proxy(
     {
@@ -167,6 +169,10 @@ export async function piRig(o: { cwd: string; config?: Record<string, unknown>; 
       setStatus: (key: string, text: string | undefined) => void ui.status.set(key, text),
       setWorkingMessage: (message?: string) => void ui.working.push(`message:${message ?? ""}`),
       setWorkingVisible: (visible: boolean) => void ui.working.push(`visible:${visible}`),
+      onTerminalInput: (handler: (data: string) => unknown) => {
+        ui.input.add(handler);
+        return () => void ui.input.delete(handler);
+      },
       confirm: async () => ui.confirm.shift() ?? true,
       editor: async (_title: string, prefill?: string) => ui.edits.shift()?.(prefill ?? ""),
       select: async () => undefined,
@@ -174,7 +180,7 @@ export async function piRig(o: { cwd: string; config?: Record<string, unknown>; 
     } as Record<string, unknown>,
     { get: (t, k: string) => t[k] ?? (() => undefined) },
   );
-  await session.bindExtensions({ uiContext: uiContext as never, mode: "rpc", onError: (e: unknown) => errors.push(e) });
+  await session.bindExtensions({ uiContext: uiContext as never, mode: o.mode ?? "rpc", onError: (e: unknown) => errors.push(e) });
   return {
     session,
     modelRuntime,
@@ -187,6 +193,16 @@ export async function piRig(o: { cwd: string; config?: Record<string, unknown>; 
     errors,
     async prompt(text: string) {
       await session.prompt(text);
+    },
+    press(data: string) {
+      let current = data;
+      for (const listener of [...ui.input]) {
+        const r = listener(current) as { consume?: boolean; data?: string } | undefined;
+        if (r?.consume) return;
+        if (r?.data !== undefined) current = r.data;
+      }
+      // pi's editor: escape while the session is busy aborts it
+      if (current === "\x1b" && session.isStreaming) void session.abort();
     },
     async shutdown() {
       await (session as unknown as { _extensionRunner: { emit(e: unknown): Promise<unknown> } })._extensionRunner.emit({ type: "session_shutdown", reason: "quit" });

@@ -7,6 +7,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getKeybindings, matchesKey } from "@earendil-works/pi-tui";
 import { type DecisionProviderConfig, Layout, loadGlobalConfig, normalizeEnvVarName, resolveApiKey, saveConfig } from "../../core/config.ts";
 import { Host } from "../../core/host.ts";
 import { SETTINGS_CATEGORIES } from "../../core/settings-schema.ts";
@@ -77,6 +78,71 @@ export function workingRow(ctx: Pick<ExtensionContext, "hasUI" | "ui" | "isIdle"
         }
       }, o.pollMs ?? 500);
       (timer as { unref?: () => void }).unref?.();
+    },
+  };
+}
+
+/**
+ * True when terminal input is pi's interrupt key (`app.interrupt`, escape by default). The
+ * keybindings are pi's own when realctx2 shares its pi-tui (the extension loader aliases it);
+ * a copy without pi's app keybindings falls back to escape.
+ */
+export function isInterruptKey(data: string): boolean {
+  try {
+    const kb = getKeybindings();
+    if (kb.getDefinition("app.interrupt")) return kb.matches(data, "app.interrupt");
+  } catch {
+    // no keybindings: the default key below
+  }
+  return matchesKey(data, "escape");
+}
+
+/** pi's interrupt key as pi shows it in its own Working row ("escape" by default). */
+export function interruptKeyText(): string {
+  try {
+    const kb = getKeybindings();
+    if (kb.getDefinition("app.interrupt")) return kb.getKeys("app.interrupt").join("/");
+  } catch {
+    // no keybindings: the default key below
+  }
+  return "escape";
+}
+
+/**
+ * The interrupt key while a user message waits for Janus in `before_agent_start`. pi already
+ * takes the key as an abort of the run, but only acts on it at `agent_start`, and `ctx.signal` is
+ * undefined until the run exists. So the hook watches the terminal itself and stops waiting at
+ * once; the key is not consumed, pi still aborts the run. Interactive mode only (`active` false
+ * elsewhere): an RPC abort has no terminal input to watch.
+ */
+export function interruptWatch(ctx: Pick<ExtensionContext, "hasUI" | "ui" | "mode">, isInterrupt: (data: string) => boolean = isInterruptKey): { signal: AbortSignal; active: boolean; dispose(): void } {
+  const ctl = new AbortController();
+  const ui = (ctx.hasUI && ctx.mode === "tui" ? ctx.ui : undefined) as Partial<Pick<ExtensionContext["ui"], "onTerminalInput">> | undefined;
+  let off: (() => void) | undefined;
+  if (typeof ui?.onTerminalInput === "function") {
+    try {
+      off = ui.onTerminalInput((data) => {
+        try {
+          if (!ctl.signal.aborted && isInterrupt(data)) ctl.abort();
+        } catch {
+          // never break the terminal
+        }
+        return undefined;
+      });
+    } catch {
+      off = undefined;
+    }
+  }
+  return {
+    signal: ctl.signal,
+    active: typeof off === "function",
+    dispose() {
+      try {
+        off?.();
+      } catch {
+        // already gone with the UI
+      }
+      off = undefined;
     },
   };
 }
@@ -345,13 +411,18 @@ class PiExtension {
     // handler; until then the prompt has left the editor and nothing says the run is waiting
     const runs = this.runsStarted;
     const working = workingRow(ctx, { started: () => this.runsStarted !== runs });
-    working.show(WORKING_MESSAGE);
+    // Esc cancels the wait: Janus stops, pi aborts the run when it starts
+    const interrupt = interruptWatch(ctx);
+    working.show(interrupt.active ? `${WORKING_MESSAGE} (${interruptKeyText()} to interrupt)` : WORKING_MESSAGE);
+    const signal = ctx.signal ? AbortSignal.any([ctx.signal, interrupt.signal]) : interrupt.signal;
     let batch: CommitBatch;
     try {
-      batch = await host.engine.onUserMessage(event.prompt ?? "", ctx.signal);
+      batch = await host.engine.onUserMessage(event.prompt ?? "", signal);
     } finally {
+      interrupt.dispose();
       working.restore();
     }
+    if (interrupt.signal.aborted) host.telemetry.event("pi.prompt_interrupted", {});
     this.adapter.deferred.edits.push(...batch.edits);
     host.updateStatus();
     const msg = batch.messages[0];

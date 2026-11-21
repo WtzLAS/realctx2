@@ -525,8 +525,10 @@ export class ContextEngine {
         this.telemetry?.event("janus.scribe_failed", { error: errMsg(e) });
       },
     );
-    await raceTimeout(late.settled, timeLeft(deadline));
+    await raceTimeout(late.settled, timeLeft(deadline), input.signal);
     if (late.done) return late.scribed;
+    // the user cancelled the prompt: the kindle is dropped, the next commit point decides anew
+    if (input.signal?.aborted) return null;
     this.lateKindle = late;
     this.telemetry?.event("janus.kindle_late", {});
     return null;
@@ -624,8 +626,9 @@ export class ContextEngine {
         return null;
       },
     );
-    await raceTimeout(settled, wait);
+    await raceTimeout(settled, wait, signal);
     if (late.done) return late.result;
+    if (signal?.aborted) return null;
     this.lateCards.push(late);
     return null;
   }
@@ -684,6 +687,8 @@ export class ContextEngine {
   /**
    * A new user message (`before_agent_start`, `UserPromptSubmit`): full Janus, synchronously,
    * with the message included. Returns records to append and at most one guidance message.
+   * An abort of `signal` (the user cancelled the prompt) ends every wait at once: what is not
+   * decided by then is dropped, not deferred, and the next commit point decides anew.
    */
   async onUserMessage(text: string, signal?: AbortSignal): Promise<CommitBatch> {
     await this.refresh();
@@ -716,7 +721,8 @@ export class ContextEngine {
       const input = { ...this.janusInput("full", text), signal };
       let plan = await this.janusNow(input, deadline);
       let from: JanusInput = input;
-      if (!plan && this.lateJanus) {
+      if (signal?.aborted) plan = null;
+      else if (!plan && this.lateJanus) {
         // an answer that was still on its way at the last commit point applies here
         const late = this.lateJanus;
         this.lateJanus = null;
@@ -805,11 +811,13 @@ export class ContextEngine {
    * prompt does not wait for them, and the answer applies at the next commit point.
    */
   private async janusNow(input: JanusInput, deadline?: number): Promise<JanusPlan | null> {
-    if (!this.janus.slow()) return this.janus.decide(input);
+    // the request gets the signal too; the race only stops waiting for a client that ignores it
+    if (!this.janus.slow()) return (await raceTimeout(this.janus.decide(input), Infinity, input.signal)) ?? null;
     if (this.janusInFlight > 0) return null;
     const run = this.runJanus(input);
-    await raceTimeout(run.promise.catch(() => null), deadline === undefined ? this.cfg.janus.lateWaitMs : timeLeft(deadline));
+    await raceTimeout(run.promise.catch(() => null), deadline === undefined ? this.cfg.janus.lateWaitMs : timeLeft(deadline), input.signal);
     if (run.done) return run.plan;
+    if (input.signal?.aborted) return null;
     this.deferJanus(run);
     return null;
   }

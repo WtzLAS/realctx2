@@ -4,7 +4,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { PiAdapter } from "../src/adapters/pi/adapter.ts";
 import { MODEL_COOLDOWN_STRIKES, PiAuxRunner } from "../src/adapters/pi/aux.ts";
 import { projectedEntries } from "../src/adapters/pi/entries.ts";
-import { applyEditsToMessages, DECISION_PROVIDER, WORKING_MESSAGE, workingRow } from "../src/adapters/pi/index.ts";
+import { applyEditsToMessages, DECISION_PROVIDER, interruptWatch, isInterruptKey, WORKING_MESSAGE, workingRow } from "../src/adapters/pi/index.ts";
 import { CustomMessageComponent, initTheme } from "@earendil-works/pi-coding-agent";
 import { guidanceLines, guidanceRenderer, parseGuidance } from "../src/adapters/pi/guidance-renderer.ts";
 import { toolRenderers } from "../src/adapters/pi/tool-renderers.ts";
@@ -293,6 +293,69 @@ describe("the Working row in before_agent_start", () => {
     bare.restore();
     await wait(20);
   });
+
+  it("watches the interrupt key in pi's TUI only, without consuming it", () => {
+    const listeners = new Set<(d: string) => unknown>();
+    const ui = { onTerminalInput: (h: (d: string) => unknown) => (listeners.add(h), () => void listeners.delete(h)) };
+    const w = interruptWatch({ hasUI: true, mode: "tui", ui: ui as never });
+    expect(w.active).toBe(true);
+    const send = (d: string) => [...listeners].map((h) => h(d));
+    expect(send("a")).toEqual([undefined]);
+    expect(w.signal.aborted).toBe(false);
+    expect(send("\x1b")).toEqual([undefined]); // pi's editor still gets the key and aborts the run
+    expect(w.signal.aborted).toBe(true);
+    w.dispose();
+    expect(listeners.size).toBe(0);
+    // rpc and print have no terminal to watch
+    for (const ctx of [{ hasUI: true, mode: "rpc" as const, ui: ui as never }, { hasUI: false, mode: "print" as const, ui: {} as never }]) {
+      const off = interruptWatch(ctx);
+      expect(off.active).toBe(false);
+      off.dispose();
+    }
+    expect(listeners.size).toBe(0);
+    expect(isInterruptKey("\x1b")).toBe(true);
+    expect(isInterruptKey("\r")).toBe(false);
+  });
+
+  it("stops reading the prompt at once when the user presses Esc, and pi aborts the run", async () => {
+    const cwd = repo();
+    const r = await piRig({ cwd, mode: "tui", config: { janus: { lateWaitMs: 200, timeoutMs: 8000 } } });
+    expect(r.errors).toEqual([]);
+    // Janus hangs on the decision until the test is over
+    let release: () => void = () => undefined;
+    const hung = new Promise<void>((res) => (release = res));
+    let workingAtJanus: string[] = [];
+    r.decision.handler = async (names) => {
+      if (names.includes("focus")) {
+        workingAtJanus = [...r.ui.working];
+        // the user gives up on the prompt while realctx2 reads it
+        setTimeout(() => r.press("\x1b"), 50);
+        await hung;
+      }
+      return {};
+    };
+    const t0 = Date.now();
+    await r.prompt("add an email column to users");
+    const took = Date.now() - t0;
+    release();
+    expect(r.errors).toEqual([]);
+    expect(workingAtJanus).toEqual([`message:${WORKING_MESSAGE} (escape to interrupt)`, "visible:true"]);
+    // far below janus.timeoutMs: the wait ended with the key, not with the timeout
+    expect(took).toBeLessThan(3000);
+    expect(r.ui.input.size).toBe(0);
+    // pi aborted the run at agent_start: the model was never asked, no guidance was added
+    expect(r.calls).toEqual([]);
+    const b = r.branch();
+    expect(b.some((e) => e.customType === "realctx2.guidance")).toBe(false);
+    expect(b.findLast((e) => e.role === "assistant")?.raw.message.stopReason).toBe("aborted");
+    // the session is usable again: the next prompt is read and answered normally
+    r.decision.handler = janus([{}]);
+    r.main.push({ text: "done" });
+    await r.prompt("never mind, just say done");
+    expect(r.errors).toEqual([]);
+    expect(r.calls.at(-1)?.text).toContain("user: never mind, just say done");
+    await r.shutdown();
+  }, 20_000);
 });
 
 describe("pressure, compaction and name conflicts in pi", () => {
