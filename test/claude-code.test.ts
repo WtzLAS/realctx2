@@ -8,6 +8,7 @@ import { ClaudeAdapter } from "../src/adapters/claude-code/adapter.ts";
 import { ClaudeAuxRunner, effortFor, type SpawnFn } from "../src/adapters/claude-code/aux.ts";
 import { chunk, ClaudeServer, type HookInput } from "../src/adapters/claude-code/server.ts";
 import { autoMemoryState, restoreClaudeSettings } from "../src/adapters/claude-code/settings.ts";
+import type { AuxTask } from "../src/core/types.ts";
 import { findServer, listen, registrations, request, runDir, socketPath } from "../src/adapters/claude-code/socket.ts";
 import { SessionLog } from "../src/adapters/claude-code/state.ts";
 import { parseTranscript, TranscriptReader } from "../src/adapters/claude-code/transcript.ts";
@@ -367,6 +368,80 @@ describe("the engine host for Claude Code (§4.6)", () => {
     const found = await r2.mcp("tools/call", { name: "search", arguments: { query: "tidy the readme", in: ["turns"], where: "project" } });
     expect(found.content[0].text).toContain("earlier session");
     await r2.close();
+  });
+
+  it("runs long commands beside the hook queue: hooks, tools and short commands answer while ingest or maintain waits on the models", async () => {
+    const r = await rig({ session: "sess-long" });
+    const send = (payload: Record<string, unknown>, ms = 10_000) => request(r.server.socket, payload, ms) as Promise<any>;
+    const hook = (event: string, extra: Record<string, unknown> = {}) => send({ kind: "hook", input: { hook_event_name: event, session_id: "sess-long", transcript_path: r.transcript.file, cwd: r.repo, ...extra } });
+    const command = (line: string, waitMs?: number) => send({ kind: "command", line, session: "sess-long", ...(waitMs ? { waitMs } : {}) }, 20_000);
+    const until = async (ok: () => boolean) => {
+      for (let i = 0; i < 400 && !ok(); i++) await new Promise((res) => setTimeout(res, 10));
+      expect(ok()).toBe(true);
+    };
+    // each model call waits until the test lets it answer (or the command is stopped)
+    const gates: Array<() => void> = [];
+    const held = (value: unknown) => (task: AuxTask) =>
+      new Promise((resolve, reject) => {
+        if (task.signal?.aborted) return reject(new Error("aborted")); // as the real runners do
+        gates.push(() => resolve(value));
+        task.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    await hook("SessionStart", { source: "startup" });
+
+    // ingest: the slicer holds the command; everything else answers meanwhile
+    write(r.repo, "AGENTS.md", "# Project\n\nAlways run `pnpm lint` before committing.\n");
+    commitAll(r.repo, "agents");
+    r.aux.on("ingest.slicer", held({ items: [{ kind: "rule", severity: "must", title: "Lint before committing", text: "Always run `pnpm lint` before committing.", lines: [3, 3], quote: "Always run `pnpm lint` before committing.", anchors: [] }], skipped: [{ lines: [1, 1], reason: "title" }] }));
+    const ingest = command("ingest --yes");
+    await until(() => gates.length === 1);
+    const t0 = Date.now();
+    await hook("PreToolUse", { tool_name: "Read", tool_input: { file_path: join(r.repo, "src/db/schema.ts") }, tool_use_id: "toolu_1" });
+    await hook("PostToolBatch", { tool_calls: [] });
+    expect((await command("status")).text).toMatch(/^realctx2 0\.7\.0 · claude-code/);
+    expect((await r.mcp("tools/call", { name: "search", arguments: { query: "lint before committing" } })).isError).toBe(false);
+    // a second long command is turned away, not queued behind the first
+    expect((await command("maintain")).text).toBe("realctx2 is still running /realctx2 ingest (started 0 s ago). Run /realctx2 maintain again when it has finished.");
+    expect(Date.now() - t0).toBeLessThan(3000);
+    expect(gates.length).toBe(1); // still slicing
+    gates.shift()!();
+    const ingested = (await ingest).text as string;
+    expect(ingested).toContain("Stored 1 item(s) as pinned memories");
+    expect(ingested).toContain("Deleted 1 file(s): AGENTS.md");
+
+    // maintain: harvesting an earlier session's work holds it past the hook client's wait
+    const mem = r.server.session!.host.memory!;
+    mem.enqueue({ kind: "idle-harvest", sessionId: "sess-earlier", harness: "claude-code", data: { records: [{ id: "t:aaaa1111", text: "The users table is soft-deleted via deletedAt." }] } });
+    r.aux.on("palim", held(null));
+    const early = await command("maintain", 400);
+    expect(early.text).toBe("/realctx2 maintain is still running in the background: it waits on the models. Hooks and tools carry on meanwhile, and its result is shown when it finishes.");
+    await until(() => gates.length === 1);
+    expect((await hook("PostToolBatch", { tool_calls: [] }))?.systemMessage).toBeUndefined();
+    gates.shift()!();
+    // the result follows with the next hook that can carry a notice
+    await until(() => r.server.session!.adapter.notices.length > 0);
+    const after = await hook("PostToolBatch", { tool_calls: [] });
+    expect(after.systemMessage).toMatch(/^\/realctx2 maintain finished:\nPaths: /);
+    await r.close();
+  });
+
+  it("stops a long command when its session ends, before the stores close, and applies nothing more", async () => {
+    const r = await rig({ session: "sess-long-end" });
+    await r.hook("SessionStart", { source: "startup" });
+    write(r.repo, "AGENTS.md", "# Project\n\nAlways run `pnpm lint` before committing.\n");
+    commitAll(r.repo, "agents");
+    let started = false;
+    r.aux.on("ingest.slicer", (task: AuxTask) => {
+      started = true;
+      if (task.signal?.aborted) return Promise.reject(new Error("aborted")); // as the real runners do
+      return new Promise((_resolve, reject) => task.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
+    });
+    const ingest = r.server.longCommand("ingest --yes", "sess-long-end");
+    for (let i = 0; i < 400 && !started; i++) await new Promise((res) => setTimeout(res, 10));
+    expect(started).toBe(true);
+    await r.close();
+    expect(await ingest).toContain("Stopped: the session ended before anything was stored or deleted.");
+    expect(existsSync(join(r.repo, "AGENTS.md"))).toBe(true);
   });
 });
 

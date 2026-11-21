@@ -212,6 +212,15 @@ describe("settings schema completeness & descriptions", () => {
     expect(parseSettingInput({ kind: "integer", path: "context.K", label: "K", description: "d", min: 1, max: 50 }, "5")).toEqual({ ok: true, value: 5 });
     expect(parseSettingInput({ kind: "integer", path: "context.K", label: "K", description: "d", min: 1, max: 50 }, "2.5").ok).toBe(false);
     expect(parseSettingInput({ kind: "integer", path: "context.K", label: "K", description: "d", min: 1, max: 50 }, "0").ok).toBe(false);
+    // daily budgets: 0 disables the limit, and says so
+    for (const path of ["budgets.dailyAuxTokens", "budgets.dailyDecisionTokens"]) {
+      const budget = flattenAllSettings(DEFAULT_CONFIG).find((i) => i.entry.path === path)!.entry as Parameters<typeof parseSettingInput>[0];
+      expect(parseSettingInput(budget, "0")).toEqual({ ok: true, value: 0 });
+      expect(parseSettingInput(budget, "unlimited")).toEqual({ ok: true, value: 0 });
+      expect(formatSettingValue(budget, 0)).toBe("0 (unlimited)");
+      expect(formatSettingValue(budget, 2_000_000)).toBe("2,000,000 tokens");
+    }
+    expect(DEFAULT_CONFIG.providers.aux.emulateTimeoutMs).toBe(40_000);
     expect(parseSettingInput({ kind: "nullable-number", path: "reverify.maxPerDay", label: "m", description: "d", min: 0 }, "")).toEqual({ ok: true, value: null });
     expect(parseSettingInput({ kind: "nullable-number", path: "reverify.maxPerDay", label: "m", description: "d", min: 0 }, "25")).toEqual({ ok: true, value: 25 });
     expect(parseSettingInput({ kind: "number-or-auto", path: "context.climb.expectedRequests", label: "e", description: "d", min: 1 }, "auto")).toEqual({ ok: true, value: "auto" });

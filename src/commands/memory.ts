@@ -455,14 +455,16 @@ export async function ingest(host: Host, io: CommandIO, p: Parsed): Promise<void
   const include = p.flags.has("all") ? ["agents", "claude", "local", "rules", "global"] : flagValue(p, "include") ? [...new Set(["agents", "claude", ...flagValue(p, "include")!.split(",").map((x) => x.trim()).filter(Boolean)])] : undefined;
   const dryRun = p.flags.has("dry-run");
   io.notify("Slicing instruction files…", "info");
-  const res = await mem.instructions.ingest({ paths: p.positional.length ? p.positional : undefined, include, dryRun, io, assumeYes: p.flags.has("yes") });
+  const res = await mem.instructions.ingest({ paths: p.positional.length ? p.positional : undefined, include, dryRun, io, assumeYes: p.flags.has("yes"), signal: io.signal });
   if (res.dryRun) return io.print("Dry run: nothing was stored or deleted.");
+  if (res.cancelled && io.signal?.aborted) return io.print("Stopped: the session ended before anything was stored or deleted.");
   if (res.cancelled) return io.print("Cancelled: nothing was stored or deleted.");
   if (!res.stored.length && !res.deleted.length) return io.print(res.plan.problems.length ? `Nothing was ingested:\n${res.plan.problems.map((x) => `  - ${x}`).join("\n")}` : "No instruction files to ingest.");
   for (const scope of mem.graph.visible()) flushNow(mem, scope);
   const lines = [`Stored ${res.stored.length} item(s) as pinned memories${res.merged.length ? `, merged ${res.merged.length} learned memor${res.merged.length === 1 ? "y" : "ies"} into them` : ""}${res.retired.length ? `, retired ${res.retired.length} item(s) that are no longer in the files` : ""}.`];
   if (res.conflicts.length) lines.push(`⚠ ${res.conflicts.length} learned memor${res.conflicts.length === 1 ? "y contradicts" : "ies contradict"} an instruction; the instruction wins in delivery until reviewed (/realctx2 review --conflicts).`);
-  if (res.deleted.length) lines.push(`Deleted ${res.deleted.length} file(s): ${res.deleted.join(", ")}${res.backupDir ? `\nUntracked files were backed up to ${res.backupDir}.` : ""}`);
+  if (res.deleted.length) lines.push(`Deleted ${res.deleted.length} file(s): ${res.deleted.join(", ")}${res.backupDir ? `\nBacked up first, as git history does not hold them as they were (untracked or uncommitted changes): ${res.backedUp.join(", ")} → ${res.backupDir}` : ""}`);
+  if (res.changedMeanwhile.length) lines.push(`Kept ${res.changedMeanwhile.join(", ")}: changed while being ingested. Run /realctx2 ingest again to pick up the changes.`);
   if (res.plan.kept.length) lines.push(`Kept (not fully covered, imported, or generated): ${res.plan.kept.map((f) => f.display).join(", ")}`);
   if (res.stored.some((s) => s.scope === "shared")) lines.push("Commit the shared store together with the deletions, so teammates get the rules from memory.");
   host.projectRules();
@@ -485,7 +487,7 @@ export async function reverify(host: Host, io: CommandIO, p: Parsed): Promise<vo
     mem.graph.commitAll("reverify-queue");
   }
   io.notify("Re-verifying memories against the code…", "info");
-  const r = await mem.reverifier.run({ sessionEnding: true, maxFiles: all ? 200 : 20 });
+  const r = await mem.reverifier.run({ sessionEnding: true, maxFiles: all ? 200 : 20, signal: io.signal });
   const lines = [`Checked ${r.files} file(s) in ${r.auxSessions} aux session(s): ${r.holdsModelFree.length + r.holds.length} hold, ${r.changed.length} updated, ${r.obsolete.length} retired as obsolete, ${r.unclear.length} unclear, ${r.review.length} sent to review.`];
   for (const c of r.changed.slice(0, 10)) lines.push(`  [m:${c.id}] → [m:${c.replacement}]`);
   if (r.waiting.length) lines.push(`  ${r.waiting.length} file(s) are still changing and will be checked later.`);

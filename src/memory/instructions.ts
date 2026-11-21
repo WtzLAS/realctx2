@@ -34,7 +34,10 @@ export interface InstructionFile {
   scope: ScopeName;
   /** Repo-relative directory the file governs ("" = root); null for files without a location. */
   dir: string | null;
+  /** Tracked by git. */
   tracked: boolean;
+  /** Tracked, but the working tree differs from HEAD (uncommitted or never committed): git history does not keep it as it is. */
+  uncommitted?: boolean;
   /** Another file that replaces this one (AGENTS.override.md). */
   shadowedBy?: string;
   importedBy?: string;
@@ -91,6 +94,8 @@ export interface IngestResult {
   conflicts: string[];
   retired: string[];
   deleted: string[];
+  /** Files planned for deletion that changed on disk while they were sliced: kept, so nothing unsliced is lost. */
+  changedMeanwhile: string[];
   backedUp: string[];
   backupDir?: string;
   dryRun: boolean;
@@ -348,7 +353,8 @@ export class Instructions {
       if (!include.has(family)) continue;
       const dir = relative(root, c.dirAbs).split(sep).join("/");
       const display = this.display(abs);
-      files.push({ abs, display, type: c.type, scope: c.scope, dir, tracked: git ? git.isTracked(display) : false });
+      const tracked = git ? git.isTracked(display) : false;
+      files.push({ abs, display, type: c.type, scope: c.scope, dir, tracked, ...(tracked && !git!.committedAsIs(display) ? { uncommitted: true } : {}) });
     }
     // AGENTS.override.md replaces that directory's AGENTS.md or CLAUDE.md, as pi does
     for (const o of files.filter((f) => f.type === "override")) {
@@ -361,7 +367,9 @@ export class Instructions {
     for (const w of wanted) {
       if (files.some((f) => f.abs === w) || !existsSync(w) || !statSync(w).isFile() || !/\.(md|MD|markdown)$/.test(w)) continue;
       const inRepo = root && !relative(root, w).startsWith("..");
-      files.push({ abs: w, display: this.display(w), type: "agents", scope: inRepo ? "shared" : "global", dir: inRepo ? relative(root, dirname(w)).split(sep).join("/") : null, tracked: git && inRepo ? git.isTracked(this.display(w)) : false });
+      const display = this.display(w);
+      const tracked = git && inRepo ? git.isTracked(display) : false;
+      files.push({ abs: w, display, type: "agents", scope: inRepo ? "shared" : "global", dir: inRepo ? relative(root, dirname(w)).split(sep).join("/") : null, tracked, ...(tracked && !git!.committedAsIs(display) ? { uncommitted: true } : {}) });
     }
     return files.sort((a, b) => a.display.localeCompare(b.display));
   }
@@ -567,7 +575,7 @@ export class Instructions {
     }
     let v = this.verify(file, parsed, items, skipped);
     let uncovered = v.uncovered.filter((l) => !plan.unchanged.has(section(l)));
-    if (uncovered.length) {
+    if (uncovered.length && !signal?.aborted) {
       // uncovered lines get one re-prompt
       const from = Math.max(1, uncovered[0]! - 3);
       const to = Math.min(parsed.lines.length, uncovered[uncovered.length - 1]! + 3);
@@ -696,7 +704,8 @@ export class Instructions {
     out.push("");
     if (plan.toDelete.length) {
       out.push("Files that will be deleted after ingest:");
-      for (const f of plan.toDelete) out.push(`  ${f.display}${f.tracked ? " (tracked: git history keeps it)" : " (untracked: backed up first)"}${f.shadowedBy ? ` — replaced by ${f.shadowedBy}, not sliced` : ""}`);
+      const how = (f: InstructionFile) => (!f.tracked ? " (untracked: backed up first)" : f.uncommitted ? " (uncommitted changes: backed up first)" : " (tracked: git history keeps it)");
+      for (const f of plan.toDelete) out.push(`  ${f.display}${how(f)}${f.shadowedBy ? ` — replaced by ${f.shadowedBy}, not sliced` : ""}`);
     } else out.push("No files will be deleted.");
     return out.join("\n");
   }
@@ -785,9 +794,14 @@ export class Instructions {
    */
   async ingest(opts: { paths?: string[]; include?: string[]; dryRun?: boolean; io: CommandIO; signal?: AbortSignal; assumeYes?: boolean }): Promise<IngestResult> {
     const plan = await this.plan({ paths: opts.paths, include: opts.include, io: opts.io, signal: opts.signal });
-    const result: IngestResult = { plan, stored: [], merged: [], conflicts: [], retired: [], deleted: [], backedUp: [], dryRun: opts.dryRun === true };
+    const result: IngestResult = { plan, stored: [], merged: [], conflicts: [], retired: [], deleted: [], changedMeanwhile: [], backedUp: [], dryRun: opts.dryRun === true };
     opts.io.print(this.preview(plan));
     if (opts.dryRun) return result;
+    // stopped while slicing (the session ended): a partial plan is never applied
+    if (opts.signal?.aborted) {
+      result.cancelled = true;
+      return result;
+    }
     if (!plan.files.some((p) => p.items.length || p.unchanged.size) && !plan.toDelete.length) return result;
     if (!opts.assumeYes) {
       const ok = await opts.io.confirm("Ingest instruction files", `Store ${plan.files.reduce((n, p) => n + p.items.length, 0)} item(s) and delete ${plan.toDelete.length} file(s)?`);
@@ -856,12 +870,27 @@ export class Instructions {
       g.syncIndex(scope);
     }
     this.s.paths.invalidate();
-    // delete: tracked files leave the working tree (git history keeps them); untracked ones are backed up first
-    if (plan.toDelete.length && this.s.cfg.instructions.deleteAfterIngest) {
+    // delete: files committed as they are leave the working tree (git history keeps them); any other is backed up first
+    // stopped while storing: the files stay, and the next ingest picks up where this one ended
+    if (plan.toDelete.length && this.s.cfg.instructions.deleteAfterIngest && !signal?.aborted) {
       const backupDir = this.s.layout ? join(this.s.layout.backupsDir, "instructions", nowIso.replace(/[:.]/g, "-")) : null;
+      const git = this.s.graph.project.git?.isRepo() ? this.s.graph.project.git : null;
       for (const f of plan.toDelete) {
         if (!existsSync(f.abs)) continue;
-        if (!f.tracked) {
+        // edited while it was sliced or confirmed: what changed was never sliced, so the file stays
+        const sliced = plan.files.find((p) => p.file === f)?.sha;
+        let now: string | null = null;
+        try {
+          now = sha256(readFileSync(f.abs, "utf8")).slice(0, 40);
+        } catch {
+          now = null;
+        }
+        if (!sliced || now !== sliced) {
+          result.changedMeanwhile.push(f.display);
+          continue;
+        }
+        // checked now, not at discovery: a commit or an edit since then changes the answer
+        if (!(f.tracked && git?.committedAsIs(f.display))) {
           if (!backupDir) continue; // nowhere to back up: keep the file
           const dest = join(backupDir, f.display.replace(/^~\//, "home/").replace(/^\//, "abs/"));
           ensureDir(dirname(dest));
@@ -909,7 +938,7 @@ export class Instructions {
       plans.push(await this.planFile(f, signal));
     }
     await this.judge(plans, signal);
-    const result: IngestResult = { plan: { files: plans, toDelete: [], kept: changed, problems: [] }, stored: [], merged: [], conflicts: [], retired: [], deleted: [], backedUp: [], dryRun: false };
+    const result: IngestResult = { plan: { files: plans, toDelete: [], kept: changed, problems: [] }, stored: [], merged: [], conflicts: [], retired: [], deleted: [], changedMeanwhile: [], backedUp: [], dryRun: false };
     await this.apply(result.plan, result, signal);
     return plans.length;
   }
@@ -974,10 +1003,10 @@ export class Instructions {
       plans.push(await this.planFile({ abs, display: `auto-memory/${basename(abs)}`, type: "auto-memory", scope: this.s.graph.has("personal") ? "personal" : "global", dir: null, tracked: false }, signal));
     }
     const complete = plans.every((p) => p.uncovered.length === 0 && !p.problems.length);
-    const result: IngestResult = { plan: { files: plans, toDelete: [], kept: [], problems: [] }, stored: [], merged: [], conflicts: [], retired: [], deleted: [], backedUp: [], dryRun: false };
+    const result: IngestResult = { plan: { files: plans, toDelete: [], kept: [], problems: [] }, stored: [], merged: [], conflicts: [], retired: [], deleted: [], changedMeanwhile: [], backedUp: [], dryRun: false };
     await this.apply(result.plan, result, signal);
     let backupDir: string | undefined;
-    if (complete && this.s.layout) {
+    if (complete && this.s.layout && !signal?.aborted) {
       const project = basename(dirname(dir));
       backupDir = join(this.s.layout.backupsDir, "auto-memory", project, this.s.clock().toISOString().replace(/[:.]/g, "-"));
       ensureDir(backupDir);

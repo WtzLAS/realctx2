@@ -62,7 +62,7 @@ export interface Config {
       defaultTools: AuxTools;
       /**
        * How long an aux-emulated decision may take (§9.1.4). An LLM rarely answers within a short
-       * call-site timeout (1.5 s for the proactive gate), so this is a floor: the gate gets 20 s,
+       * call-site timeout (1.5 s for the proactive gate), so this is a floor: the gate gets 40 s,
        * while Janus keeps its longer `janus.timeoutMs`. A commit point waits for an emulated
        * answer at most `janus.lateWaitMs`; one that misses it applies at the next commit point.
        * 0 keeps the call site's timeout.
@@ -187,6 +187,7 @@ export interface Config {
   shared: { review: boolean; ignoreActors: string[]; compactOn: "any" | "default-branch" | "manual"; defaultBranch: string | null; counterFlushThreshold: number };
   tools: { names: Record<string, string>; remember: boolean; forget: boolean };
   forget: { queryMargin: number };
+  /** Daily token caps (§9.5). 0 means no limit. */
   budgets: { dailyAuxTokens: number; dailyDecisionTokens: number };
   privacy: { indexSessions: "new-only" | "off"; telemetryContent: boolean };
   maintenance: { idleMinutes: number };
@@ -199,7 +200,7 @@ export const DEFAULT_CONFIG: Config = {
     aux: {
       maxConcurrent: 2,
       defaultTools: "read-only",
-      emulateTimeoutMs: 20_000,
+      emulateTimeoutMs: 40_000,
       guard: {
         deny: [
           "rm -r*",

@@ -8,7 +8,7 @@
 import { spawn } from "node:child_process";
 import { insideAux, Limiter, pruneToSchema, renderAuxPrompt, roleSettings, type RoleSettings, validateSchema } from "../../core/aux.ts";
 import type { Config } from "../../core/config.ts";
-import type { Telemetry } from "../../core/telemetry.ts";
+import { budgetReached, type Telemetry } from "../../core/telemetry.ts";
 import type { AuxResult, AuxSessionRunner, AuxTask, ThinkingLevel } from "../../core/types.ts";
 import type { MemoryRuntime } from "../../memory/runtime.ts";
 import { errMsg } from "../../util/errors.ts";
@@ -160,7 +160,7 @@ export class ClaudeAuxRunner implements AuxSessionRunner {
     if (!this.available()) return { ...empty, error: "the claude CLI is not available" };
     const settings = roleSettings(this.cfg, "claudeCode", task as AuxTask);
     const budgetKind = task.role === "reverify" && !this.cfg.reverify.countsTowardBudget ? "reverify" : "aux";
-    if (budgetKind === "aux" && this.telemetry && this.telemetry.spentToday().aux >= this.cfg.budgets.dailyAuxTokens) {
+    if (budgetKind === "aux" && this.telemetry && budgetReached(this.telemetry.spentToday().aux, this.cfg.budgets.dailyAuxTokens)) {
       this.telemetry.call({ callSite: task.role, kind: "aux", latencyMs: 0, outcome: "skipped", detail: "daily budget", budget: "none" });
       return { ...empty, error: "daily aux budget exhausted" };
     }

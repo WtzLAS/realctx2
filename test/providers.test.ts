@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { budgetReached, Telemetry } from "../src/core/telemetry.ts";
 import type { AuxResult, AuxSessionRunner, AuxTask, DecisionQuestion } from "../src/core/types.ts";
 import { buildDecisionsRequest, buildSystemOneRequest, CircuitBreaker, EmulatedDecisionClient, type FetchLike, HttpDecisionClient, parseDecisionsResponse, parseSystemOneResponse, ResilientDecisionClient } from "../src/providers/decision.ts";
 import { DenseEmbeddingClient, MultiVectorEmbeddingClient } from "../src/providers/embedding.ts";
@@ -89,6 +90,23 @@ describe("HttpDecisionClient", () => {
     expect(calls.length).toBe(2);
     expect(calls[0]!.headers.authorization).toBe("Bearer k");
     expect(Object.keys(ans).sort()).toEqual(["effect", "focus", "redirect"]);
+  });
+  it("stops at the daily budget, and a budget of 0 means no limit", async () => {
+    const ok = () => fakeFetch(() => ({ json: { answers: { redirect: { type: "noul", noul: 1 } } } }));
+    const telemetry = new Telemetry(null);
+    telemetry.spend("decision", 600);
+    const capped = ok();
+    const c = new HttpDecisionClient(cfg, { fetch: capped.fetch, telemetry, dailyTokenBudget: 500 });
+    await expect(c.decide("e", [QUESTIONS[0]!], { callSite: "t", timeoutMs: 1000 })).rejects.toThrow(/daily decision budget exhausted/);
+    expect(capped.calls.length).toBe(0);
+    expect(telemetry.recent.at(-1)).toMatchObject({ outcome: "skipped", detail: "daily budget" });
+    for (const dailyTokenBudget of [0, undefined]) {
+      const free = ok();
+      const c2 = new HttpDecisionClient(cfg, { fetch: free.fetch, telemetry, dailyTokenBudget });
+      expect((await c2.decide("e", [QUESTIONS[0]!], { callSite: "t", timeoutMs: 1000 })).redirect!.p).toBe(1);
+      expect(free.calls.length).toBe(1);
+    }
+    expect([budgetReached(10, 0), budgetReached(10, 10), budgetReached(9, 10)]).toEqual([false, true, false]);
   });
   it("retries once on 5xx, never when noRetry, and times out", async () => {
     let n = 0;

@@ -61,7 +61,8 @@ export async function status(host: Host, io: CommandIO): Promise<void> {
   lines.push(`Embeddings: ${emb.length ? emb.join(" · ") : "not configured (BM25 only)"}${host.memory ? ` · search mode ${host.memory.sim.searchMode()}` : ""}`);
   lines.push(`Aux model: ${h.aux.available ? "available" : "unavailable"}`);
   const spent = host.telemetry.spentToday();
-  lines.push(`Today's spend: aux ${num(spent.aux)} / ${num(host.cfg.budgets.dailyAuxTokens)} tokens · decision ${num(spent.decision)} / ${num(host.cfg.budgets.dailyDecisionTokens)} tokens${spent.reverify ? ` · re-verification ${num(spent.reverify)}` : ""}`);
+  const cap = (n: number) => (n > 0 ? num(n) : "unlimited");
+  lines.push(`Today's spend: aux ${num(spent.aux)} / ${cap(host.cfg.budgets.dailyAuxTokens)} tokens · decision ${num(spent.decision)} / ${cap(host.cfg.budgets.dailyDecisionTokens)} tokens${spent.reverify ? ` · re-verification ${num(spent.reverify)}` : ""}`);
 
   const mem = host.memory;
   if (mem) {

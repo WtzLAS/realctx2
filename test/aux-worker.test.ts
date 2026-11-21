@@ -80,7 +80,13 @@ describe("aux session plumbing (§9.3)", () => {
     const t = (role: AuxTask["role"], over: Partial<AuxTask> = {}): AuxTask => ({ role, instructions: "", data: [], schema: {}, ...over });
     expect(roleSettings(cfg, "pi", t("precip"))).toEqual({ tools: "none", thinking: "medium", maxTurns: 1, timeoutMs: 1000, model: "anthropic/claude-sonnet" });
     expect(roleSettings(cfg, "pi", t("janus.scribe"))).toMatchObject({ tools: "none", thinking: "off", model: "anthropic/claude-haiku" });
-    expect(roleSettings(cfg, "pi", t("reverify"))).toMatchObject({ tools: "read-only+bash", thinking: "high", maxTurns: 3, timeoutMs: 180_000 });
+    expect(roleSettings(cfg, "pi", t("reverify"))).toMatchObject({ tools: "read-only+bash", thinking: "high", maxTurns: 3, timeoutMs: 360_000 });
+    // default timeouts: twice the old ones, never under 30 s
+    expect(Object.fromEntries(Object.entries(ROLE_DEFAULTS).map(([r, s]) => [r, s.timeoutMs / 1000]))).toEqual({
+      "janus.scribe": 30, precip: 120, palim: 120, "qemem.planner": 30, "qemem.constructor": 240, "write.merge": 60,
+      "evo.operator": 240, "ingest.slicer": 600, reverify: 360, "review.resolve": 240, "decision.emulate": 30,
+    });
+    expect(roleSettings(cfg, "pi", t("janus.scribe")).timeoutMs).toBe(30_000);
     expect(roleSettings(cfg, "pi", t("reverify", { tools: "none" })).tools).toBe("none");
     expect(roleSettings(cfg, "pi", t("palim", { budget: { timeoutMs: 30_000, thinking: "low" } }))).toMatchObject({ thinking: "low", timeoutMs: 30_000 });
     expect(roleSettings(cfg, "claudeCode", t("evo.operator"))).toMatchObject({ tools: "read-only", maxTurns: 6 });
@@ -332,6 +338,11 @@ describe("aux sessions in pi (§9.3.3)", () => {
     expect(spend.seen.length).toBe(0);
     expect(spend.telemetry.recent.at(-1)).toMatchObject({ outcome: "skipped", detail: "daily budget" });
     expect((await spend.r.run({ role: "reverify", instructions: "c", data: [], schema })).output).toEqual({ verdict: "holds" });
+    // a budget of 0 means no daily limit
+    const unlimited = runner([() => say('{"verdict":"holds"}')], { cfg: { ...cfg, budgets: { dailyAuxTokens: 0 } } });
+    unlimited.telemetry.spend("aux", 50_000_000);
+    expect((await unlimited.r.run({ role: "write.merge", instructions: "c", data: [], schema })).output).toEqual({ verdict: "holds" });
+    expect(unlimited.seen.length).toBe(1);
   });
 
   it("clamps the thinking level to what the model supports", async () => {

@@ -34,6 +34,8 @@ interface Sub {
   help: string;
   /** Flags that take a value. */
   valued?: string[];
+  /** Waits on the models for minutes: Claude Code runs it beside its hook queue, so hooks are not held up (§4.6.1). */
+  long?: boolean;
   run(host: Host, io: CommandIO, rest: string): Promise<void> | void;
 }
 
@@ -51,20 +53,26 @@ export const SUBCOMMANDS: Record<string, Sub> = {
   pin: { usage: "pin <target>", help: "Protect a memory from automatic forgetting", run: (h, io, r) => memory.pin(h, io, parseArgs(r), true) },
   unpin: { usage: "unpin <target>", help: "Remove that protection", run: (h, io, r) => memory.pin(h, io, parseArgs(r), false) },
   share: { usage: "share [--commit]", help: "Flush pending shared changes now, and optionally commit .pi/realctx2/ only", run: (h, io, r) => store.share(h, io, parseArgs(r)) },
-  maintain: { usage: "maintain [scope]", help: "Run a maintenance pass now", run: (h, io, r) => store.maintain(h, io, parseArgs(r)) },
+  maintain: { usage: "maintain [scope]", help: "Run a maintenance pass now", long: true, run: (h, io, r) => store.maintain(h, io, parseArgs(r)) },
   policy: { usage: "policy", help: "EvoDisco phase, recent U and E, agreement with the teacher, operator mix", run: (h, io) => status.policy(h, io) },
   doctor: { usage: "doctor", help: "Check providers, calibration, tool names, stores, instruction files, indexes and secrets", run: (h, io) => status.doctor(h, io) },
   export: { usage: "export [scope] <dir> | export agents [--dir <dir>]", help: "Write a readable markdown mirror, or regenerate AGENTS.md files from rules", valued: ["dir"], run: (h, io, r) => memory.exportCmd(h, io, parseArgs(r, ["dir"])) },
-  ingest: { usage: "ingest [paths…] [--all] [--include local,rules,global] [--dry-run]", help: "Slice AGENTS.md / CLAUDE.md / rules files into path-anchored memories, then delete the files", valued: ["include"], run: (h, io, r) => memory.ingest(h, io, parseArgs(r, ["include"])) },
+  ingest: { usage: "ingest [paths…] [--all] [--include local,rules,global] [--dry-run]", help: "Slice AGENTS.md / CLAUDE.md / rules files into path-anchored memories, then delete the files", valued: ["include"], long: true, run: (h, io, r) => memory.ingest(h, io, parseArgs(r, ["include"])) },
   rules: { usage: "rules [path] | rules edit <id>", help: "List the rules in force at a path; edit one rule", run: (h, io, r) => memory.rules(h, io, parseArgs(r)) },
   restore: { usage: "restore <id>", help: "Restore a retired memory, or a purged one until the session-end flush", run: (h, io, r) => memory.restore(h, io, parseArgs(r)) },
   paths: { usage: "paths [sync | show <path> | stale]", help: "Reconcile tracked paths; show a path's memories; list stale anchors", run: (h, io, r) => memory.paths(h, io, parseArgs(r)) },
   compact: { usage: "compact [scope]", help: "Compact a store now", run: (h, io, r) => store.compact(h, io, parseArgs(r)) },
-  calibrate: { usage: "calibrate [model]", help: "Recalibrate similarity thresholds for an embedding model", run: (h, io, r) => memory.calibrate(h, io, parseArgs(r)) },
-  reverify: { usage: "reverify [id | --all]", help: "Re-verify memories against the code now", run: (h, io, r) => memory.reverify(h, io, parseArgs(r)) },
+  calibrate: { usage: "calibrate [model]", help: "Recalibrate similarity thresholds for an embedding model", long: true, run: (h, io, r) => memory.calibrate(h, io, parseArgs(r)) },
+  reverify: { usage: "reverify [id | --all]", help: "Re-verify memories against the code now", long: true, run: (h, io, r) => memory.reverify(h, io, parseArgs(r)) },
   uninstall: { usage: "uninstall", help: "Restore the Claude Code settings realctx2 changed", run: (h, io) => store.uninstall(h, io) },
   git: { usage: "git install-hooks | git lfs | git fix-gitignore", help: "Install optional git hooks; move shared files to Git LFS; un-ignore .pi/realctx2/ in .gitignore", run: (h, io, r) => store.git(h, io, parseArgs(r)) },
 };
+
+/** The subcommand a command line names, when it is one of the long ones (ingest, maintain, reverify, calibrate). */
+export function longCommand(line: string): string | null {
+  const name = line.trim().split(/\s+/)[0] ?? "";
+  return Object.hasOwn(SUBCOMMANDS, name) && SUBCOMMANDS[name]!.long ? name : null;
+}
 
 export function helpText(prefix = "/realctx2 "): string {
   const rows = Object.values(SUBCOMMANDS).map((s) => `  ${prefix}${s.usage}\n      ${s.help}`);

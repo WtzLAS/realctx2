@@ -63,7 +63,7 @@ export async function maintain(host: Host, io: CommandIO, p: Parsed): Promise<vo
   for (const h of free.hygiene) lines.push(`${h.scope}: folded ${h.folded} strength log(s), promoted ${h.promoted.length}, demoted ${h.demoted.length}${h.forgettingRan ? `, forgetting pass: ${h.dormant.length} dormant, ${h.archived.length} archived (threshold ${h.threshold.toFixed(2)})` : ""}${h.lowValue.length ? `, ${h.lowValue.length} low-value` : ""}.`);
   if (free.compacted.length) lines.push(`Compacted: ${free.compacted.join(", ")}.`);
   // model-dependent part: harvest, re-verification, fusion and strategy attempts
-  const res = await host.maintain({ force: true, scopes });
+  const res = await host.maintain({ force: true, scopes, signal: io.signal });
   if (res.harvested) lines.push(`Harvested ${res.harvested} knowledge item(s) from consolidated work.`);
   const idle = res.idle;
   if (idle) {

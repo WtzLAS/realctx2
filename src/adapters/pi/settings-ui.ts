@@ -1320,11 +1320,12 @@ export class Realctx2SettingsComponent implements Component, Focusable {
     const isSecret = entry.kind === "secret";
     const input = new Input({ prompt: "> ", placeholder: entry.placeholder ?? "" });
     // For secrets, prefill empty so existing secret is not exposed in clear text unless re-typed
-    this.prefillInput(input, isSecret ? "" : rawInputValue(entry, cur));
+    this.prefillInput(input, isSecret ? "" : rawInputValue(cur));
 
     const bounds: string[] = [];
     if (entry.min !== undefined) bounds.push(`min ${entry.min}`);
     if (entry.max !== undefined) bounds.push(`max ${entry.max}`);
+    if (entry.zeroLabel && (entry.kind === "integer" || entry.kind === "number")) bounds.push(entry.zeroLabel);
     if (entry.unit) bounds.push(`unit: ${entry.unit}`);
     if (isSecret && typeof cur === "string" && cur.trim()) bounds.push(`current: ${maskSecret(cur)}`);
     if (entry.kind === "nullable-number") bounds.push("blank = default/null");

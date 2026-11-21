@@ -5,7 +5,11 @@
  * already aborted); `ms = Infinity` waits for `p` or the abort only.
  */
 export async function raceTimeout<T>(p: Promise<T>, ms: number, signal?: AbortSignal): Promise<T | undefined> {
-  if (signal?.aborted) return undefined;
+  if (signal?.aborted) {
+    // nobody waits for `p` any more: a later rejection must not surface as unhandled
+    p.catch(() => undefined);
+    return undefined;
+  }
   let timer: ReturnType<typeof setTimeout> | undefined;
   let onAbort: (() => void) | undefined;
   try {

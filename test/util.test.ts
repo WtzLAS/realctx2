@@ -353,6 +353,22 @@ describe("async and error helpers", () => {
     }
   });
 
+  it("raceTimeout on an aborted signal stops waiting without leaving a later rejection unhandled", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => void unhandled.push(e);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      let reject!: (e: Error) => void;
+      const p = new Promise<number>((_, rej) => (reject = rej));
+      await expect(raceTimeout(p, Infinity, AbortSignal.abort())).resolves.toBeUndefined();
+      reject(new Error("late"));
+      await new Promise((r) => setTimeout(r, 10));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
   it("errMsg reads errors, message-bearing objects and bare thrown values", () => {
     expect(errMsg(new Error("x"))).toBe("x");
     expect(errMsg({ message: "m" })).toBe("m");

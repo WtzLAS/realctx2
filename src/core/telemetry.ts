@@ -16,6 +16,11 @@ export interface CallRecord {
   budget?: "aux" | "decision" | "reverify" | "none";
 }
 
+/** True when a daily cap is set and today's spend has reached it. A cap of 0 (or less) means no limit. */
+export function budgetReached(spent: number, cap: number): boolean {
+  return cap > 0 && spent >= cap;
+}
+
 function day(d = new Date()): string {
   return d.toISOString().slice(0, 10);
 }

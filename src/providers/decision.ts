@@ -4,7 +4,7 @@
  */
 import type { DecisionProviderConfig } from "../core/config.ts";
 import { buildAuthHeaders } from "../core/config.ts";
-import type { Telemetry } from "../core/telemetry.ts";
+import { budgetReached, type Telemetry } from "../core/telemetry.ts";
 import type { AuxSessionRunner, DecideOptions, DecisionAnswer, DecisionClient, DecisionQuestion } from "../core/types.ts";
 import { sleep } from "../util/async.ts";
 import { errMsg } from "../util/errors.ts";
@@ -284,6 +284,7 @@ export function parseDecisionsResponse(body: unknown, questions: DecisionQuestio
 export interface HttpDecisionOptions {
   fetch?: FetchLike;
   telemetry?: Telemetry;
+  /** Daily input-token cap; 0 or unset means no limit. */
   dailyTokenBudget?: number;
   now?: () => number;
 }
@@ -312,7 +313,7 @@ export class HttpDecisionClient implements DecisionClient {
     this.config = config;
     this.fetchImpl = opts.fetch ?? (globalThis.fetch as unknown as FetchLike);
     this.telemetry = opts.telemetry;
-    this.budget = opts.dailyTokenBudget ?? Infinity;
+    this.budget = opts.dailyTokenBudget ?? 0;
     this.breaker = new CircuitBreaker(5, 60_000, opts.now);
   }
 
@@ -331,7 +332,7 @@ export class HttpDecisionClient implements DecisionClient {
   async decide(evidence: string | object, questions: DecisionQuestion[], opts: DecideOptions): Promise<Record<string, DecisionAnswer>> {
     if (questions.length === 0) return {};
     if (this.breaker.isOpen()) throw new DecisionUnavailable("circuit breaker open");
-    if (this.telemetry && this.telemetry.spentToday().decision >= this.budget) {
+    if (this.telemetry && budgetReached(this.telemetry.spentToday().decision, this.budget)) {
       this.telemetry.call({ callSite: opts.callSite, kind: "decision", latencyMs: 0, outcome: "skipped", detail: "daily budget" });
       throw new DecisionUnavailable("daily decision budget exhausted");
     }

@@ -122,6 +122,15 @@ export class Git {
     return this.git(["ls-files", "--error-unmatch", "--", path]).code === 0;
   }
 
+  /**
+   * Whether HEAD holds a tracked file exactly as it is in the working tree (staged changes count as
+   * changes), so removing it loses nothing git cannot restore. False outside git, before the first
+   * commit, and for untracked files.
+   */
+  committedAsIs(path: string): boolean {
+    return this.isTracked(path) && this.git(["diff", "--quiet", "HEAD", "--", path]).code === 0;
+  }
+
   isIgnored(path: string): boolean {
     return this.git(["check-ignore", "-q", "--", path]).code === 0;
   }

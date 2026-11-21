@@ -198,7 +198,9 @@ async function main() {
       process.stdout.write("realctx2 is not running in this session (its MCP server was not found).\n");
       return;
     }
-    const res = await ask(reg.socket, { kind: "command", line, session }, budget || TIMEOUT_MS.command);
+    // the server answers a long command (ingest, maintain, …) before this wait ends, and shows its result later
+    const waitMs = budget || TIMEOUT_MS.command;
+    const res = await ask(reg.socket, { kind: "command", line, session, waitMs }, waitMs);
     process.stdout.write((res && typeof res.text === "string" ? res.text : "realctx2 did not answer in time.") + "\n");
     return;
   }

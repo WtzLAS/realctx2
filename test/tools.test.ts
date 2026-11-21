@@ -847,6 +847,21 @@ describe("review: the aux model settles a flagged memory", () => {
     await r.host.shutdown({ spawnWorker: false });
   });
 
+  it("review approve <id> settles every item of a memory, also when the first one settles the rest", async () => {
+    const r = await rig();
+    const mem = r.host.memory!;
+    const id = idOf(await r.run('remember "Callers must await TokenCache.warmup at startup." --kind rule --scope personal --path src/auth/tokenCache.ts'));
+    // re-verification found the rule obsolete, and its path is gone too
+    mem.graph.sd("personal").patchNode(id, { flags: ["review", "stale-rule"] });
+    mem.graph.commit("personal");
+    mem.review.add({ at: new Date(r.now.t).toISOString(), scope: "personal", id, kind: "rule-obsolete" });
+    expect(new ReviewSession(r.host, mem).keysFor(id)).toEqual([`q:${id}`, `f:${id}`]);
+    expect(await r.run(`review approve ${id}`)).toBe(`Approved [m:${id}]: retired as obsolete.`);
+    expect(mem.graph.get(id, { includePurged: true })!.node.status).toBe("archived");
+    expect(await r.run("review")).toBe("Nothing to review.");
+    await r.host.shutdown({ spawnWorker: false });
+  });
+
   it("refuses suggestions it cannot carry out, and plans for a memory that changed meanwhile", async () => {
     const r = await rig();
     const mem = r.host.memory!;

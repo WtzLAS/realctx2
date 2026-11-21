@@ -20,6 +20,9 @@ Owner: laserrks · Harnesses (v1): [pi](https://docs.pi.dev/latest/extensions) (
 - **Janus waits longer by default.** `janus.timeoutMs` is 30 s (was 1.5 s) and `janus.lateWaitMs` 10 s (was 200 ms), so a slow answer is more often used at the commit point it was asked for instead of the next one (§5.2.1, §5.2.7, §5.7, §9.1.5, §9.4).
 - **A user message has one budget.** pi shows no Working row before the first turn starts, so the prompt left the editor and nothing moved while the decision, the scribe and the proactive gate ran one after another (about 18 s with emulated decisions). They now share one budget, `janus.timeoutMs` with a decision model and `janus.lateWaitMs` without; a scribe that misses it opens its intent at the next commit point, and the intent still governs the rounds since its user message. `turn_end` has one deadline as well, `janus.lateWaitMs`, for the late intent, Janus's answer, the scribe and the cards together. realctx2 shows pi's Working row while the hook waits (§4.2, §5.2.1).
 - **Decisions-compatible servers without every option.** A server that answers 400 or 422 naming `prompt_cache_key` or `input_json` gets the request again without it, and later requests leave it out: the cache key is dropped, and JSON evidence is sent as text. Before, every request failed and all decisions fell back to emulation (§9.1).
+- **Aux calls get more time.** Default role timeouts are twice what they were and at least 30 s (`janus.scribe` and `qemem.planner` 30 s, Precip and Palim 120 s, `write.merge` 60 s, the tool-using roles 240–600 s), and `emulateTimeoutMs` is 40 s (was 20 s): harness models often spent most of the old limits before answering (§9.3.4, §9.4).
+- **Daily budgets can be off.** `budgets.dailyAuxTokens` or `budgets.dailyDecisionTokens` set to 0 means no daily limit for that model (§6.6.8, §9.4).
+- **Long commands don't hold up Claude Code's hooks.** `ingest`, `maintain`, `reverify` and `calibrate` run beside the server's hook queue, so hooks and tools answer while they wait on the models; the result of one that outlasts the hook client's wait arrives as a notice (§4.6.1).
 - **Remembered memories start short-term.** An unpinned `remember` goes to SML and earns LML by the usual rules; in LML the first hygiene pass demoted it (§6.3).
 - **Read-only sessions keep the shared store clean.** Path reconciliation writes nothing for unchanged paths, and keeps the checkout's last reconciled commit in the local index (§6.8.2–6.8.3); the shared journal records whether it holds counter-only changes, so the worker doesn't flush them (§7.5).
 - **pi details.** Tools register in `session_start` and are re-checked at the first `before_agent_start` (§4.1, §8.1.3); records decided in `before_agent_start` travel in the guidance message's `details` (§4.2, §5.1); the compaction record is written in `session_compact` (§4.2, §5.4.5); summaries and `!` runs can't be edited (§4.3). `aux.pi.extensions` is dropped.
@@ -467,6 +470,10 @@ pi is realctx2's primary harness. Claude Code is supported **best-effort** (deci
 - Claude Code tests are smoke tests (§12.1), not parity tests.
 - **Trust.** Claude Code asks the user to trust a folder before it runs there, so the project is treated as trusted (shared store and project config load) unless `REALCTX2_UNTRUSTED=1`.
 - **Commands have no dialogs.** Skills run commands without a UI: confirmations take `--yes` (for example `/realctx2:ingest --yes`), and `rules edit` prints the rule's form instead of opening an editor; editing needs pi.
+- **Long commands run beside the hooks.** The server handles hooks, tool calls and commands one at a time. `ingest`, `maintain`, `reverify` and `calibrate` wait on the models for minutes, so they run beside that queue instead:
+  - Hooks, tool calls and short commands keep answering while one runs. Only one long command runs at a time; a second one is turned away with a note, not queued.
+  - The hook client waits up to 110 s for a command and sends that wait with the request. Shortly before it ends, the server answers that the command is still running, and its result follows as a notice (`systemMessage`) with the next hook.
+  - When the session ends (`/clear`, `/resume`, exit), a running long command is stopped before the stores close. An ingest stopped while slicing stores nothing; one stopped while storing deletes no file.
 
 #### 4.6.1 Packaging
 
@@ -1607,7 +1614,7 @@ Model calls must use the harness's own model access and login (decided). So main
 - **Leftover work.** Model-dependent work still pending at session end is written to `~/.pi/agent/realctx2/queue/`, and the next session in either harness picks it up during idle time.
 - **Locking:** one lock file per scope in `~/.pi/agent/realctx2/locks/`, never inside the repo.
 - **Per pass and scope:** hygiene, then A = 8 strategy attempts (ours).
-- **Daily budgets:** caps on aux and decision tokens (§9.5). When a budget runs out, the pass ends cleanly. Re-verification has no cap and doesn't count toward the aux budget by default (§6.8.6).
+- **Daily budgets:** caps on aux and decision tokens (§9.5); 0 turns a cap off. When a budget runs out, the pass ends cleanly. Re-verification has no cap and doesn't count toward the aux budget by default (§6.8.6).
 - **Shared scope:**
   - at most one strategy pass per day per machine;
   - all output is held until the next shared flush (§7.5);
@@ -1903,8 +1910,9 @@ Imported lines keep the imported file as their source. **Imported files are neve
 
    `--dry-run` writes this report and changes nothing.
 7. **Delete and ignore.**
-   - **Files git tracks** are deleted from the working tree. The deletions show in `git status` next to the new update files, so both land in the same commit. Git history keeps the old content.
-   - **Files git doesn't track** (`CLAUDE.local.md`, files under the home directory) are first copied to `~/.pi/agent/realctx2/backups/instructions/<time>/`, then deleted.
+   - **Files committed as they are** (HEAD matches the working tree) are deleted from the working tree. The deletions show in `git status` next to the new update files, so both land in the same commit. Git history keeps the old content.
+   - **Every other file** is first copied to `~/.pi/agent/realctx2/backups/instructions/<time>/`, then deleted: files git doesn't track (`CLAUDE.local.md`, files under the home directory), and tracked files with uncommitted or staged changes, whose current content git history doesn't hold. This is checked at deletion time, and the preview labels each file accordingly.
+   - **A file that changed on disk after it was sliced** (edited during slicing or before the confirmation) is kept: its new content was never sliced. The report lists it, and the next ingest picks up the changed sections.
    - realctx2 then ignores instruction files for this project (§6.9.5).
 
 #### 6.9.3 Editing rules after ingest
@@ -2428,7 +2436,7 @@ realctx2 talks to decision models over custom HTTP adapters in both harnesses, s
   - shared routing 0.95;
   - proactive gate 0.7;
   - attribution uses deterministic signals only.
-- **Emulated answers are slow.** An LLM call takes seconds where a decision model takes milliseconds, so a short call-site timeout (1.5 s for the proactive gate) would almost always expire. An emulated decision gets at least `providers.aux.emulateTimeoutMs` (default 20,000; 0 keeps the call site's timeout): the gate gets 20 s, and Janus keeps its own 30 s. A commit point waits for an emulated answer at most `janus.lateWaitMs` (default 10 s): Janus's answer and the proactive gate's cards that miss it apply at the next commit point (§5.2.1, §6.4.1).
+- **Emulated answers are slow.** An LLM call takes seconds where a decision model takes milliseconds, so a short call-site timeout (1.5 s for the proactive gate) would almost always expire. An emulated decision gets at least `providers.aux.emulateTimeoutMs` (default 40,000; 0 keeps the call site's timeout): the gate gets 40 s, and Janus keeps its own 30 s. A commit point waits for an emulated answer at most `janus.lateWaitMs` (default 10 s): Janus's answer and the proactive gate's cards that miss it apply at the next commit point (§5.2.1, §6.4.1).
 - **Thinking is off** for `decision.emulate` (§9.3.4). With a small model, thinking `low` took 5–10 s per answer, and thinking off 1.5–2.3 s.
 
 #### 9.1.5 Reliability
@@ -2580,20 +2588,20 @@ Each role has its own thinking level, using pi's levels: `off`, `minimal`, `low`
 
 | Role | Frequency | Tools | Output | Suggested tier | Thinking | Turns | Timeout |
 |---|---|---|---|---|---|---|---|
-| `janus.scribe` | Per kindle | none | Intent JSON | Small, fast | off | 1 | 15 s |
-| `precip` | Per closed intent | none | Prose + sidecar JSON | Strong | medium | 1 | 60 s |
-| `palim` | Per fold or harvest | none | `ripple` JSON | Strong | medium (low under pressure) | 1 | 60 s (30 s under pressure) |
-| `qemem.planner` | Thorough search | none | Plan JSON | Small | low | 1 | 15 s |
-| `qemem.constructor` | Thorough search | read-only | ViewCards + feedback | Strong | medium | 6 | 120 s |
-| `write.merge` | Subsumption, fusion | none | Merged node | Small | low | 1 | 30 s |
-| `evo.operator` | Abstract / Refine / Bridge | read-only | Nodes or relation | Medium | medium | 6 | 120 s |
-| `ingest.slicer` | Per instruction file or group of sections | read-only | Items JSON with quotes, anchors, severity and triggers | Strong | high | 12 | 300 s |
-| `reverify` | Per changed file whose memories need more than the model-free check (§6.8.6) | read-only | Verdict JSON per memory | Medium | medium | 10 | 180 s |
-| `review.resolve` | When the user asks it about a conflict or a flagged memory on the review screen (§10) | read-only | Decision JSON: for a conflict, retire or rewrite either memory, or merge them, with the new text; for a flagged memory, keep, retire or rewrite it (new text and/or paths) | Medium | medium | 6 | 120 s |
-| `decision.emulate` | Only without a decision model (§9.1.4) | none | Probabilities JSON | Small | off | 1 | The call site's timeout, at least `emulateTimeoutMs` (20 s) |
+| `janus.scribe` | Per kindle | none | Intent JSON | Small, fast | off | 1 | 30 s |
+| `precip` | Per closed intent | none | Prose + sidecar JSON | Strong | medium | 1 | 120 s |
+| `palim` | Per fold or harvest | none | `ripple` JSON | Strong | medium (low under pressure) | 1 | 120 s (30 s under pressure) |
+| `qemem.planner` | Thorough search | none | Plan JSON | Small | low | 1 | 30 s |
+| `qemem.constructor` | Thorough search | read-only | ViewCards + feedback | Strong | medium | 6 | 240 s |
+| `write.merge` | Subsumption, fusion | none | Merged node | Small | low | 1 | 60 s |
+| `evo.operator` | Abstract / Refine / Bridge | read-only | Nodes or relation | Medium | medium | 6 | 240 s |
+| `ingest.slicer` | Per instruction file or group of sections | read-only | Items JSON with quotes, anchors, severity and triggers | Strong | high | 12 | 600 s |
+| `reverify` | Per changed file whose memories need more than the model-free check (§6.8.6) | read-only | Verdict JSON per memory | Medium | medium | 10 | 360 s |
+| `review.resolve` | When the user asks it about a conflict or a flagged memory on the review screen (§10) | read-only | Decision JSON: for a conflict, retire or rewrite either memory, or merge them, with the new text; for a flagged memory, keep, retire or rewrite it (new text and/or paths) | Medium | medium | 6 | 240 s |
+| `decision.emulate` | Only without a decision model (§9.1.4) | none | Probabilities JSON | Small | off | 1 | The call site's timeout, at least `emulateTimeoutMs` (40 s) |
 
 - Every value is adjustable per role and per harness (`providers.aux.<harness>.roles.<role>`, §9.4).
-- `janus.scribe` and Palim under pressure hold up the next model request, so their limits are tight.
+- No default timeout is below 30 s. Palim under pressure holds up the next model request, so its limit is tight; a user message waits for the scribe only within its shared budget (§5.2.1).
 
 ### 9.4 Configuration
 
@@ -2615,7 +2623,7 @@ The global configuration lives in `~/.pi/agent/realctx2/config.json`. Model ids 
     "aux": {
       "maxConcurrent": 2,
       "defaultTools": "read-only",
-      "emulateTimeoutMs": 20000,
+      "emulateTimeoutMs": 40000,
       "guard": {
         "deny": ["rm -r*", "rm -fr*", "git reset --hard*", "git clean*", "git push*", "npm publish*",
                  "*curl * | *sh*", "*wget * | *sh*", "scp *", "rsync * *:*", "curl * -T *", "curl * --upload-file *"],
@@ -2624,7 +2632,7 @@ The global configuration lives in `~/.pi/agent/realctx2/config.json`. Model ids 
       "pi": {
         "model": "<provider>/<model-id>", "thinking": "medium",
         "roles": {
-          "janus.scribe":  { "thinking": "off", "maxTurns": 1, "timeoutMs": 15000 },
+          "janus.scribe":  { "thinking": "off", "maxTurns": 1, "timeoutMs": 30000 },
           "precip":        { "model": "<provider>/<model-id>", "tools": "none", "maxTurns": 1 },
           "ingest.slicer": { "model": "<provider>/<model-id>", "thinking": "high", "tools": "read-only", "maxTurns": 12 }
         }
@@ -2698,6 +2706,7 @@ The global configuration lives in `~/.pi/agent/realctx2/config.json`. Model ids 
 - **Model ids are examples.** The late-interaction prefixes shown are the usual ones for PyLate-trained ColBERT models; check the model card (companion specification §7).
 - **Similarity values** are dense-cosine values. With a late-interaction model, calibration maps each one to that model's scale (§9.2.4).
 - **Aux roles** inherit the harness-level `model` and `thinking` and the role defaults in §9.3.4, unless the role sets its own.
+- **Daily budgets** cap today's aux and decision tokens. 0 means no limit for that model.
 
 **Project overrides** in `<repo>/.pi/realctx2/config.json` are allowed only for:
 
@@ -2796,7 +2805,7 @@ Assume a 2-hour coding session with about 80 model steps, 10 intents and 2 Palim
 | Updates stranded by a long-lived branch | `importBatch` can't apply them | Recovery from git history; otherwise the `stranded/` folder and a `doctor` warning (§7.9) |
 | PeerID reused across diverged states | Lease check against recorded frontiers | Fresh PeerID whenever the check fails (§7.8) |
 | Missed or wrong move detection | Anchors go stale; the agent touches a path with no cards; rule flagged for review | Reconciliation on the next session; `/realctx2 paths sync`; rules are flagged for review rather than hidden (§6.8.4) |
-| Ingest drops or distorts an instruction | Coverage check; quote check; optional decision-model check | Re-prompt for uncovered lines. Preview and confirmation before anything is deleted. Git history keeps tracked files; untracked ones are backed up first. Re-ingest from history or backup if needed. |
+| Ingest drops or distorts an instruction | Coverage check; quote check; optional decision-model check | Re-prompt for uncovered lines. Preview and confirmation before anything is deleted. Git history keeps files committed as they are; untracked files and files with uncommitted changes are backed up first; a file edited after slicing is kept. Re-ingest from history or backup if needed. |
 | An instruction file reappears | `status`, `doctor`, Claude Code's `InstructionsLoaded` | Ignored for loading; re-ingest on request (§6.9.4) |
 | A teammate lacks git-lfs | LFS pointer files in the shared store | Shared store left unloaded; `doctor` explains the fix (§7.4) |
 | Aux call through `claude -p` fails or is slow | Exit status; timeout | Same fail-safe defaults as other aux calls; queued work retries in a later idle period |
@@ -2833,7 +2842,7 @@ Assume a 2-hour coding session with about 80 model steps, 10 intents and 2 Palim
   - Compactions on two branches since the default branch's last snapshot must load together after a merge (§7.7).
   - Mixed-version peers: an older client never drops or retypes fields it doesn't know (§7.13).
 - **Path tracking tests.** Renames and moves (committed and uncommitted), directory moves, deletions, branch switches, and paths that reappear.
-- **Ingest tests.** Line coverage, quote verification, `@path` imports (kept, re-sliced on change, pointer memories for non-markdown files), `AGENTS.override.md` precedence; deletion of tracked files, backups of untracked ones, and ignoring in both harnesses after ingest; re-ingest of a reappearing file; the Claude Code auto-memory import.
+- **Ingest tests.** Line coverage, quote verification, `@path` imports (kept, re-sliced on change, pointer memories for non-markdown files), `AGENTS.override.md` precedence; deletion of tracked files, backups of untracked ones and of tracked files with uncommitted changes, keeping a file edited during slicing, and ignoring in both harnesses after ingest; re-ingest of a reappearing file; the Claude Code auto-memory import.
 - **Embedding tests.** Dense and multi-vector responses, the `/pooling` alias, role prefixes and shape errors (the companion specification's examples), and reproducible calibration.
 - **Gate tests.** `edit`, `write` and `bash` (command patterns, redirects, compound commands); at most once per memory per intent; a rule in the Project rules section still gates.
 - **Aux tests.** Single-turn tool-free roles vs. read-only tool sessions (no `edit`/`write`, no `bash` by default), no recursion, withheld tools, budgets and fail-safes, in both harnesses.

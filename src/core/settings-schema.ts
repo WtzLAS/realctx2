@@ -387,13 +387,14 @@ export function formatSettingValue(entry: EditableSetting, value: unknown): stri
     return String(value);
   }
   if (typeof value === "number") {
+    if (value === 0 && scalar.zeroLabel) return scalar.zeroLabel;
     if (scalar.unit === "bytes") return `${formatNum(value)} (${formatBytes(value)})`;
     return scalar.unit ? `${formatNum(value)} ${scalar.unit}` : formatNum(value);
   }
   return String(value);
 }
 
-export function rawInputValue(entry: ScalarSetting, value: unknown): string {
+export function rawInputValue(value: unknown): string {
   if (value === null || value === undefined) return "";
   return String(value);
 }
@@ -444,8 +445,10 @@ export function parseSettingInput(entry: ScalarSetting, raw: string): { ok: true
   }
   if (entry.kind === "integer" || entry.kind === "number") {
     if (trimmed === "" && entry.nullLabel) return { ok: true, value: undefined };
+    if (entry.zeroLabel && /^(off|none|unlimited|disabled?)$/i.test(trimmed)) return { ok: true, value: 0 };
     const n = Number(trimmed.replace(/,/g, ""));
     if (!Number.isFinite(n)) return { ok: false, error: "Enter a valid number" };
+    if (n === 0 && entry.zeroLabel) return { ok: true, value: 0 };
     if (entry.kind === "integer" && !Number.isInteger(n)) return { ok: false, error: "Must be a whole integer" };
     if (entry.min !== undefined && n < entry.min) return { ok: false, error: `Must be ≥ ${entry.min}` };
     if (entry.max !== undefined && n > entry.max) return { ok: false, error: `Must be ≤ ${entry.max}` };
@@ -1008,7 +1011,7 @@ function summarizeRole(harness: "pi" | "claudeCode", role: AuxRole, cfg: Config)
   return `default (${base.thinking}, ${base.maxTurns}t, ${Math.round(base.timeoutMs / 1000)}s)`;
 }
 
-function buildAuxHarnessScreen(harness: "pi" | "claudeCode", cfg: Config): SettingScreenSpec {
+function buildAuxHarnessScreen(harness: "pi" | "claudeCode"): SettingScreenSpec {
   const basePath = `providers.aux.${harness}`;
   const isPi = harness === "pi";
   return {
@@ -1200,7 +1203,7 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
                 const count = Object.keys(c.providers.aux.pi.roles ?? {}).length;
                 return `${c.providers.aux.pi.model ?? "session model"} · ${c.providers.aux.pi.thinking ?? "medium"}${count ? ` · ${count} role override${count === 1 ? "" : "s"}` : ""}`;
               },
-              build: (c) => buildAuxHarnessScreen("pi", c),
+              build: () => buildAuxHarnessScreen("pi"),
             },
             {
               kind: "subscreen",
@@ -1211,7 +1214,7 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
                 const count = Object.keys(c.providers.aux.claudeCode.roles ?? {}).length;
                 return `${c.providers.aux.claudeCode.model ?? "haiku"} · ${c.providers.aux.claudeCode.thinking ?? "medium"}${count ? ` · ${count} role override${count === 1 ? "" : "s"}` : ""}`;
               },
-              build: (c) => buildAuxHarnessScreen("claudeCode", c),
+              build: () => buildAuxHarnessScreen("claudeCode"),
             },
           ],
         },
@@ -2518,7 +2521,7 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
     description: "Enable/disable or rename agent tools, configure daily token budgets, privacy & session indexing, idle maintenance timing, and Claude Code integration.",
     summary: (cfg) => {
       const enabled = 3 + (cfg.tools.remember ? 1 : 0) + (cfg.tools.forget ? 1 : 0);
-      return `tools: ${enabled}/5 · aux cap: ${(cfg.budgets.dailyAuxTokens / 1e6).toFixed(1)}M · idle: ${cfg.maintenance.idleMinutes}m`;
+      return `tools: ${enabled}/5 · aux cap: ${cfg.budgets.dailyAuxTokens > 0 ? `${(cfg.budgets.dailyAuxTokens / 1e6).toFixed(1)}M` : "unlimited"} · idle: ${cfg.maintenance.idleMinutes}m`;
     },
     build: () => ({
       id: "system",
@@ -2593,19 +2596,21 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
               kind: "integer",
               path: "budgets.dailyAuxTokens",
               label: "Daily aux token budget",
-              description: "Daily token limit across auxiliary LLM sessions (Janus scribe, Precip, Palim, thorough search, evolution). Background maintenance pauses once reached.",
+              description: "Daily token limit across auxiliary LLM sessions (Janus scribe, Precip, Palim, thorough search, evolution). Background maintenance pauses once reached. 0 disables the limit.",
               unit: "tokens",
               min: 0,
               step: 250_000,
+              zeroLabel: "0 (unlimited)",
             },
             {
               kind: "integer",
               path: "budgets.dailyDecisionTokens",
               label: "Daily decision token budget",
-              description: "Daily input token limit for HTTP decision-model calls.",
+              description: "Daily input token limit for HTTP decision-model calls. 0 disables the limit.",
               unit: "tokens",
               min: 0,
               step: 500_000,
+              zeroLabel: "0 (unlimited)",
             },
           ],
         },

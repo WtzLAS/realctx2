@@ -4,6 +4,7 @@
  * schedule, and semantic checks before any operator commits.
  */
 import { join } from "node:path";
+import { budgetReached } from "../core/telemetry.ts";
 import type { DecisionQuestion, MemoryEdge, MemoryNode, Relation, ScopeName } from "../core/types.ts";
 import { RELATIONS } from "../core/types.ts";
 import { binaryP, choiceProbs } from "../providers/decision.ts";
@@ -932,8 +933,8 @@ export class Evolution {
   private overBudget(): string | null {
     const spent = this.s.telemetry?.spentToday();
     if (!spent) return null;
-    if (spent.aux >= this.s.cfg.budgets.dailyAuxTokens) return "daily aux budget reached";
-    if (spent.decision >= this.s.cfg.budgets.dailyDecisionTokens) return "daily decision budget reached";
+    if (budgetReached(spent.aux, this.s.cfg.budgets.dailyAuxTokens)) return "daily aux budget reached";
+    if (budgetReached(spent.decision, this.s.cfg.budgets.dailyDecisionTokens)) return "daily decision budget reached";
     return null;
   }
 

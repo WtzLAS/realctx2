@@ -14,21 +14,24 @@ export interface RoleSettings {
   model?: string;
 }
 
-/** Role table (§9.3.4). Transcript-only roles run single-turn without tools; repo-checking roles get read-only tools. */
+/**
+ * Role table (§9.3.4). Transcript-only roles run single-turn without tools; repo-checking roles get read-only tools.
+ * No default timeout is below 30 s: LLM calls through a harness often need that long just to start answering.
+ */
 export const ROLE_DEFAULTS: Record<AuxRole, RoleSettings> = {
-  "janus.scribe": { tools: "none", thinking: "off", maxTurns: 1, timeoutMs: 15_000 },
-  precip: { tools: "none", thinking: "medium", maxTurns: 1, timeoutMs: 60_000 },
-  palim: { tools: "none", thinking: "medium", maxTurns: 1, timeoutMs: 60_000 },
-  "qemem.planner": { tools: "none", thinking: "low", maxTurns: 1, timeoutMs: 15_000 },
-  "qemem.constructor": { tools: "read-only", thinking: "medium", maxTurns: 6, timeoutMs: 120_000 },
-  "write.merge": { tools: "none", thinking: "low", maxTurns: 1, timeoutMs: 30_000 },
-  "evo.operator": { tools: "read-only", thinking: "medium", maxTurns: 6, timeoutMs: 120_000 },
-  "ingest.slicer": { tools: "read-only", thinking: "high", maxTurns: 12, timeoutMs: 300_000 },
-  reverify: { tools: "read-only", thinking: "medium", maxTurns: 10, timeoutMs: 180_000 },
+  "janus.scribe": { tools: "none", thinking: "off", maxTurns: 1, timeoutMs: 30_000 },
+  precip: { tools: "none", thinking: "medium", maxTurns: 1, timeoutMs: 120_000 },
+  palim: { tools: "none", thinking: "medium", maxTurns: 1, timeoutMs: 120_000 },
+  "qemem.planner": { tools: "none", thinking: "low", maxTurns: 1, timeoutMs: 30_000 },
+  "qemem.constructor": { tools: "read-only", thinking: "medium", maxTurns: 6, timeoutMs: 240_000 },
+  "write.merge": { tools: "none", thinking: "low", maxTurns: 1, timeoutMs: 60_000 },
+  "evo.operator": { tools: "read-only", thinking: "medium", maxTurns: 6, timeoutMs: 240_000 },
+  "ingest.slicer": { tools: "read-only", thinking: "high", maxTurns: 12, timeoutMs: 600_000 },
+  reverify: { tools: "read-only", thinking: "medium", maxTurns: 10, timeoutMs: 360_000 },
   // the user waits for it on the review screen: a short tool loop to check the code, then a verdict
-  "review.resolve": { tools: "read-only", thinking: "medium", maxTurns: 6, timeoutMs: 120_000 },
+  "review.resolve": { tools: "read-only", thinking: "medium", maxTurns: 6, timeoutMs: 240_000 },
   // thinking off: it stands in for a decision model on every step, and thinking made each answer take 5 to 10 s
-  "decision.emulate": { tools: "none", thinking: "off", maxTurns: 1, timeoutMs: 10_000 },
+  "decision.emulate": { tools: "none", thinking: "off", maxTurns: 1, timeoutMs: 30_000 },
 };
 
 /** Roles that only structure input they were handed never get tools, whatever the configuration says. */

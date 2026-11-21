@@ -1084,7 +1084,8 @@ export async function review(host: Host, io: CommandIO, p: Parsed): Promise<void
     const session = new ReviewSession(host, mem);
     const keys = session.keysFor(id);
     if (!keys.length) return io.print(mem.graph.get(id) ? `Nothing to review for [m:${id}].` : `No memory ${rawId} is visible here.`);
-    const out = keys.map((k) => session.run(k, action));
+    // settling one item can settle the others (approving an obsolete rule retires it, which ends its flags too)
+    const out = keys.flatMap((k) => (session.list().some((e) => e.key === k) ? [session.run(k, action)] : []));
     const failed = out.find((o) => !o.ok);
     if (failed) return io.print(failed.message);
     return io.print(action === "dismiss" ? `Dismissed the review item for ${rawId}.` : out.map((o) => o.message).join("\n"));

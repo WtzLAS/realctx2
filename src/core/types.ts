@@ -242,6 +242,8 @@ export interface CommandIO {
   /** Interactive review screen (pi's TUI); without it `/realctx2 review` prints a list. */
   review?(model: import("../commands/review.ts").ReviewModel): Promise<void>;
   hasUI: boolean;
+  /** Aborted when the session ends while a long command (ingest, maintain, …) still runs: it stops without applying more. */
+  signal?: AbortSignal;
 }
 
 export interface CommandDef {

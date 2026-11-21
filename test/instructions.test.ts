@@ -200,6 +200,36 @@ describe("/realctx2 ingest (§6.9.2)", () => {
     w.close();
   });
 
+  it("never deletes what git history does not hold: uncommitted changes are backed up, and a file edited while it was sliced is kept", async () => {
+    const { repo, w, ins } = ingestWorld({ "AGENTS.md": "- Always use pnpm.\n", "packages/api/AGENTS.md": "- API handlers must stay thin.\n", "packages/web/AGENTS.md": "- Web pages must load fast.\n" });
+    // tracked, with an uncommitted edit; and one added to the index but never committed
+    write(repo, "AGENTS.md", "- Always use pnpm.\n- Run the linter before committing.\n");
+    write(repo, "packages/db/AGENTS.md", "- Migrations must be reversible.\n");
+    git(repo, "add", "packages/db/AGENTS.md");
+    // the user edits a file while the slicer works on it: the new line was never sliced
+    const slicer = fakeSlicer();
+    w.aux.on("ingest.slicer", (task: AuxTask) => {
+      if (task.instructions.includes("File: packages/web/AGENTS.md")) write(repo, "packages/web/AGENTS.md", "- Web pages must load fast.\n- Images must have alt text.\n");
+      return slicer(task);
+    });
+    const out = io();
+    const res = await ins.ingest({ io: out });
+    expect(out.out[0]).toContain("AGENTS.md (uncommitted changes: backed up first)");
+    expect(out.out[0]).toContain("packages/db/AGENTS.md (uncommitted changes: backed up first)");
+    expect(out.out[0]).toContain("packages/api/AGENTS.md (tracked: git history keeps it)");
+    expect(res.deleted.sort()).toEqual(["AGENTS.md", "packages/api/AGENTS.md", "packages/db/AGENTS.md"]);
+    expect(res.backedUp.sort()).toEqual(["AGENTS.md", "packages/db/AGENTS.md"]);
+    expect(readFileSync(join(res.backupDir!, "AGENTS.md"), "utf8")).toContain("Run the linter before committing.");
+    expect(readFileSync(join(res.backupDir!, "packages/db/AGENTS.md"), "utf8")).toBe("- Migrations must be reversible.\n");
+    expect(res.changedMeanwhile).toEqual(["packages/web/AGENTS.md"]);
+    expect(readFileSync(join(repo, "packages/web/AGENTS.md"), "utf8")).toContain("Images must have alt text.");
+    // the file committed as it was comes back from git, unchanged
+    expect(existsSync(join(repo, "packages/api/AGENTS.md"))).toBe(false);
+    git(repo, "checkout", "HEAD", "--", "packages/api/AGENTS.md");
+    expect(readFileSync(join(repo, "packages/api/AGENTS.md"), "utf8")).toBe("- API handlers must stay thin.\n");
+    w.close();
+  });
+
   it("checks coverage and quotes: uncovered lines get one re-prompt, and a file that stays uncovered is kept", async () => {
     const { repo, w, ins } = ingestWorld({ "AGENTS.md": ROOT_AGENTS, "docs/AGENTS.md": "- Docs must use sentence case.\n- This line is always dropped.\n" });
     const calls: AuxTask[] = [];

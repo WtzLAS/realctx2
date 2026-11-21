@@ -10,7 +10,7 @@
 import type { Server } from "node:net";
 import { join } from "node:path";
 import type { Readable, Writable } from "node:stream";
-import { runCommand } from "../../commands/index.ts";
+import { longCommand, runCommand } from "../../commands/index.ts";
 import type { PendingDelivery } from "../../context/engine.ts";
 import { type Config, Layout, loadConfig } from "../../core/config.ts";
 import { Host, type HostOptions } from "../../core/host.ts";
@@ -38,6 +38,20 @@ const CONTEXT_CAP = 9500;
 const INJECTION_PARTS = 4;
 
 const OWN_TOOL = /^mcp__(?:plugin_[A-Za-z0-9_-]*_)?realctx2__(.+)$/;
+
+/** How long the hook client waits for a command when it does not say (`realctx2-hook`'s TIMEOUT_MS.command). */
+const COMMAND_WAIT_MS = 110_000;
+/** A notice with a long command's late result stays readable. */
+const NOTICE_CAP = 4000;
+
+/** A long command (ingest, maintain, …) running beside the hook queue. */
+interface LongRun {
+  name: string;
+  startedAt: number;
+  session: Session;
+  abort: AbortController;
+  done: Promise<string>;
+}
 
 export interface HookInput {
   hook_event_name?: string;
@@ -128,6 +142,8 @@ export class ClaudeServer {
   private net: Server | null = null;
   private registryFile = "";
   private queue: Promise<unknown> = Promise.resolve();
+  /** At most one long command at a time; hooks, tools and short commands do not wait for it. */
+  private long: LongRun | null = null;
   private toolPrefix: string;
   private closing: Promise<void> | null = null;
 
@@ -171,6 +187,12 @@ export class ClaudeServer {
     const s = this.session;
     if (!s) return;
     this.session = null;
+    // a long command of this session stops at its next check and nothing more is applied; the stores close after it
+    const run = this.long;
+    if (run?.session === s) {
+      run.abort.abort();
+      await run.done.catch(() => undefined);
+    }
     try {
       const batch = await s.host.shutdown({ spawnWorker });
       for (const r of batch.records) s.log.append(r);
@@ -328,7 +350,12 @@ export class ClaudeServer {
 
   private async dispatch(req: Record<string, unknown>): Promise<unknown> {
     if (req.kind === "hook") return this.serial(() => this.hook(req.input as HookInput).catch((e) => this.failOpen("hook", e)));
-    if (req.kind === "command") return this.serial(async () => ({ text: await this.command(String(req.line ?? ""), req.session as string | undefined) }));
+    if (req.kind === "command") {
+      const line = String(req.line ?? "");
+      const session = typeof req.session === "string" ? req.session : undefined;
+      if (longCommand(line)) return { text: await this.longCommand(line, session, typeof req.waitMs === "number" && req.waitMs > 0 ? req.waitMs : COMMAND_WAIT_MS) };
+      return this.serial(async () => ({ text: await this.command(line, session) }));
+    }
     if (req.kind === "tool") {
       const key = String(req.name) as ToolKey;
       if (!AUX_TOOL_KEYS.includes(key)) return { text: `${key} is not available to helper sessions.`, isError: true };
@@ -368,11 +395,57 @@ export class ClaudeServer {
   }
 
   async command(line: string, sessionId?: string): Promise<string> {
-    const s = this.session ?? (sessionId ? await this.open({ session_id: sessionId, source: "resume" }) : null);
+    const s = await this.sessionFor(sessionId);
     if (!s) return "realctx2 has not started in this session yet.";
+    return this.runIn(s, line);
+  }
+
+  private async sessionFor(sessionId?: string): Promise<Session | null> {
+    return this.session ?? (sessionId ? await this.open({ session_id: sessionId, source: "resume" }) : null);
+  }
+
+  /**
+   * A long command waits on the models for minutes. It runs beside the queue, so hooks and tool
+   * calls carry on meanwhile; only opening the session goes through the queue, like every hook.
+   * The hook client gives up after `waitMs`: shortly before that the answer says the command is
+   * still running, and its result follows as a notice with the next hook.
+   */
+  async longCommand(line: string, sessionId: string | undefined, waitMs = COMMAND_WAIT_MS): Promise<string> {
+    const name = longCommand(line) ?? line.trim().split(/\s+/)[0] ?? "";
+    const busy = () => {
+      const r = this.long;
+      return r ? `realctx2 is still running /realctx2 ${r.name} (started ${Math.max(0, Math.round((this.now().getTime() - r.startedAt) / 1000))} s ago). Run /realctx2 ${name} again when it has finished.` : null;
+    };
+    const before = busy();
+    if (before) return before;
+    const s = await this.serial(() => this.sessionFor(sessionId));
+    if (!s) return "realctx2 has not started in this session yet.";
+    const after = busy();
+    if (after) return after;
+    const abort = new AbortController();
+    const done = this.runIn(s, line, abort.signal);
+    const run: LongRun = { name, startedAt: this.now().getTime(), session: s, abort, done };
+    this.long = run;
+    void done
+      .finally(() => {
+        if (this.long === run) this.long = null;
+      })
+      .catch(() => undefined);
+    const text = await raceTimeout(done, Math.max(0, waitMs - Math.min(5_000, waitMs / 4)));
+    if (text !== undefined) return text;
+    void done.then((out) => {
+      if (this.session !== s || abort.signal.aborted) return;
+      const body = out.trim() || "(no output)";
+      s.adapter.notices.push(`/realctx2 ${name} finished:\n${body.length > NOTICE_CAP ? `${body.slice(0, NOTICE_CAP - 20)}\n[… cut]` : body}`);
+    }, () => undefined);
+    return `/realctx2 ${name} is still running in the background: it waits on the models. Hooks and tools carry on meanwhile, and its result is shown when it finishes.`;
+  }
+
+  private async runIn(s: Session, line: string, signal?: AbortSignal): Promise<string> {
     const out: string[] = [];
     const io: CommandIO = {
       hasUI: false,
+      signal,
       print: (t) => void out.push(t),
       notify: (t, level) => void (level && level !== "info" ? out.push(`${level}: ${t}`) : undefined),
       confirm: async (title, message) => {
