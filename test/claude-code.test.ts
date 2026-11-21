@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { promisify } from "node:util";
@@ -205,7 +205,7 @@ describe("the engine host for Claude Code (§4.6)", () => {
   it("serves the tools over MCP and injects the prompt section at session start", async () => {
     const r = await rig({ env: { CLAUDE_PLUGIN_ROOT: "/plugins/realctx2" } });
     const init = await r.mcp("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "claude-code", version: "2.1.326" } });
-    expect(init).toMatchObject({ protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "realctx2", version: "0.6.0" } });
+    expect(init).toMatchObject({ protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "realctx2", version: "0.7.0" } });
     const list = await r.mcp("tools/list");
     expect(list.tools.map((t: { name: string }) => t.name)).toEqual(["search", "recall", "inspect", "remember", "forget"]);
     expect(list.tools[0].inputSchema).toMatchObject({ type: "object", required: ["query"] });
@@ -313,7 +313,7 @@ describe("the engine host for Claude Code (§4.6)", () => {
     expect(s.host.engine.state.deliveries.some((d) => d.channel === "recall" && d.id === records[0]!.id && d.toolCallId)).toBe(true);
     // /realctx2:status through the command channel
     const status = await r.server.command("status");
-    expect(status).toMatch(/^realctx2 0\.6\.0 · claude-code \(append-only: consolidation takes effect at the harness's own compaction\)/);
+    expect(status).toMatch(/^realctx2 0\.7\.0 · claude-code \(append-only: consolidation takes effect at the harness's own compaction\)/);
     expect(status).toContain("Consolidations: 1");
     expect(await r.server.command("ingest --dry-run")).toContain("Dry run: nothing was stored or deleted.");
     // SessionEnd answers at once and flushes afterwards
@@ -564,4 +564,51 @@ describe("post-compaction injection", () => {
     adapter.model = "claude-sonnet-4-5[1m]";
     expect(adapter.maxContextTokens()).toBe(1_000_000);
   });
+});
+
+describe("the plugin without the package around it (marketplace installs)", () => {
+  it("the engine host loads without pi's packages: no value import of them on its import graph", () => {
+    // pi's packages are optional peer dependencies, and a first-run install leaves them out.
+    const start = join(process.cwd(), "src", "adapters", "claude-code", "server.ts");
+    const seen = new Set([start]);
+    const queue = [start];
+    const imports = /^\s*(?:import|export)\s+(?!type\b)(?:[^"';]*?\sfrom\s+)?["']([^"']+)["']/gm;
+    const offenders: string[] = [];
+    while (queue.length) {
+      const file = queue.shift() as string;
+      for (const [, spec] of readFileSync(file, "utf8").matchAll(imports)) {
+        if (spec.startsWith("@earendil-works/")) offenders.push(`${file.slice(process.cwd().length + 1)} imports ${spec}`);
+        if (!spec.startsWith(".")) continue;
+        const target = join(file, "..", spec);
+        if (!seen.has(target) && existsSync(target)) {
+          seen.add(target);
+          queue.push(target);
+        }
+      }
+    }
+    expect(seen.size).toBeGreaterThan(10);
+    expect(offenders).toEqual([]);
+  });
+
+  it("the first-run installer unpacks a package tarball into the plugin data directory, once under concurrent starts", async () => {
+    const work = tmp();
+    const pkg = join(work, "pkg", "realctx2-abc123");
+    write(pkg, "package.json", JSON.stringify({ name: "realctx2", version: "9.9.9", dependencies: {} }));
+    write(pkg, "bin/run-entry.cjs", "module.exports = {};\n");
+    write(pkg, "src/adapters/claude-code/server.ts", "export async function main() { return 0; }\n");
+    const tgz = join(work, "realctx2.tgz");
+    await exec("tar", ["-czf", tgz, "-C", join(work, "pkg"), "realctx2-abc123"]);
+    const data = join(work, "data");
+    const installer = join(process.cwd(), "realctx2-claude", "bin", "realctx2-install.cjs");
+    const env = { ...process.env, REALCTX2_PACKAGE_SOURCE: tgz };
+    await Promise.all([exec(process.execPath, [installer, data, "9.9.9"], { env }), exec(process.execPath, [installer, data, "9.9.9"], { env })]);
+    const root = join(data, "runtime", "9.9.9", "realctx2");
+    expect(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version).toBe("9.9.9");
+    expect(existsSync(join(root, "src", "adapters", "claude-code", "server.ts"))).toBe(true);
+    const log = readFileSync(join(data, "runtime", "install-9.9.9.log"), "utf8");
+    expect(log.match(/installed realctx2 9\.9\.9/g)).toHaveLength(1);
+    await expect(exec(process.execPath, [installer, data, "1.0.0"], { env: { ...env, REALCTX2_PACKAGE_SOURCE: join(work, "missing.tgz") } })).rejects.toThrow();
+    expect(readFileSync(join(data, "runtime", "install-1.0.0.log"), "utf8")).toContain("failed: ");
+    expect(readdirSync(join(data, "runtime")).filter((f) => f.startsWith("."))).toEqual([]);
+  }, 60_000);
 });

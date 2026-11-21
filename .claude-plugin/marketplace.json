@@ -1,0 +1,28 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "realctx2",
+  "owner": {
+    "name": "Wtz_LASR",
+    "email": "wtz_lasr@outlook.com"
+  },
+  "metadata": {
+    "description": "realctx2: context and memory management for coding agents."
+  },
+  "plugins": [
+    {
+      "name": "realctx2",
+      "source": "./realctx2-claude",
+      "description": "Context and memory manager: intent tracking, consolidated turns, long-term memory with path-anchored rules. Shares its stores with the pi extension of the same name.",
+      "version": "0.7.0",
+      "author": {
+        "name": "Wtz_LASR",
+        "email": "wtz_lasr@outlook.com"
+      },
+      "homepage": "https://github.com/WtzLAS/realctx2",
+      "repository": "https://github.com/WtzLAS/realctx2",
+      "license": "MIT",
+      "keywords": ["memory", "context", "compaction"],
+      "category": "productivity"
+    }
+  ]
+}

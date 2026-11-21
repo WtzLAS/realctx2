@@ -28,7 +28,7 @@ import { sha256 } from "../util/text.ts";
 const SCHEMA_VERSION = 1;
 /** Schema version this build writes. Clients older than meta.minWriter open read-only (§7.13). */
 const WRITER_VERSION = 1;
-export const REALCTX2_VERSION = "0.6.0";
+export const REALCTX2_VERSION = "0.7.0";
 
 export const PLAIN_FIELDS = [
   "layer",

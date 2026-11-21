@@ -146,7 +146,7 @@ describe("realctx2 as a pi extension (§4.1–4.4)", () => {
     // /realctx2 status works against the live session
     r.ui.notes.length = 0;
     await r.prompt("/realctx2 status");
-    expect(r.ui.notes[0]!.text).toMatch(/^realctx2 0\.6\.0 · pi\nContext: W = 32,000 tokens/);
+    expect(r.ui.notes[0]!.text).toMatch(/^realctx2 0\.7\.0 · pi\nContext: W = 32,000 tokens/);
     expect(r.ui.notes[0]!.text).toContain("Decision model: jev-test (systemone) · healthy");
     expect(r.ui.notes[0]!.text).toContain("- Add an email column (open for 3 rounds)");
     await r.shutdown();

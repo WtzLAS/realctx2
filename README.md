@@ -48,9 +48,19 @@ pi -e https://github.com/WtzLAS/realctx2          # one run, without installing
 pi clones the repository and installs its runtime dependencies (`loro-crdt`, `picomatch`); no
 build step runs. `pi update --extensions` pulls new commits.
 
-**Claude Code.** The plugin directory is `realctx2-claude/` inside this package. It runs the
-package next to it (from `dist/` or `src/`), the one `REALCTX2_PACKAGE` names, or one in the
-global `node_modules`. A pi git install works too: point `--plugin-dir` at its `realctx2-claude/`.
+**Claude Code.** This repository is a plugin marketplace:
+
+```bash
+claude plugin install realctx2 --marketplace WtzLAS/realctx2
+```
+
+The plugin directory is `realctx2-claude/` inside this package. It runs the package next to it
+(from `dist/` or `src/`), the one `REALCTX2_PACKAGE` names, or one in the global `node_modules`.
+A marketplace install copies only the plugin directory, so on the first session the plugin
+installs the package of its own version into its data directory (the GitHub tarball of the tag
+`v<version>`, else of `main` at that version). A release therefore needs its `v<version>` tag, or
+`main` at that version. A pi git install works too: point `--plugin-dir` at its
+`realctx2-claude/`.
 
 ```bash
 claude --plugin-dir /path/to/realctx2/realctx2-claude
@@ -137,4 +147,5 @@ and Windows.
 | `REALCTX2_NO_WORKER=1` | No detached worker at session end |
 | `REALCTX2_UNTRUSTED=1` | Claude Code: do not load the shared store or project config |
 | `REALCTX2_PACKAGE` | Claude Code: where the realctx2 package is, if the plugin directory was copied elsewhere |
+| `REALCTX2_PACKAGE_SOURCE` | Claude Code: the `.tar.gz` (URL or file) that the plugin's first-run install unpacks, instead of the GitHub tarball |
 | `REALCTX2_CHILD=1` | Set by realctx2 on processes it starts: hooks do nothing, the MCP server runs in aux mode |

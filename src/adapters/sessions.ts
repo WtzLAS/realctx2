@@ -9,7 +9,7 @@ import type { SessionEntry } from "../memory/runtime.ts";
 import { ClaudeAdapter } from "./claude-code/adapter.ts";
 import { SessionLog } from "./claude-code/state.ts";
 import { TranscriptReader } from "./claude-code/transcript.ts";
-import { loadPiSession } from "./pi/adapter.ts";
+import { loadPiSession } from "./pi/session-file.ts";
 
 export async function loadAnySession(layout: Layout, session: SessionEntry): Promise<{ entries: EntryView[]; records: SessionRecord[] } | null> {
   if (session.harness === "claude-code") {

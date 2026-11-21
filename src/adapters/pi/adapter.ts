@@ -3,13 +3,12 @@
  * It reads the session through `ctx.sessionManager`, and writes through boundary returns
  * (`turn_end`, `agent_before_settle`), `pi.appendEntry` and `pi.sendMessage`.
  */
-import { readFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { catalogContextWindow } from "../../core/catalog.ts";
 import { type Config, effectiveMaxWindow } from "../../core/config.ts";
 import type { Telemetry } from "../../core/telemetry.ts";
 import type { AuxRole, AuxSessionRunner, CommandDef, CommitBatch, ContextEdit, EntryView, HarnessAdapter, ModelPricing, SessionRecord, ToolDef } from "../../core/types.ts";
-import type { MemoryRuntime, SessionEntry as RegisteredSession } from "../../memory/runtime.ts";
+import type { MemoryRuntime } from "../../memory/runtime.ts";
 import { errMsg } from "../../util/errors.ts";
 import { PiAuxRunner } from "./aux.ts";
 import { archiveEntries, branchRecords, projectedEntries, replacementFor } from "./entries.ts";
@@ -377,37 +376,4 @@ export class PiAdapter implements HarnessAdapter {
   }
 }
 
-/**
- * An earlier session of this project, read from its pi session file (§5.6): the branch that
- * ends at the last entry of the file.
- */
-export function loadPiSession(session: RegisteredSession): { entries: EntryView[]; records: SessionRecord[] } | null {
-  if (!session.file) return null;
-  let text: string;
-  try {
-    text = readFileSync(session.file, "utf8");
-  } catch {
-    return null;
-  }
-  const byId = new Map<string, SessionEntry>();
-  let last: SessionEntry | null = null;
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const e = JSON.parse(line) as { type?: string; id?: unknown };
-      if (e.type === "session" || typeof e.id !== "string") continue;
-      byId.set(e.id, e as SessionEntry);
-      last = e as SessionEntry;
-    } catch {
-      // a torn last line
-    }
-  }
-  if (!last) return null;
-  const branch: SessionEntry[] = [];
-  const seen = new Set<string>();
-  for (let cur: SessionEntry | undefined = last; cur && !seen.has(cur.id); cur = cur.parentId ? byId.get(cur.parentId) : undefined) {
-    seen.add(cur.id);
-    branch.unshift(cur);
-  }
-  return { entries: archiveEntries(branch), records: branchRecords(branch) };
-}
+export { loadPiSession } from "./session-file.ts";

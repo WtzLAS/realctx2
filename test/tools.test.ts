@@ -325,7 +325,7 @@ describe("/realctx2 commands (§10)", () => {
     r.decision.on("janus", (_e, qs) => Object.fromEntries([["focus", { continue: 0.95 }], ...qs.filter((q) => q.name.startsWith("close.")).map((q): [string, Record<string, number>] => [q.name, { open: 0.95 }])]));
     await r.s.round("looking", [{ name: "bash", args: { command: "pnpm test" }, output: filler(300, "x") }]);
     const status = await r.run("status");
-    expect(status).toMatch(/^realctx2 0\.6\.0 · test\nContext: W = 32,000 tokens · occupancy [\d,]+ \(\d+%\) · working tail [\d,]+ tokens · 1 rounds · 1 requests/);
+    expect(status).toMatch(/^realctx2 0\.7\.0 · test\nContext: W = 32,000 tokens · occupancy [\d,]+ \(\d+%\) · working tail [\d,]+ tokens · 1 rounds · 1 requests/);
     expect(status).toContain("Open intents (outermost first):\n  - Fix the flaky test (open for 1 rounds) — done when: suite passes 20 times");
     expect(status).toContain("Decision model: not configured");
     expect(status).toContain("Embeddings: not configured (BM25 only) · search mode lexical");
