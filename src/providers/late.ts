@@ -172,15 +172,30 @@ export function poolTokens(m: TokenMatrix, factor: number): TokenMatrix {
     }
     return x;
   };
-  const pairs: Array<[number, number, number]> = [];
-  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) pairs.push([dot(m[i]!, m[j]!), i, j]);
-  pairs.sort((a, b) => b[0] - a[0]);
+  const pairCount = (n * (n - 1)) / 2;
+  const scores = new Float32Array(pairCount);
+  const left = new Int32Array(pairCount);
+  const right = new Int32Array(pairCount);
+  const order = new Int32Array(pairCount);
+  let idx = 0;
+  for (let i = 0; i < n; i++) {
+    const mi = m[i]!;
+    for (let j = i + 1; j < n; j++) {
+      scores[idx] = dot(mi, m[j]!);
+      left[idx] = i;
+      right[idx] = j;
+      order[idx] = idx;
+      idx++;
+    }
+  }
+  order.sort((a, b) => scores[b]! - scores[a]!);
   let clusters = n;
   const cap = Math.max(2, Math.ceil(factor * 2));
-  for (const [, i, j] of pairs) {
+  for (let k = 0; k < pairCount; k++) {
     if (clusters <= target) break;
-    const a = find(i);
-    const b = find(j);
+    const p = order[k]!;
+    const a = find(left[p]!);
+    const b = find(right[p]!);
     if (a === b || size[a]! + size[b]! > cap) continue;
     parent[b] = a;
     size[a] = size[a]! + size[b]!;

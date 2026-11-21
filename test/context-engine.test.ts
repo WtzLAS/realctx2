@@ -277,6 +277,45 @@ describe("Precip (§5.3)", () => {
     expect(await s.h.contextText()).toContain('intent "Fix the build" · succeeded · details archived]');
     await hiddenReachable(s);
   });
+
+  it("retries a deferred Precip job when idle is aborted by user input", async () => {
+    const s = new Session({ cfg: cfg() });
+    let precipCalls = 0;
+    s.aux.on("precip", async (task) => {
+      precipCalls++;
+      if (precipCalls === 1) {
+        // simulate an aux call interrupted by user input during idle
+        await new Promise((r) => setTimeout(r, 40));
+        if (task.signal?.aborted) return null;
+      }
+      return { memory: "Deferred summary after retry.", sidecar: { artifacts: [], entities: [], outcome: "ok" } };
+    });
+    const plan = director(s.decision, s.aux);
+    await s.start();
+    plan.push({ kindle: "Retryable task" });
+    await s.user("do retryable task");
+    for (let i = 0; i < 4; i++) {
+      plan.push({});
+      await s.round(`retry work ${i}`, work(i));
+    }
+    plan.push({ close: ["Retryable task"] });
+    await s.finish("Done.");
+    const ac = new AbortController();
+    const firstIdle = s.engine.onIdle(ac.signal);
+    await new Promise((r) => setTimeout(r, 10));
+    ac.abort();
+    await firstIdle;
+    expect(precipCalls).toBe(1);
+    // second idle retries and completes the deferred Precip instead of losing it
+    await s.engine.onIdle();
+    expect(precipCalls).toBe(2);
+    plan.push({ kindle: "Follow-up" });
+    await s.user("next");
+    plan.push({});
+    const b = await s.round("working", work(9, 30));
+    expect(b.records.some((r) => r.type === "realctx2.consolidation")).toBe(true);
+    expect(await s.h.contextText()).toContain('intent "Retryable task" · succeeded · details archived]');
+  });
 });
 
 describe("Palim (§5.4)", () => {

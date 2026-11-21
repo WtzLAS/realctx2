@@ -251,7 +251,30 @@ describe("turn index", () => {
     expect(all.vectors).toBeGreaterThan(0);
     expect(ti.vectors.count("dense")).toBe(0);
     expect(ti.vectors.getTokens("t:aaaaaaaa", "late")).not.toBeNull();
+    // sizeBytes shrinks after eviction and evicted raw turns are not re-queued by pendingEmbeds
+    expect(ti.sizeBytes()).toBeLessThan(before.bytes);
+    expect(ti.pendingEmbeds("tokens", "late", 100).filter((r) => r.kind === "raw")).toEqual([]);
+    expect(ti.pendingEmbeds("dense", "dense", 100).filter((r) => r.kind === "raw")).toEqual([]);
     ti.close();
+  });
+
+  it("rebuilds FDE blobs on fdeDims/fdeQuant change and caps in-memory tokenCacheBytes", () => {
+    const p = join(tmp(), "fde-rebuild.sqlite");
+    const ti1 = new TurnIndex(p, { fdeDims: 256, fdeQuant: "int8" });
+    ti1.addRaw({ session: "s", harness: "pi", entryId: "e1", at: "2026-11-20T00:00:00Z", text: "database pool settings", seq: 0 });
+    ti1.addRaw({ session: "s", harness: "pi", entryId: "e2", at: "2026-11-20T00:01:00Z", text: "unrelated frontend button", seq: 1 });
+    ti1.vectors.putTokens(rawTurnId("s", "e1"), "late", "h1", tokens("database pool settings", 64), "int8", 2);
+    ti1.vectors.putTokens(rawTurnId("s", "e2"), "late", "h2", tokens("unrelated frontend button", 64), "int8", 2);
+    ti1.close();
+    // Re-open with different fdeQuant + fdeDims: FDEs must rebuild without throwing or corrupting search
+    const ti2 = new TurnIndex(p, { fdeDims: 512, fdeQuant: "float32" });
+    const hits = ti2.vectors.lateSearch(tokens("database pool", 64), "late", { limit: 2, exactMax: 0, candidates: 2 });
+    expect(hits.length).toBe(2);
+    // tokenCacheBytes cap drops the in-memory cache once exceeded
+    ti2.vectors.tokenCacheBytes = 100;
+    ti2.vectors.putTokens(rawTurnId("s", "e3"), "late", "h3", tokens("another large entry with many tokens", 64), "int8", 1);
+    expect(ti2.vectors.getTokens(rawTurnId("s", "e3"), "late")).not.toBeNull();
+    ti2.close();
   });
 
   it("matches CJK queries and camelCase/snake_case sub-words via FTS5 pre-tokenization", () => {

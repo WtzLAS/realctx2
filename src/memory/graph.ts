@@ -226,7 +226,7 @@ export class MemoryGraph {
 
   private adjacencyMap(): Map<string, Array<{ edge: MemoryEdge; edgeScope: ScopeName; otherScope: ScopeName; otherId: string; direction: "out" | "in" }>> {
     const scopes = this.visible();
-    const key = scopes.map((s) => `${s}:${this.sd(s).edgeEpoch}:${this.handle(s).store.sd === this.sd(s) ? "" : "x"}`).join("|");
+    const key = scopes.map((s) => `${s}:${this.sd(s).edgeEpoch}`).join("|");
     if (this.adjacency?.key === key) return this.adjacency.map;
     const map = new Map<string, Array<{ edge: MemoryEdge; edgeScope: ScopeName; otherScope: ScopeName; otherId: string; direction: "out" | "in" }>>();
     const add = (k: string, v: { edge: MemoryEdge; edgeScope: ScopeName; otherScope: ScopeName; otherId: string; direction: "out" | "in" }) => {

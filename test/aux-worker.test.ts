@@ -55,6 +55,9 @@ describe("aux session plumbing (§9.3)", () => {
     expect(validateSchema({ items: [] }, schema)).toEqual(["$.label: missing"]);
     // where the schema is closed, properties it does not name are dropped, not reported
     expect(pruneToSchema({ label: "x", extra: 1, items: [{ n: 1, note: "y" }] }, schema)).toEqual({ label: "x", items: [{ n: 1, note: "y" }] });
+    // nested closed schemas and maxItems are still pruned even when the outer object omits additionalProperties: false
+    const outerOpen = { type: "object", properties: { inner: { type: "object", additionalProperties: false, properties: { ok: { type: "string" } } }, list: { type: "array", maxItems: 2, items: { type: "number" } } } };
+    expect(pruneToSchema({ keepOuter: 1, inner: { ok: "a", drop: 2 }, list: [1, 2, 3] }, outerOpen)).toEqual({ keepOuter: 1, inner: { ok: "a" }, list: [1, 2] });
   });
 
   it("keeps untrusted text inside data blocks that cannot be closed from within", () => {
@@ -103,6 +106,35 @@ describe("aux session plumbing (§9.3)", () => {
     expect(limiter.pending).toBe(3);
     expect(await all).toEqual([20, 20, 5, 5, 5]);
     expect(peak).toBe(2);
+    // pre-aborted signal fails fast even when slots are free, and slot handoff never exceeds max
+    const preAborted = new AbortController();
+    preAborted.abort();
+    await expect(limiter.run(async () => "never", preAborted.signal)).rejects.toThrow(/aborted/);
+    const one = new Limiter(1);
+    let oneActive = 0;
+    let onePeak = 0;
+    let releaseFirst!: () => void;
+    const first = one.run(async () => {
+      onePeak = Math.max(onePeak, ++oneActive);
+      await new Promise<void>((r) => (releaseFirst = r));
+      oneActive--;
+    });
+    const second = one.run(async () => {
+      onePeak = Math.max(onePeak, ++oneActive);
+      await new Promise((r) => setTimeout(r, 10));
+      oneActive--;
+    });
+    // release first, then synchronously enqueue a third before `second`'s microtask resumes
+    releaseFirst();
+    await first;
+    const third = one.run(async () => {
+      onePeak = Math.max(onePeak, ++oneActive);
+      await new Promise((r) => setTimeout(r, 10));
+      oneActive--;
+    });
+    await Promise.all([second, third]);
+    expect(onePeak).toBe(1);
+    expect(one.active).toBe(0);
     // a queued job that is aborted leaves the queue
     const gate = limiter.run(() => new Promise((r) => setTimeout(r, 30)));
     const gate2 = limiter.run(() => new Promise((r) => setTimeout(r, 30)));

@@ -7,7 +7,7 @@ import { estimateTokens, sha256 } from "../util/text.ts";
 import { type Db, ftsQuery, indexTokens, openDb } from "./sqlite.ts";
 import { type Scored, VectorTables } from "./vectors.ts";
 
-const TURN_SCHEMA = 3;
+const TURN_SCHEMA = 4;
 const CHUNK_TOKENS = 512;
 
 export interface TurnRow {
@@ -124,10 +124,20 @@ export class TurnIndex {
 
   constructor(path: string, opts: { fdeDims?: number; fdeQuant?: "int8" | "float32" } = {}) {
     this.db = openDb(path);
+    try {
+      this.db.exec("PRAGMA auto_vacuum = INCREMENTAL");
+    } catch {
+      // ignore if read-only
+    }
     this.db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)");
     const have = Number(this.db.prepare("SELECT value FROM meta WHERE key = 'schema'").get()?.value ?? 0);
     if (have !== TURN_SCHEMA) {
       this.db.exec("DROP TABLE IF EXISTS turns; DROP TABLE IF EXISTS turns_fts; DROP TABLE IF EXISTS turn_dense; DROP TABLE IF EXISTS turn_tokens; DROP TABLE IF EXISTS turn_fde;");
+      try {
+        this.db.exec("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;");
+      } catch {
+        // best effort on upgrade
+      }
       this.db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?)").run(String(TURN_SCHEMA));
     }
     this.db.exec(`
@@ -145,13 +155,18 @@ export class TurnIndex {
         role         TEXT,
         tool         TEXT,
         seq          INTEGER NOT NULL DEFAULT 0,
-        tokens       INTEGER NOT NULL DEFAULT 0
+        tokens       INTEGER NOT NULL DEFAULT 0,
+        evicted      INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS turns_session ON turns (session, seq, chunk);
       CREATE INDEX IF NOT EXISTS turns_entry ON turns (session, entry);
       CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(text, tokenize = "unicode61 tokenchars '_'");
     `);
     this.vectors = new VectorTables(this.db, "turn", opts);
+    const fdeKey = `${this.vectors.fdeDims}:${this.vectors.fdeQuant}`;
+    const savedFde = this.db.prepare("SELECT value FROM meta WHERE key = 'fde_config'").get()?.value;
+    if (savedFde && String(savedFde) !== fdeKey) this.vectors.rebuildFde();
+    if (String(savedFde ?? "") !== fdeKey) this.db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('fde_config', ?)").run(fdeKey);
   }
 
   close(): void {
@@ -169,12 +184,12 @@ export class TurnIndex {
     const tokens = estimateTokens(row.text);
     if (cur) {
       const rid = Number(cur.rid);
-      this.db.prepare("UPDATE turns SET session = ?, harness = ?, entry = ?, chunk = ?, kind = ?, at = ?, text = ?, content_hash = ?, role = ?, tool = ?, seq = ?, tokens = ? WHERE rid = ?").run(row.session, row.harness, row.entry, row.chunk, row.kind, row.at, row.text, hash, row.role, row.tool, row.seq, tokens, rid);
+      this.db.prepare("UPDATE turns SET session = ?, harness = ?, entry = ?, chunk = ?, kind = ?, at = ?, text = ?, content_hash = ?, role = ?, tool = ?, seq = ?, tokens = ?, evicted = 0 WHERE rid = ?").run(row.session, row.harness, row.entry, row.chunk, row.kind, row.at, row.text, hash, row.role, row.tool, row.seq, tokens, rid);
       this.db.prepare("DELETE FROM turns_fts WHERE rowid = ?").run(rid);
       this.db.prepare("INSERT INTO turns_fts (rowid, text) VALUES (?, ?)").run(rid, indexTokens(row.text));
       this.vectors.delete(row.id);
     } else {
-      this.db.prepare("INSERT INTO turns (id, session, harness, entry, chunk, kind, at, text, content_hash, role, tool, seq, tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(row.id, row.session, row.harness, row.entry, row.chunk, row.kind, row.at, row.text, hash, row.role, row.tool, row.seq, tokens);
+      this.db.prepare("INSERT INTO turns (id, session, harness, entry, chunk, kind, at, text, content_hash, role, tool, seq, tokens, evicted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)").run(row.id, row.session, row.harness, row.entry, row.chunk, row.kind, row.at, row.text, hash, row.role, row.tool, row.seq, tokens);
       const rid = Number(this.db.prepare("SELECT rid FROM turns WHERE id = ?").get(row.id)!.rid);
       this.db.prepare("INSERT INTO turns_fts (rowid, text) VALUES (?, ?)").run(rid, indexTokens(row.text));
     }
@@ -306,7 +321,8 @@ export class TurnIndex {
   }
 
   pendingEmbeds(kind: "dense" | "tokens", model: string, limit = 128): TurnRow[] {
-    const items = this.db.prepare("SELECT id, content_hash FROM turns ORDER BY at DESC LIMIT 20000").all().map((r) => ({ id: String(r.id), hash: String(r.content_hash) }));
+    const maxEvicted = kind === "tokens" ? 0 : 1;
+    const items = this.db.prepare("SELECT id, content_hash FROM turns WHERE evicted <= ? ORDER BY at DESC LIMIT 20000").all(maxEvicted).map((r) => ({ id: String(r.id), hash: String(r.content_hash) }));
     const ids = this.vectors.missing(kind, model, items).slice(0, limit);
     return ids.map((id) => this.get(id)).filter((r): r is TurnRow => r !== null);
   }
@@ -317,15 +333,20 @@ export class TurnIndex {
     const cutoff = new Date(now.getTime() - recentDays * 86_400_000).toISOString();
     const rows = this.db.prepare("SELECT t.id AS id FROM turns t JOIN turn_tokens v ON v.id = t.id WHERE t.kind = 'raw' AND t.at < ? AND v.model = ? AND v.quant != 'binary' LIMIT 2000").all(cutoff, model);
     let n = 0;
-    for (const r of rows) if (this.vectors.requantize(String(r.id), model, "binary")) n++;
+    if (rows.length) {
+      this.db.transaction(() => {
+        for (const r of rows) if (this.vectors.requantize(String(r.id), model, "binary")) n++;
+      });
+    }
     return n;
   }
 
   sizeBytes(): number {
     try {
       const pages = Number(this.db.prepare("PRAGMA page_count").get()?.page_count ?? 0);
+      const free = Number(this.db.prepare("PRAGMA freelist_count").get()?.freelist_count ?? 0);
       const size = Number(this.db.prepare("PRAGMA page_size").get()?.page_size ?? 0);
-      return pages * size;
+      return Math.max(0, pages - free) * size;
     } catch {
       return 0;
     }
@@ -339,22 +360,29 @@ export class TurnIndex {
     const out = { tokens: 0, vectors: 0 };
     let over = this.sizeBytes() - maxBytes;
     if (over <= 0) return out;
-    const tokenRows = this.db.prepare("SELECT t.id AS id, LENGTH(v.data) AS n FROM turns t JOIN turn_tokens v ON v.id = t.id WHERE t.kind = 'raw' ORDER BY t.at ASC").all();
-    for (const r of tokenRows) {
-      if (over <= 0) break;
-      this.vectors.deleteTokens(String(r.id));
-      over -= Number(r.n);
-      out.tokens++;
-    }
-    if (over > 0) {
-      const rows = this.db.prepare("SELECT t.id AS id, COALESCE(LENGTH(f.vec), 0) + COALESCE(LENGTH(d.vec), 0) AS n FROM turns t LEFT JOIN turn_fde f ON f.id = t.id LEFT JOIN turn_dense d ON d.id = t.id WHERE t.kind = 'raw' AND (f.id IS NOT NULL OR d.id IS NOT NULL) ORDER BY t.at ASC").all();
-      for (const r of rows) {
+    const markEvicted = this.db.prepare("UPDATE turns SET evicted = MAX(evicted, ?) WHERE id = ?");
+    this.db.transaction(() => {
+      const tokenRows = this.db.prepare("SELECT t.id AS id, LENGTH(v.data) AS n FROM turns t JOIN turn_tokens v ON v.id = t.id WHERE t.kind = 'raw' ORDER BY t.at ASC").all();
+      for (const r of tokenRows) {
         if (over <= 0) break;
-        this.vectors.deleteFdeAndDense(String(r.id));
+        const id = String(r.id);
+        this.vectors.deleteTokens(id);
+        markEvicted.run(1, id);
         over -= Number(r.n);
-        out.vectors++;
+        out.tokens++;
       }
-    }
+      if (over > 0) {
+        const rows = this.db.prepare("SELECT t.id AS id, COALESCE(LENGTH(f.vec), 0) + COALESCE(LENGTH(d.vec), 0) AS n FROM turns t LEFT JOIN turn_fde f ON f.id = t.id LEFT JOIN turn_dense d ON d.id = t.id WHERE t.kind = 'raw' AND (f.id IS NOT NULL OR d.id IS NOT NULL) ORDER BY t.at ASC").all();
+        for (const r of rows) {
+          if (over <= 0) break;
+          const id = String(r.id);
+          this.vectors.deleteFdeAndDense(id);
+          markEvicted.run(2, id);
+          over -= Number(r.n);
+          out.vectors++;
+        }
+      }
+    });
     if (out.tokens || out.vectors) {
       try {
         this.db.exec("PRAGMA incremental_vacuum");

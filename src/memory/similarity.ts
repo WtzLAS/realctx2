@@ -90,8 +90,8 @@ interface SimilarityOptions {
 
 export class Similarity {
   readonly cfg: Config;
-  readonly late: EmbeddingClient<"multivector"> | null;
-  readonly dense: EmbeddingClient<"dense"> | null;
+  late: EmbeddingClient<"multivector"> | null;
+  dense: EmbeddingClient<"dense"> | null;
   private readonly layout: Layout | null;
   private readonly telemetry?: Telemetry;
   private readonly clock: Clock;
@@ -108,6 +108,14 @@ export class Similarity {
     this.telemetry = o.telemetry;
     this.clock = o.clock ?? (() => new Date());
     this.random = o.random ?? Math.random;
+  }
+
+  /** Replace embedding clients after a live configuration reload. */
+  setClients(late: EmbeddingClient<"multivector"> | null, dense: EmbeddingClient<"dense"> | null): void {
+    this.late = late;
+    this.dense = dense;
+    this.queryCache.clear();
+    this.calibrating = null;
   }
 
   // ───────────── modes

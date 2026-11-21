@@ -15,7 +15,7 @@ import type { Telemetry } from "../../core/telemetry.ts";
 import type { AuxResult, AuxRole, AuxSessionRunner, AuxTask, ModelPricing, ThinkingLevel, ToolDef } from "../../core/types.ts";
 import type { MemoryRuntime } from "../../memory/runtime.ts";
 import { errMsg } from "../../util/errors.ts";
-import { runSync } from "../../util/git.ts";
+import { diffGitStatusFiles, gitStatusSnapshot } from "../../util/git.ts";
 import { clipTokens } from "../../util/text.ts";
 import { checkAuxBash } from "../guard.ts";
 
@@ -86,12 +86,6 @@ async function piBuiltins(cwd: string, withBash: boolean): Promise<AuxTool[]> {
 
 function textOf(msg: AssistantMessage): string {
   return msg.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map((c) => c.text).join("\n");
-}
-
-function gitStatus(root: string | null): Set<string> | null {
-  if (!root) return null;
-  const res = runSync("git", ["status", "--porcelain=v2", "--untracked-files=all"], root, 10_000);
-  return res.code === 0 ? new Set(res.stdout.split("\n").filter(Boolean)) : null;
 }
 
 export class PiAuxRunner implements AuxSessionRunner {
@@ -226,7 +220,7 @@ export class PiAuxRunner implements AuxSessionRunner {
     const prompt = renderAuxPrompt(task as AuxTask, settings, { schemaInPrompt: !useTools, submitTool: useTools ? SUBMIT : undefined });
     const messages: Message[] = [{ role: "user", content: prompt.user, timestamp: Date.now() }];
     const reasoning = clampThinking(model, settings.thinking);
-    const before = withBash ? gitStatus(this.env.root()) : null;
+    const before = withBash ? gitStatusSnapshot(this.env.root()) : null;
 
     const complete = async (toolList: Tool[]): Promise<AssistantMessage> => {
       const context: Context = { systemPrompt: prompt.system, messages, ...(toolList.length ? { tools: toolList } : {}) };
@@ -345,9 +339,9 @@ export class PiAuxRunner implements AuxSessionRunner {
 
     // change watch: nothing is reverted, the change is reported (§9.3.2)
     if (before) {
-      const after = gitStatus(this.env.root());
+      const after = gitStatusSnapshot(this.env.root());
       if (after) {
-        out.changedFiles = [...after].filter((l) => !before.has(l)).map((l) => l.split(" ").at(-1) ?? l);
+        out.changedFiles = diffGitStatusFiles(before, after);
         if (out.changedFiles.length) memory?.noteAuxChanges(task.role, out.changedFiles);
       }
     }

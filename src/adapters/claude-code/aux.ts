@@ -12,7 +12,7 @@ import type { Telemetry } from "../../core/telemetry.ts";
 import type { AuxResult, AuxSessionRunner, AuxTask, ThinkingLevel } from "../../core/types.ts";
 import type { MemoryRuntime } from "../../memory/runtime.ts";
 import { errMsg } from "../../util/errors.ts";
-import { runSync } from "../../util/git.ts";
+import { diffGitStatusFiles, gitStatusSnapshot, runSync } from "../../util/git.ts";
 
 export interface SpawnResult {
   code: number | null;
@@ -22,24 +22,34 @@ export interface SpawnResult {
 }
 export type SpawnFn = (cmd: string, args: string[], opts: { input: string; env: Record<string, string | undefined>; cwd: string; timeoutMs: number; signal?: AbortSignal }) => Promise<SpawnResult>;
 
-const spawnClaude: SpawnFn = (cmd, args, opts) =>
-  new Promise((resolve) => {
+const spawnClaude: SpawnFn = (cmd, args, opts) => {
+  if (opts.signal?.aborted) return Promise.resolve({ code: null, stdout: "", stderr: "aborted", timedOut: false });
+  return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
     let done = false;
+    let killTimer: ReturnType<typeof setTimeout> | null = null;
     const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env as NodeJS.ProcessEnv, stdio: ["pipe", "pipe", "pipe"] });
     const finish = (code: number | null) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       opts.signal?.removeEventListener("abort", onAbort);
       resolve({ code, stdout, stderr, timedOut });
     };
     const kill = () => {
       try {
         child.kill("SIGTERM");
-        setTimeout(() => child.kill("SIGKILL"), 2000).unref();
+        killTimer = setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // already gone
+          }
+        }, 2000);
+        killTimer.unref();
       } catch {
         // already gone
       }
@@ -60,6 +70,7 @@ const spawnClaude: SpawnFn = (cmd, args, opts) =>
     child.stdin.on("error", () => undefined);
     child.stdin.end(opts.input);
   });
+};
 
 /** `--effort` for a thinking level (§9.3.3); undefined for `off`, which sets MAX_THINKING_TOKENS=0 instead. */
 export function effortFor(level: ThinkingLevel): string | undefined {
@@ -86,12 +97,6 @@ function atLeast(version: string | null, major: number, minor: number, patch: nu
   if (!m) return false;
   const v = [Number(m[1]), Number(m[2]), Number(m[3])];
   return v[0]! > major || (v[0] === major && (v[1]! > minor || (v[1] === minor && v[2]! >= patch)));
-}
-
-function gitStatus(root: string | null): Set<string> | null {
-  if (!root) return null;
-  const res = runSync("git", ["status", "--porcelain=v2", "--untracked-files=all"], root, 10_000);
-  return res.code === 0 ? new Set(res.stdout.split("\n").filter(Boolean)) : null;
 }
 
 export class ClaudeAuxRunner implements AuxSessionRunner {
@@ -187,7 +192,7 @@ export class ClaudeAuxRunner implements AuxSessionRunner {
     const system = prompt.system.replace("Answer with a single JSON object that matches the schema. No prose, no code fence.", "Return the result as structured output.");
     const { args, env } = this.args(task as AuxTask, settings, system);
     const cwd = this.env.root() ?? this.env.cwd();
-    const before = withTools ? gitStatus(this.env.root()) : null;
+    const before = withTools ? gitStatusSnapshot(this.env.root()) : null;
     const deadline = Date.now() + settings.timeoutMs;
     let input = prompt.user;
     // one repair turn: a second call that names what was wrong with the first answer
@@ -233,9 +238,9 @@ export class ClaudeAuxRunner implements AuxSessionRunner {
       input = `${prompt.user}\n\nYour previous answer did not match the required schema (${problems.join("; ")}). Return a corrected result.`;
     }
     if (before) {
-      const after = gitStatus(this.env.root());
+      const after = gitStatusSnapshot(this.env.root());
       if (after) {
-        out.changedFiles = [...after].filter((l) => !before.has(l)).map((l) => l.split(" ").at(-1) ?? l);
+        out.changedFiles = diffGitStatusFiles(before, after);
         if (out.changedFiles.length) this.env.memory()?.noteAuxChanges(task.role, out.changedFiles);
       }
     }

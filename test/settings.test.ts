@@ -560,6 +560,10 @@ describe("/realctx2 settings command & Host.reloadConfig", () => {
     const home = tmp("settings-home-");
     const layout = new Layout(home);
     const adapter = new FakeHarness(new FakeAux());
+    let cooldownResets = 0;
+    adapter.auxRunner.resetCooldowns = () => {
+      cooldownResets++;
+    };
     let seenDecisionCfg: unknown = undefined;
     const host = new Host({
       adapter,
@@ -614,15 +618,44 @@ describe("/realctx2 settings command & Host.reloadConfig", () => {
     expect(cmd.completions?.("settings ")).toEqual(SETTINGS_CATEGORIES.map((c) => c.id));
     expect(findCategory("endpoints")?.id).toBe("providers");
 
-    // Host.reloadConfig mutates host.cfg in place and notifies onDecisionConfig
+    // Host.reloadConfig mutates host.cfg in place, notifies onDecisionConfig, reloads embedding clients and resets aux cooldowns
     const next = loadGlobalConfig(layout);
     next.context.rho = 0.72;
     next.providers.decision = { format: "systemone", url: "https://live.example/v1/systemone", model: "jev-live", registerInPi: true };
+    next.providers.embedding.dense = { url: "https://emb.example/v1/embeddings", model: "dense-live" };
     saveConfig(layout, next);
     host.reloadConfig();
     expect(host.cfg.context.rho).toBe(0.72);
     expect(host.cfg.providers.decision?.model).toBe("jev-live");
     expect(seenDecisionCfg).toMatchObject({ model: "jev-live" });
+    expect(cooldownResets).toBe(1);
+    expect(host.dense?.model).toBe("dense-live");
+    expect(host.memory?.sim.dense?.model).toBe("dense-live");
+
+    // Host.noteSettled chains onto an unwinding aborted idle pass so two runs never overlap
+    let activeIdle = 0;
+    let peakIdle = 0;
+    let idleRuns = 0;
+    const origIdle = host.engine.onIdle.bind(host.engine);
+    host.engine.onIdle = async (sig?: AbortSignal) => {
+      idleRuns++;
+      peakIdle = Math.max(peakIdle, ++activeIdle);
+      try {
+        await new Promise((r) => setTimeout(r, 30));
+        if (sig?.aborted) return;
+      } finally {
+        activeIdle--;
+      }
+    };
+    host.cfg.maintenance.idleMinutes = 10;
+    host.noteSettled();
+    await new Promise((r) => setTimeout(r, 5));
+    host.noteInput();
+    host.noteSettled();
+    await host.settle();
+    host.engine.onIdle = origIdle;
+    expect(idleRuns).toBe(2);
+    expect(peakIdle).toBe(1);
 
     // Confirm loadConfig picks up the persisted values for future sessions
     expect(loadConfig(layout).config.context.rho).toBe(0.72);

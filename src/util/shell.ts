@@ -244,13 +244,14 @@ function flagValue(args: string[], names: string[]): string | undefined {
   return undefined;
 }
 
-const PATHISH = /^[\w.@+~/-]+$/;
+const PATHISH = /^[\w.@+~[\]/-]+$/;
 
 /** Report the file-system effects of a command line. All paths are absolute. */
 export function analyzeCommand(line: string, opts: AnalyzeOptions): CommandEffects {
   const fx: CommandEffects = { parts: [], moves: [], deletes: [], copies: [], mkdirs: [], writes: [], touched: [], cds: [] };
   let cwd = opts.cwd;
-  const abs = (p: string) => normalize(isAbsolute(p) ? p : resolve(cwd, p.replace(/^~(?=\/|$)/, process.env.HOME ?? "~")));
+  let partCwd = cwd;
+  const abs = (p: string) => normalize(isAbsolute(p) ? p : resolve(partCwd, p.replace(/^~(?=\/|$)/, process.env.HOME ?? "~")));
   const isDir = (p: string) => p.endsWith("/") || (opts.isDir?.(abs(p)) ?? false);
   const touch = (p: string) => {
     if (!p || p.startsWith("-") || !PATHISH.test(p)) return;
@@ -266,6 +267,7 @@ export function analyzeCommand(line: string, opts: AnalyzeOptions): CommandEffec
     srcs.map((s) => ({ from: abs(s), to: forceDir || srcs.length > 1 || isDir(dst) ? join(abs(dst), basename(abs(s))) : abs(dst) }));
 
   for (const part of parseShell(line)) {
+    partCwd = cwd;
     const w = stripPrefix(part.words);
     for (const r of part.redirects) {
       if (r.op.includes(">") && r.target !== "/dev/null" && !r.target.startsWith("&")) write(r.target);
@@ -278,6 +280,7 @@ export function analyzeCommand(line: string, opts: AnalyzeOptions): CommandEffec
       const target = args.find((a) => !a.startsWith("-"));
       if (target && target !== "-") {
         cwd = abs(target);
+        partCwd = cwd;
         fx.cds.push(cwd);
       }
       continue;
@@ -289,7 +292,7 @@ export function analyzeCommand(line: string, opts: AnalyzeOptions): CommandEffec
       // skip global options: -C <dir>, -c k=v, --git-dir=…
       let i = 0;
       while (i < args.length && args[i]!.startsWith("-")) {
-        if (args[i] === "-C" && args[i + 1]) cwd = abs(args[i + 1]!);
+        if (args[i] === "-C" && args[i + 1]) partCwd = abs(args[i + 1]!);
         i += args[i] === "-C" || args[i] === "-c" ? 2 : 1;
       }
       sub = `git ${args[i] ?? ""}`;

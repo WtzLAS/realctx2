@@ -502,7 +502,7 @@ export class MemoryWriter {
     if (dup) {
       const same = binaryP(answers, `same.${judged.indexOf(dup)}`);
       if (same !== undefined) sim.logPair("dedup", dup.sim, same >= 0.5, { mode: dup.mode });
-      return this.mergeInto(dup.ref, p, touched);
+      if (same === undefined || same >= 0.5) return this.mergeInto(dup.ref, p, touched);
     }
     if (sampled && answers[`rel.${judged.indexOf(sampled)}`]) sim.logPair("conflict", sampled.sim, verdict(sampled).rel !== "unrelated", { below: true, mode: sampled.mode });
     conflicts = conflicts.filter((x) => x !== sampled);

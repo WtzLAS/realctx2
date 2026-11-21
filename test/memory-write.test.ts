@@ -326,4 +326,21 @@ describe("write path (§6.3)", () => {
     untrusted.close();
     writeFileSync(join(repo, "marker"), "x");
   });
+
+  it("does not merge when the decision model judges a high-similarity candidate non-redundant (same < 0.5)", async () => {
+    const repo = initRepo();
+    const w = world({ cwd: repo, embeddings: "dense" });
+    const writer = new MemoryWriter(w);
+    const [first] = await writer.write([{ text: "The staging database runs on port 5432 with TLS required.", kind: "fact", origin: "explicit", scope: "personal", urgency: "hint" }]);
+    w.decision.on("write.conflict", (_e, qs) =>
+      Object.fromEntries(qs.map((q): [string, number | Record<string, number>] => [q.name, q.name.startsWith("same.") ? 0.1 : { unrelated: 0.9 }])),
+    );
+    // Nearly identical wording crosses the dense dedup threshold, but the judge says they differ.
+    const [second] = await writer.write([{ text: "The staging database runs on port 5433 with TLS required.", kind: "fact", origin: "explicit", scope: "personal", urgency: "hint" }]);
+    expect(second!.status).toBe("created");
+    expect(second!.id).not.toBe(first!.id);
+    expect(w.graph.get(second!.id!)!.node.text).toContain("5433");
+    expect(w.graph.get(first!.id!)!.node.text).toContain("5432");
+    w.close();
+  });
 });

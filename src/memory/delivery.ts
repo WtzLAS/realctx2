@@ -230,7 +230,7 @@ export class PathDelivery {
     if (this.s.cfg.urgency.gate === "off") return null;
     if (event.action !== "edit" && event.action !== "command") return null;
     const hits = new Map<string, ScopedNode>();
-    const immediate = (n: MemoryNode) => effectiveUrgency(n, this.s.cfg) === "immediate";
+    const immediate = (n: MemoryNode) => !n.flags?.includes("conflicts-instruction") && effectiveUrgency(n, this.s.cfg) === "immediate";
     const edits = new Set<TriggerAction>(["edit"]);
     if (event.action === "edit") {
       for (const path of event.paths) for (const c of this.s.paths.covering(path)) if (immediate(c.node) && this.triggered(c.node, edits)) hits.set(key({ scope: c.scope, node: c.node }), { scope: c.scope, node: c.node });

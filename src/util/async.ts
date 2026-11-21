@@ -14,3 +14,19 @@ export async function raceTimeout<T>(p: Promise<T>, ms: number): Promise<T | und
     clearTimeout(timer);
   }
 }
+
+/** Abort-aware delay that fast-returns if already aborted and removes its listener when done. */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const onAbort = () => {
+      clearTimeout(t);
+      resolve();
+    };
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}

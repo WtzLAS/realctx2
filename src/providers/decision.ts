@@ -6,6 +6,7 @@ import type { DecisionProviderConfig } from "../core/config.ts";
 import { buildAuthHeaders } from "../core/config.ts";
 import type { Telemetry } from "../core/telemetry.ts";
 import type { AuxSessionRunner, DecideOptions, DecisionAnswer, DecisionClient, DecisionQuestion } from "../core/types.ts";
+import { sleep } from "../util/async.ts";
 import { errMsg } from "../util/errors.ts";
 import { estimateTokens, headTail } from "../util/text.ts";
 
@@ -422,16 +423,6 @@ export class HttpDecisionClient implements DecisionClient {
 }
 
 class DecisionUnavailable extends Error {}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => {
-      clearTimeout(t);
-      resolve();
-    }, { once: true });
-  });
-}
 
 // ───────────────────────────── Aux-emulated decisions (§9.1.4)
 

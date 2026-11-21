@@ -196,6 +196,13 @@ describe("hygiene and the forgetting pass (§6.5.2, §6.5.4)", () => {
     const member = put(w, "personal", { id: "onlyevid", ...base, evidence: [{ quote: "q", source: { type: "file", ref: "a.ts" }, verified: true }] });
     const concept = put(w, "personal", { id: "concept1", ...base, kind: "concept", layer: "long", pinned: true });
     w.graph.link({ scope: "personal", node: concept }, "generalizes", { scope: "personal", node: member });
+    // two verified members under one unverified active concept: when both fall below threshold
+    // in the same pass, the first becomes dormant and the last remaining one is archived under it
+    const m2a = put(w, "personal", { id: "dual0001", ...base, evidence: [{ quote: "q1", source: { type: "file", ref: "b.ts" }, verified: true }] });
+    const m2b = put(w, "personal", { id: "dual0002", ...base, evidence: [{ quote: "q2", source: { type: "file", ref: "c.ts" }, verified: true }] });
+    const concept2 = put(w, "personal", { id: "concept2", ...base, kind: "concept", layer: "long", pinned: true });
+    w.graph.link({ scope: "personal", node: concept2 }, "generalizes", { scope: "personal", node: m2a });
+    w.graph.link({ scope: "personal", node: concept2 }, "generalizes", { scope: "personal", node: m2b });
     const neighbor = put(w, "personal", { id: "neighbor", ...base, layer: "long", pinned: true });
     w.graph.link({ scope: "personal", node: w.graph.get("weak0001")!.node }, "precedes", { scope: "personal", node: neighbor });
     w.graph.sd("personal").incTurns(5000);
@@ -204,9 +211,10 @@ describe("hygiene and the forgetting pass (§6.5.2, §6.5.4)", () => {
     const life = new Lifecycle(w);
     const report = life.hygiene("personal");
     expect(report.forgettingRan).toBe(true);
-    expect(report.dormant.sort()).toEqual(["chainold", "weak0001"]);
-    expect(report.archived).toEqual(["onlyevid"]); // archived under its concept instead of going dormant
+    expect(report.dormant.sort()).toEqual(["chainold", "dual0001", "weak0001"]);
+    expect(report.archived.sort()).toEqual(["dual0002", "onlyevid"]); // archived under its concept instead of going dormant
     expect(w.graph.get("onlyevid")!.node.statusReason).toBe("forgetting: kept under m:concept1");
+    expect(w.graph.get("dual0002")!.node.statusReason).toBe("forgetting: kept under m:concept2");
     for (const id of ["pinned01", "longterm", "highmw01", "deliverd", "brandnew", "chainhed"]) expect(w.graph.get(id)!.node.status, id).toBe("active");
     // edges are kept, but inactive; dormant nodes leave default retrieval but stay reachable by ID
     expect(w.graph.sd("personal").allEdges().find((e) => e.src === "weak0001")!.active).toBe(false);

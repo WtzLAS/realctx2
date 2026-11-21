@@ -63,6 +63,13 @@ export class MemoryIndex {
     `);
     this.vectors = new VectorTables(this.db, "node", opts);
     this.purposeVectors = new VectorTables(this.db, "purpose", opts);
+    const fdeKey = `${this.vectors.fdeDims}:${this.vectors.fdeQuant}`;
+    const savedFde = this.getMeta("fde_config");
+    if (savedFde && savedFde !== fdeKey) {
+      this.vectors.rebuildFde();
+      this.purposeVectors.rebuildFde();
+    }
+    if (savedFde !== fdeKey) this.setMeta("fde_config", fdeKey);
   }
 
   close(): void {

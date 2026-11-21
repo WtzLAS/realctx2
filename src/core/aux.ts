@@ -157,10 +157,14 @@ export function pruneToSchema(value: unknown, schema: JSONSchema): unknown {
     const max = typeof schema.maxItems === "number" ? schema.maxItems : value.length;
     return value.slice(0, max).map((v) => (items ? pruneToSchema(v, items) : v));
   }
-  if (value && typeof value === "object" && schema.properties && schema.additionalProperties === false) {
+  if (value && typeof value === "object" && schema.properties) {
     const props = schema.properties as Record<string, JSONSchema>;
+    const strict = schema.additionalProperties === false;
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) if (props[k]) out[k] = pruneToSchema(v, props[k]);
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (props[k]) out[k] = pruneToSchema(v, props[k]);
+      else if (!strict) out[k] = v;
+    }
     return out;
   }
   return value;
@@ -187,6 +191,7 @@ export class Limiter {
     this.max = Math.max(1, max);
   }
   async run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) throw new Error("aborted");
     if (this.running >= this.max) {
       await new Promise<void>((resolve, reject) => {
         const go = () => {
@@ -201,13 +206,15 @@ export class Limiter {
         signal?.addEventListener("abort", onAbort, { once: true });
         this.queue.push(go);
       });
+    } else {
+      this.running++;
     }
-    this.running++;
     try {
       return await fn();
     } finally {
-      this.running--;
-      this.queue.shift()?.();
+      const next = this.queue.shift();
+      if (next) next(); // slot transfers directly to the woken waiter; `running` stays unchanged
+      else this.running--;
     }
   }
   get pending(): number {

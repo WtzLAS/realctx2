@@ -370,14 +370,15 @@ export class ScopeStore {
     const ordered = [...blobs].sort((a, b) => Number(b.snapshot) - Number(a.snapshot));
     const doc = freshDoc();
     if (tryImport(doc, ordered.map((b) => b.bytes))) return { doc, stranded: [] };
-    // Some file cannot be applied (trimmed history, corruption). Find the good set one file at
-    // a time; a second pass picks up files that were only waiting for a later one.
-    let good: typeof ordered = [];
+    // Some file cannot be applied (trimmed history, corruption). Find the good set incrementally
+    // via fork() so each candidate is checked in O(1) instead of re-importing all good blobs.
+    let goodDoc = freshDoc();
     let rest = ordered;
     for (let pass = 0; pass < 2 && rest.length; pass++) {
       const failed: typeof ordered = [];
       for (const b of rest) {
-        if (tryImport(freshDoc(), [...good.map((g) => g.bytes), b.bytes])) good = [...good, b];
+        const probe = goodDoc.fork();
+        if (tryImport(probe, [b.bytes])) goodDoc = probe;
         else failed.push(b);
       }
       if (failed.length === rest.length) {
@@ -386,9 +387,8 @@ export class ScopeStore {
       }
       rest = failed;
     }
-    const out = freshDoc();
-    if (!tryImport(out, good.map((g) => g.bytes))) this.problems.push({ problem: "store files could not be imported together" });
-    return { doc: out, stranded: rest.map((b) => b.name) };
+    goodDoc.setRecordTimestamp(true);
+    return { doc: goodDoc, stranded: rest.map((b) => b.name) };
   }
 
   private importJournal(): void {
@@ -593,18 +593,31 @@ export class ScopeStore {
     const covered = new Set<string>();
     for (const m of live) for (const c of m.covers) covered.add(c);
     const fresh: Array<{ name: string; bytes: Uint8Array; snapshot: boolean }> = [];
+    let pointers = 0;
     for (const m of live) {
       const key = `snapshots/${m.epoch}.loro`;
       if (this.seen.has(key)) continue;
       const bytes = this.readBlob(join(this.snapshotsDir, `${m.epoch}.loro`), this.opts.cfg.storage.maxSnapshotBytes, key);
-      if (bytes && !isLfsPointer(bytes)) fresh.push({ name: key, bytes, snapshot: true });
+      if (!bytes) continue;
+      if (isLfsPointer(bytes)) pointers++;
+      else fresh.push({ name: key, bytes, snapshot: true });
     }
     const names = listFiles(this.updatesDir, ".loro");
     for (const name of names) {
       const key = `updates/${name}`;
       if (this.seen.has(key) || covered.has(name)) continue;
       const bytes = this.readBlob(join(this.updatesDir, name), this.opts.cfg.storage.maxUpdateBytes, key);
-      if (bytes && !isLfsPointer(bytes)) fresh.push({ name: key, bytes, snapshot: false });
+      if (!bytes) continue;
+      if (isLfsPointer(bytes)) pointers++;
+      else fresh.push({ name: key, bytes, snapshot: false });
+    }
+    if (pointers > 0) {
+      if (this.tryLfsPull()) {
+        this.reload();
+        return true;
+      }
+      const msg = `${pointers} newly pulled store file(s) are Git LFS pointers: install git-lfs, then run \`git lfs pull\``;
+      if (!this.problems.some((p) => p.problem === msg)) this.problems.push({ problem: msg });
     }
     // a branch switch or revert can also take files away: then the state must be rebuilt
     const present = new Set([...live.map((m) => `snapshots/${m.epoch}.loro`), ...names.map((n) => `updates/${n}`)]);

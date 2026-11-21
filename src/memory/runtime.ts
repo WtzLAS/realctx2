@@ -9,7 +9,7 @@ import type { Telemetry } from "../core/telemetry.ts";
 import type { AuxSessionRunner, Clock, DecisionClient, EmbeddingClient, ScopeName } from "../core/types.ts";
 import { TurnIndex } from "../storage/turnindex.ts";
 import { errMsg } from "../util/errors.ts";
-import { appendJsonl, ensureDir, listFiles, readJson, removeDir, removeFile, tryLock, writeJson } from "../util/fs.ts";
+import { appendJsonl, ensureDir, listFiles, readJson, removeDir, removeFile, tryLock, withLockSync, writeJson } from "../util/fs.ts";
 import { median } from "../util/text.ts";
 import { SessionAccounting } from "./accounting.ts";
 import { PathDelivery } from "./delivery.ts";
@@ -162,13 +162,21 @@ export class MemoryRuntime implements MemoryServices {
     return f ? readJson<SessionEntry[]>(f, []) : [];
   }
 
+  private withSessionsLock<T>(fn: () => T): T {
+    const key = this.project.projectKey ?? "global";
+    return withLockSync(this.layout.lockFile(`sessions-${key}`), fn, { timeoutMs: 5000 });
+  }
+
   registerSession(entry: SessionEntry): void {
     const f = this.sessionsFile;
     if (!f) return;
-    const all = this.sessions().filter((s) => s.id !== entry.id);
-    const prev = this.sessions().find((s) => s.id === entry.id);
-    all.push({ ...prev, ...entry, startedAt: prev?.startedAt ?? entry.startedAt });
-    writeJson(f, all.slice(-500));
+    this.withSessionsLock(() => {
+      const existing = this.sessions();
+      const prev = existing.find((s) => s.id === entry.id);
+      const all = existing.filter((s) => s.id !== entry.id);
+      all.push({ ...prev, ...entry, startedAt: prev?.startedAt ?? entry.startedAt });
+      writeJson(f, all.slice(-500));
+    });
   }
 
   /**
@@ -180,11 +188,16 @@ export class MemoryRuntime implements MemoryServices {
   dropGoneSessions(exists: (file: string) => boolean): string[] {
     const f = this.sessionsFile;
     if (!f) return [];
-    const all = this.sessions();
-    const dayAgo = this.clock().getTime() - 86_400_000;
-    const over = (s: SessionEntry) => !!s.endedAt || !(Date.parse(s.startedAt) > dayAgo);
-    const gone = all.filter((s) => s.file && s.id !== this.sessionId && over(s) && !exists(s.file));
-    if (!gone.length) return [];
+    const gone = this.withSessionsLock(() => {
+      const all = this.sessions();
+      const dayAgo = this.clock().getTime() - 86_400_000;
+      const over = (s: SessionEntry) => !!s.endedAt || !(Date.parse(s.startedAt) > dayAgo);
+      const dropped = all.filter((s) => s.file && s.id !== this.sessionId && over(s) && !exists(s.file));
+      if (!dropped.length) return [];
+      const droppedIds = new Set(dropped.map((s) => s.id));
+      writeJson(f, all.filter((s) => !droppedIds.has(s.id)));
+      return dropped;
+    });
     for (const s of gone) {
       try {
         this.turns?.removeSession(s.id);
@@ -193,19 +206,20 @@ export class MemoryRuntime implements MemoryServices {
         this.telemetry?.event("sessions.drop_failed", { error: errMsg(e) });
       }
     }
-    writeJson(f, all.filter((s) => !gone.includes(s)));
     return gone.map((s) => s.id);
   }
 
   endSession(id: string, requests: number): void {
     const f = this.sessionsFile;
     if (!f) return;
-    const all = this.sessions();
-    const s = all.find((x) => x.id === id);
-    if (!s) return;
-    s.endedAt = this.clock().toISOString();
-    s.requests = Math.max(s.requests ?? 0, requests);
-    writeJson(f, all);
+    this.withSessionsLock(() => {
+      const all = this.sessions();
+      const s = all.find((x) => x.id === id);
+      if (!s) return;
+      s.endedAt = this.clock().toISOString();
+      s.requests = Math.max(s.requests ?? 0, requests);
+      writeJson(f, all);
+    });
   }
 
   /**
@@ -315,12 +329,17 @@ export class MemoryRuntime implements MemoryServices {
     if (warm) Object.assign(report, warm);
     report.reverify = await step("reverify", () => this.reverifier.run({ signal: opts.signal }));
     report.resliced = (await step("reslice", () => this.instructions.resliceImports(opts.signal))) ?? 0;
+    const maintainJobs: QueuedJob[] = [];
     for (const job of this.queued()) {
       if (aborted()) break;
       if (job.kind === "auto-memory-import" && this.harness === "claude-code") {
         report.autoMemory = await step("auto-memory", () => this.instructions.importAutoMemory(opts.signal));
         if (!aborted()) this.dequeue(job);
-      } else if (job.kind === "reslice-imports" || job.kind === "reverify" || job.kind === "maintain") this.dequeue(job); // covered by the steps above and below
+      } else if (job.kind === "reslice-imports" || job.kind === "reverify") {
+        if (!aborted()) this.dequeue(job); // covered by the steps above
+      } else if (job.kind === "maintain") {
+        maintainJobs.push(job);
+      }
     }
     // one scope at a time; a scope another process is maintaining is skipped (one worker per scope)
     for (const scope of opts.scopes ?? this.graph.visible()) {
@@ -342,6 +361,7 @@ export class MemoryRuntime implements MemoryServices {
         lock.release();
       }
     }
+    if (!aborted()) for (const job of maintainJobs) this.dequeue(job);
     if (aborted()) report.stopped = "aborted";
     this.lastIdle = report;
     return report;

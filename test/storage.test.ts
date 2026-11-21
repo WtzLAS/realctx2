@@ -283,6 +283,16 @@ describe("store files", () => {
     expect(again.unloaded).toBe(true);
     expect(again.unloadedReason).toMatch(/git lfs pull/);
     expect(again.flush().kind).toBe("none");
+
+    // pulling an LFS pointer mid-session during refresh() also records a problem instead of silently skipping
+    const dir2 = join(tmp(), "store-refresh-lfs");
+    const live = openStore(dir2);
+    live.sd.insertNode(node({ id: "bbbbbbbb" }));
+    live.commit();
+    live.flush();
+    writeFileSync(join(dir2, "updates", "20261121T000000000Z-999-deadbeef.loro"), "version https://git-lfs.github.com/spec/v1\noid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\nsize 12345\n");
+    expect(live.refresh()).toBe(false);
+    expect(live.problems.some((p) => /git lfs pull/.test(p.problem))).toBe(true);
   });
 
   it("reuses a released PeerID only when the document still contains its operations", () => {

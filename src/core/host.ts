@@ -70,8 +70,8 @@ export class Host {
   readonly overrides: ProjectOverrideReport;
   readonly telemetry: Telemetry;
   readonly decision: DecisionClient;
-  readonly late: EmbeddingClient<"multivector"> | null;
-  readonly dense: EmbeddingClient<"dense"> | null;
+  late: EmbeddingClient<"multivector"> | null;
+  dense: EmbeddingClient<"dense"> | null;
   readonly memory: MemoryRuntime | null;
   readonly engine: ContextEngine;
   readonly blobs: BlobStore;
@@ -90,6 +90,7 @@ export class Host {
   http: HttpDecisionClient | null = null;
   memoryError: string | null = null;
   private readonly fetchImpl?: FetchLike;
+  private readonly customEmbeddings: boolean;
   private readonly onDecisionConfig?: (cfg: DecisionProviderConfig | null) => void;
   private configMtime = 0;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -125,7 +126,8 @@ export class Host {
       this.http = this.makeHttp(this.cfg.providers.decision);
       this.decision = new ResilientDecisionClient(this.http, aux ? new EmulatedDecisionClient(aux, this.cfg.providers.aux.emulateTimeoutMs) : null);
     }
-    const emb = o.late !== undefined || o.dense !== undefined ? { late: o.late ?? null, dense: o.dense ?? null } : createEmbeddingClients(this.cfg.providers.embedding, { fetch: o.fetch, telemetry: this.telemetry });
+    this.customEmbeddings = o.late !== undefined || o.dense !== undefined;
+    const emb = this.customEmbeddings ? { late: o.late ?? null, dense: o.dense ?? null } : createEmbeddingClients(this.cfg.providers.embedding, { fetch: o.fetch, telemetry: this.telemetry });
     this.late = emb.late;
     this.dense = emb.dense;
 
@@ -217,18 +219,30 @@ export class Host {
   reloadConfig(): void {
     const loaded = loadConfig(this.layout, this.project.sharedDir, this.trusted);
     const prevDecision = this.cfg.providers.decision;
+    const prevDecisionBudget = this.cfg.budgets.dailyDecisionTokens;
+    const prevEmbedding = this.cfg.providers.embedding;
     this.configMtime = this.mtime();
     for (const k of Object.keys(loaded.config) as Array<keyof Config>) {
       (this.cfg as unknown as Record<string, unknown>)[k] = loaded.config[k];
     }
     this.overrides.applied.splice(0, this.overrides.applied.length, ...loaded.overrides.applied);
     this.overrides.ignored.splice(0, this.overrides.ignored.length, ...loaded.overrides.ignored);
-    if (!sameJson(prevDecision, this.cfg.providers.decision)) {
+    this.aux()?.resetCooldowns?.();
+    const decisionChanged = !sameJson(prevDecision, this.cfg.providers.decision);
+    if (decisionChanged || prevDecisionBudget !== this.cfg.budgets.dailyDecisionTokens) {
       if (this.decision instanceof ResilientDecisionClient) {
         this.http = this.makeHttp(this.cfg.providers.decision);
         this.decision.setPrimary(this.http);
       }
-      this.onDecisionConfig?.(this.cfg.providers.decision);
+      if (decisionChanged) this.onDecisionConfig?.(this.cfg.providers.decision);
+    }
+    if (!this.customEmbeddings && !sameJson(prevEmbedding, this.cfg.providers.embedding)) {
+      const emb = createEmbeddingClients(this.cfg.providers.embedding, { fetch: this.fetchImpl, telemetry: this.telemetry });
+      this.late = emb.late;
+      this.dense = emb.dense;
+      this.probes = {};
+      this.memory?.sim.setClients(this.late, this.dense);
+      void this.probe();
     }
     this.sectionCache = null;
     this.updateStatus();
@@ -348,7 +362,12 @@ export class Host {
     this.noteInput();
     const abort = new AbortController();
     this.idleAbort = abort;
-    const first = this.engine.onIdle(abort.signal).catch((e) => this.telemetry.event("idle.engine_failed", { error: errMsg(e) }));
+    // chain onto any still-unwinding aborted idle pass so two runs never overlap
+    const prev = this.idleRunning ?? Promise.resolve();
+    const first = prev
+      .catch(() => undefined)
+      .then(() => (abort.signal.aborted || this.closed ? undefined : this.engine.onIdle(abort.signal)))
+      .catch((e) => this.telemetry.event("idle.engine_failed", { error: errMsg(e) }));
     this.idleRunning = first.then(() => undefined);
     const wait = Math.max(0, this.cfg.maintenance.idleMinutes) * 60_000;
     this.idleTimer = setTimeout(() => {

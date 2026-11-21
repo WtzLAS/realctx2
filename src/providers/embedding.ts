@@ -7,6 +7,7 @@ import type { EmbeddingProviderConfig } from "../core/config.ts";
 import { buildAuthHeaders } from "../core/config.ts";
 import type { Telemetry } from "../core/telemetry.ts";
 import type { DenseVector, EmbeddingClient, TokenMatrix } from "../core/types.ts";
+import { sleep } from "../util/async.ts";
 import { errMsg } from "../util/errors.ts";
 import { clipTokens, estimateTokens, sha256 } from "../util/text.ts";
 import { CircuitBreaker, extractHttpError, type FetchLike } from "./decision.ts";
@@ -78,7 +79,10 @@ abstract class BaseClient {
     let lastErr = "";
     const attempts = 1 + this.retries;
     for (let attempt = 0; attempt < attempts; attempt++) {
-      if (attempt > 0) await new Promise((r) => setTimeout(r, 150 + Math.random() * 350));
+      if (attempt > 0) {
+        await sleep(150 + Math.random() * 350, signal);
+        if (signal?.aborted) throw new Error("aborted");
+      }
       const timeout = AbortSignal.timeout(this.timeoutMs);
       try {
         const res = await this.fetchImpl(this.config.url, { method: "POST", headers, body: payload, signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
@@ -189,18 +193,21 @@ export class MultiVectorEmbeddingClient extends BaseClient implements EmbeddingC
         if (typeof m[0] === "number") throw this.shape('expected a token matrix but got a single vector (set kind: "dense", or serve the model with the token_embed task)');
         const tokens = Array.isArray(item.tokens) && item.tokens.length === m.length ? (item.tokens as unknown[]) : null;
         const rows: Float32Array[] = [];
+        const allRows: Float32Array[] = [];
         for (let r = 0; r < m.length; r++) {
           const row = m[r];
           if (!Array.isArray(row) || typeof row[0] !== "number") throw this.shape(`token row ${r} is not a vector`);
           if (this.config.dims && row.length !== this.config.dims) throw this.shape(`expected token vectors of width ${this.config.dims}, got ${row.length}`);
           if (this.seenDims && row.length !== this.seenDims) throw this.shape(`token vector width changed from ${this.seenDims} to ${row.length}`);
           this.seenDims = row.length;
+          const vec = l2normalize(Float32Array.from(row as number[]));
+          allRows.push(vec);
           // punctuation rows are dropped for documents when the server reports the tokens
           if (role === "document" && tokens && typeof tokens[r] === "string" && PUNCT_ONLY.test(tokens[r] as string)) continue;
-          rows.push(l2normalize(Float32Array.from(row as number[])));
+          rows.push(vec);
         }
-        if (rows.length === 0) throw this.shape("every token row was dropped");
-        out.push(rows);
+        // a punctuation-only document is valid input: keep all rows instead of disabling the provider
+        out.push(rows.length > 0 ? rows : allRows);
       }
     }
     return out;

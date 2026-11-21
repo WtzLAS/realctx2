@@ -194,11 +194,14 @@ export class ClaudeServer {
     const cwd = input.cwd ?? this.o.cwd ?? process.cwd();
     const log = new SessionLog(this.layout, id);
     const source = input.source ?? "resume";
+    let parentBlobDirs: string[] | undefined;
     if (source !== "clear" && log.exists()) log.load();
     else if (source === "fork" && input.transcript_path) {
       // the parent is known when the forked transcript begins with its entries
-      const parent = this.reader.read(input.transcript_path).sessionIds.find((sid) => sid !== id && new SessionLog(this.layout, sid).exists());
+      const parents = this.reader.read(input.transcript_path).sessionIds.filter((sid) => sid !== id);
+      const parent = parents.find((sid) => new SessionLog(this.layout, sid).exists());
       if (parent) log.copyFrom(new SessionLog(this.layout, parent));
+      if (parents.length) parentBlobDirs = parents.map((sid) => this.layout.blobDir(sid));
     }
     let host: Host | null = null;
     const adapter = new ClaudeAdapter(log, {
@@ -227,6 +230,7 @@ export class ClaudeServer {
       cwd,
       sessionId: id,
       sessionFile: input.transcript_path,
+      parentBlobDirs,
       // Claude Code asks the user to trust a folder before it runs there
       trusted: this.env.REALCTX2_UNTRUSTED !== "1",
       layout: this.layout,
@@ -241,7 +245,7 @@ export class ClaudeServer {
     this.afterStart(session, source);
     if (this.registryFile) {
       const reg = readJson<Record<string, unknown>>(this.registryFile, {});
-      writeJson(this.registryFile, { ...reg, sessionId: id, cwd });
+      writeJson(this.registryFile, { ...reg, sessionId: id, cwd }, 0o600);
     }
     return session;
   }

@@ -164,7 +164,7 @@ export class Lifecycle {
     const centrality = g.centrality(scope);
     const maxAccess = Math.max(0, ...active.map((n) => accessScore(n.counters)));
     const turns = sd.turns();
-    const concepts = this.soleEvidenceMap(scope);
+    const concepts = this.conceptEvidence(scope);
     const scored = short.map((n) => ({ n, v: strengthAt(n, now), R: retention(n, { now, maxAccess, centrality: centrality.get(n.id) ?? 0, scopeTurns: turns }) }));
 
     const guarded = (n: MemoryNode): boolean => {
@@ -178,7 +178,7 @@ export class Lifecycle {
       return false;
     };
     const forget = (n: MemoryNode, reason: string) => {
-      const concept = concepts.get(n.id);
+      const concept = concepts.take(n.id);
       if (concept) {
         // the only verified evidence of an active concept is archived under it instead
         sd.patchNode(n.id, { status: "archived", statusReason: `forgetting: kept under m:${concept}`, statusAt: nowIso });
@@ -220,8 +220,11 @@ export class Lifecycle {
     }
   }
 
-  /** member id → concept id, for members that are the only verified evidence of an active concept. */
-  private soleEvidenceMap(scope: ScopeName): Map<string, string> {
+  /**
+   * Track active verified members of unverified active concepts dynamically during a forgetting
+   * pass so removing multiple members in one pass still archives the last remaining evidence.
+   */
+  private conceptEvidence(scope: ScopeName): { take(memberId: string): string | undefined } {
     const sd = this.s.graph.sd(scope);
     const members = new Map<string, string[]>();
     for (const e of sd.allEdges()) {
@@ -230,17 +233,39 @@ export class Lifecycle {
       if (list) list.push(e.dst);
       else members.set(e.src, [e.dst]);
     }
-    const out = new Map<string, string>();
+    const remaining = new Map<string, Set<string>>();
+    const byMember = new Map<string, string[]>();
     for (const [conceptId, ids] of members) {
       const concept = sd.getNode(conceptId);
-      if (!concept || concept.status !== "active") continue;
-      const verified = ids.filter((id) => {
-        const m = sd.getNode(id);
-        return m && m.status === "active" && m.evidence.some((e) => e.verified);
-      });
-      if (verified.length === 1 && !concept.evidence.some((e) => e.verified)) out.set(verified[0]!, conceptId);
+      if (!concept || concept.status !== "active" || concept.evidence.some((e) => e.verified)) continue;
+      const verified = new Set(
+        ids.filter((id) => {
+          const m = sd.getNode(id);
+          return m && m.status === "active" && m.evidence.some((e) => e.verified);
+        }),
+      );
+      if (!verified.size) continue;
+      remaining.set(conceptId, verified);
+      for (const id of verified) {
+        const list = byMember.get(id);
+        if (list) list.push(conceptId);
+        else byMember.set(id, [conceptId]);
+      }
     }
-    return out;
+    return {
+      take(memberId: string): string | undefined {
+        const list = byMember.get(memberId);
+        if (!list) return undefined;
+        let sole: string | undefined;
+        for (const conceptId of list) {
+          const set = remaining.get(conceptId);
+          if (!set?.has(memberId)) continue;
+          if (set.size === 1) sole ??= conceptId;
+          set.delete(memberId);
+        }
+        return sole;
+      },
+    };
   }
 
   // ───────────── explicit forgetting (§6.5.6)

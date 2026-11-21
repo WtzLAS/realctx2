@@ -387,6 +387,12 @@ describe("just-in-time delivery (§6.8.5, §6.10.2)", () => {
       expect(cmd(c)?.refs.map((r) => r.node.id), c).toEqual([t.never.node.id]);
     }
     expect(cmd("cat packages/api/src/db/generated/client.ts")).toBeNull();
+    // memories flagged as conflicting with an ingested instruction do not trigger the pre-edit gate
+    t.w.graph.sd("personal").patchNode(t.never.node.id, { flags: ["conflicts-instruction"] });
+    t.w.graph.commit("personal");
+    expect(t.d.gate({ action: "edit", paths: ["packages/api/src/db/generated/client.ts"] }, ctx())).toBeNull();
+    t.w.graph.sd("personal").patchNode(t.never.node.id, { flags: [] });
+    t.w.graph.commit("personal");
     // switch: with the gate off, immediate memories are treated as hints
     t.w.cfg.urgency.gate = "off";
     expect(cmd("pnpm prisma migrate reset")).toBeNull();

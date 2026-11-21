@@ -219,3 +219,39 @@ export function fingerprintSimilarity(a: string, b: string): number {
   for (const x of sa) if (sb.has(x)) inter++;
   return inter / Math.max(1, Math.min(sa.size, sb.size));
 }
+
+/** Snapshot `git status --porcelain=v2 --untracked-files=all` lines for change detection. */
+export function gitStatusSnapshot(root: string | null): Set<string> | null {
+  if (!root) return null;
+  const res = runSync("git", ["status", "--porcelain=v2", "--untracked-files=all"], root, 10_000);
+  return res.code === 0 ? new Set(res.stdout.split("\n").filter(Boolean)) : null;
+}
+
+/** Extract the file path from a `git status --porcelain=v2` line, preserving spaces in filenames. */
+export function porcelainV2Path(line: string): string {
+  if (line.startsWith("? ") || line.startsWith("! ")) return line.slice(2);
+  // 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path> (8 space-separated fields before path)
+  // 2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path><sep><origPath> (9 fields before path)
+  // u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path> (10 fields before path)
+  const fields = line.startsWith("1 ") ? 8 : line.startsWith("2 ") ? 9 : line.startsWith("u ") ? 10 : 0;
+  if (fields > 0) {
+    let idx = 0;
+    for (let f = 0; f < fields; f++) {
+      const next = line.indexOf(" ", idx);
+      if (next < 0) return line;
+      idx = next + 1;
+    }
+    const rest = line.slice(idx);
+    if (line.startsWith("2 ")) {
+      const tab = rest.indexOf("\t");
+      return tab >= 0 ? rest.slice(0, tab) : rest;
+    }
+    return rest;
+  }
+  return line;
+}
+
+/** Paths whose porcelain v2 status lines appeared or changed between `before` and `after`. */
+export function diffGitStatusFiles(before: Set<string>, after: Set<string>): string[] {
+  return [...after].filter((l) => !before.has(l)).map(porcelainV2Path);
+}

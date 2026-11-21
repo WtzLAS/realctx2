@@ -1217,11 +1217,22 @@ export class ContextEngine {
       if (job.after && !job.after.committed) continue;
       job.promise = this.track(this.runPrecip(job, signal)).then(
         (plan) => {
+          if (!plan && signal?.aborted) {
+            // aborted during idle: leave queued so the next idle or turn can retry it
+            job.promise = null;
+            job.done = false;
+            return null;
+          }
           job.plan = plan;
           job.done = true;
           return plan;
         },
         (e) => {
+          if (signal?.aborted) {
+            job.promise = null;
+            job.done = false;
+            return null;
+          }
           job.done = true;
           this.telemetry?.event("precip.failed", { error: errMsg(e) });
           return null;
@@ -1242,10 +1253,12 @@ export class ContextEngine {
     // attribution runs in the same pass, on the region before replacement
     try {
       const res = await this.attributor.attribute({ deliveries: deliveries.filter((d) => d.intentId === intent.id), entries, from: region.from, to: region.to, intent, outcome, state, actions: this.actions.get(intent.id) ?? [], signal });
+      if (signal?.aborted) return null;
       for (const r of res.records) this.emit(r);
       for (const rec of res.updatedRecords) this.emit({ type: "realctx2.consolidation", record: rec });
       this.actions.delete(intent.id);
     } catch (e) {
+      if (signal?.aborted) return null;
       this.telemetry?.event("attribution.failed", { error: errMsg(e) });
     }
     if (job.attributionOnly) return null;

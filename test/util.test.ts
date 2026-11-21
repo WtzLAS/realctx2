@@ -2,9 +2,10 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
+import { BlobStore, paginate } from "../src/context/archive.ts";
 import { catalogContextWindow, warmModelCatalog } from "../src/core/catalog.ts";
 import { applyProjectOverrides, DEFAULT_CONFIG, deepMerge, diffConfig, effectiveCacheTtlSeconds, effectiveMaxWindow, isContextEngineEnabled, scaledContext } from "../src/core/config.ts";
-import { raceTimeout } from "../src/util/async.ts";
+import { raceTimeout, sleep } from "../src/util/async.ts";
 import { errMsg } from "../src/util/errors.ts";
 import { takeOverStale, tryLock, writeFileAtomic } from "../src/util/fs.ts";
 import { applyIgnoreFix, checkSharedIgnored, describeIgnoreProblem } from "../src/util/gitignore.ts";
@@ -14,7 +15,7 @@ import { imageCostFor, imageSize, imageTokens } from "../src/util/images.ts";
 import { scanSecrets } from "../src/util/secrets.ts";
 import { analyzeCommand, normalizeCommandParts, parseShell } from "../src/util/shell.ts";
 import { estimateTokens, extractPathTokens, extractSignature, headTail, ngramOverlap, sanitize, trigramJaccard, verifyQuote } from "../src/util/text.ts";
-import { blobHash, Git } from "../src/util/git.ts";
+import { blobHash, diffGitStatusFiles, Git, porcelainV2Path } from "../src/util/git.ts";
 import { cleanupTmp, commitAll, initRepo, tmp, write } from "./helpers/fixtures.ts";
 
 afterAll(cleanupTmp);
@@ -116,6 +117,10 @@ describe("shell parser", () => {
     expect(analyzeCommand("sed -n '1,5p' src/db/schema.ts", opts).writes).toEqual([]);
     expect(analyzeCommand("git rm --cached secret.env", opts).deletes).toEqual([]);
     expect(analyzeCommand("git checkout src/a.ts", opts).writes).toEqual(["/repo/src/a.ts"]);
+    // git -C scopes its directory to that git invocation only and does not leak to following commands
+    const scoped = analyzeCommand("git -C /other/repo status && rm src/app/[id]/page.tsx", opts);
+    expect(scoped.deletes).toEqual(["/repo/src/app/[id]/page.tsx"]);
+    expect(scoped.touched).toContain("/repo/src/app/[id]/page.tsx");
   });
 });
 
@@ -354,6 +359,46 @@ describe("async and error helpers", () => {
     expect(errMsg("plain")).toBe("plain");
     expect(errMsg(undefined)).toBe("undefined");
     expect(errMsg(null)).toBe("null");
+  });
+
+  it("sleep returns immediately on a pre-aborted signal and clears its timer on abort", async () => {
+    vi.useFakeTimers();
+    try {
+      const done = new AbortController();
+      done.abort();
+      await sleep(10_000, done.signal);
+      expect(vi.getTimerCount()).toBe(0);
+      const ac = new AbortController();
+      const p = sleep(10_000, ac.signal);
+      expect(vi.getTimerCount()).toBe(1);
+      ac.abort();
+      await p;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("porcelainV2Path preserves filenames containing spaces and renames", () => {
+    expect(porcelainV2Path("? dir/my file.txt")).toBe("dir/my file.txt");
+    expect(porcelainV2Path("1 .M N... 100644 100644 100644 abcdef0 abcdef0 src/my file.ts")).toBe("src/my file.ts");
+    expect(porcelainV2Path("2 R. N... 100644 100644 100644 abcdef0 abcdef0 R100 src/new name.ts\tsrc/old name.ts")).toBe("src/new name.ts");
+    expect(diffGitStatusFiles(new Set(), new Set(["? my file.txt"]))).toEqual(["my file.txt"]);
+  });
+
+  it("BlobStore rejects traversal IDs and invalid SHAs, and paginate respects CJK token budgets", () => {
+    const dir = tmp("blobs-");
+    const blobs = new BlobStore(dir);
+    expect(blobs.meta("o:../../etc/passwd")).toBeNull();
+    expect(blobs.read("o:../../etc/passwd")).toBeNull();
+    writeFileSync(join(dir, "abcd1234.json"), JSON.stringify({ id: "o:abcd1234", sha: "../../etc/passwd", tokens: 1, bytes: 1, at: "2026-11-20T00:00:00Z" }));
+    expect(blobs.meta("o:abcd1234")).toBeNull();
+    expect(blobs.read("o:abcd1234")).toBeNull();
+    // 100 CJK characters = 100 estimated tokens; at 30 tokens/page this must split into multiple pages
+    const cjk = "测试数据记录".repeat(20);
+    const pages = paginate(cjk, 30);
+    expect(pages.length).toBeGreaterThan(3);
+    for (const p of pages) expect(estimateTokens(p)).toBeLessThanOrEqual(30);
   });
 });
 

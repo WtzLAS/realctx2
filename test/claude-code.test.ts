@@ -520,6 +520,26 @@ describe("aux sessions through the claude CLI (§4.6.4)", () => {
       await new Promise<void>((resolve) => srv.close(() => resolve()));
     }
   });
+
+  it("keeps 0o600 permissions on the server registry after session open and recalls parent blobs on fork", async () => {
+    const r = await rig();
+    await r.hook("SessionStart", { source: "startup", session_id: "cc-parent" });
+    if (process.platform !== "win32") {
+      const regFile = join(r.home, "claude-code", "run", `server-${process.pid}.json`);
+      expect(statSync(regFile).mode & 0o777).toBe(0o600);
+    }
+    const blob = r.server.session!.host.blobs.put("parent oversized output payload", { tool: "Bash", toolCallId: "t1", at: "2026-11-20T00:00:00.000Z" });
+    const forkTranscript = join(r.repo, "fork-transcript.jsonl");
+    writeFileSync(
+      forkTranscript,
+      `${JSON.stringify({ type: "user", uuid: "u1", sessionId: "cc-parent", timestamp: "2026-11-20T00:00:00.000Z", message: { role: "user", content: "hi" } })}\n`,
+    );
+    await r.hook("SessionStart", { source: "fork", session_id: "cc-fork", transcript_path: forkTranscript });
+    const recalled = await r.mcp("tools/call", { name: "recall", arguments: { id: blob.id } });
+    expect(recalled.isError).not.toBe(true);
+    expect(recalled.content[0].text).toContain("parent oversized output payload");
+    await r.close();
+  });
 });
 
 describe("post-compaction injection", () => {

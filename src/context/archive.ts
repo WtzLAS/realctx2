@@ -8,11 +8,13 @@ import type { ConsolidationRecord, EntryView } from "../core/types.ts";
 import { ensureDir, listFiles, readJson, writeFileAtomic, writeJson } from "../util/fs.ts";
 import { stableId8 } from "../util/ids.ts";
 import { estimateTokens, headTail, sha256 } from "../util/text.ts";
-import { rawTurnId } from "../storage/turnindex.ts";
+import { chunkText, rawTurnId } from "../storage/turnindex.ts";
 import { renderEntry } from "./render.ts";
 import type { SessionState } from "./state.ts";
 
 export const PAGE_TOKENS = 4000;
+const BLOB_ID = /^o:[0-9a-z]{8}$/i;
+const SHA256_HEX = /^[0-9a-f]{64}$/i;
 
 export interface BlobMeta {
   id: string; // "o:…"
@@ -54,20 +56,22 @@ export class BlobStore {
 
   meta(id: string): BlobMeta | null {
     const key = id.replace(/^\[|\]$/g, "");
+    if (!BLOB_ID.test(key)) return null;
     if (!this.dir && !this.fallbackDirs.length) return this.mem.get(key)?.meta ?? null;
     for (const d of this.readDirs()) {
       const m = readJson<BlobMeta | null>(join(d, `${key.slice(2)}.json`), null);
-      if (m) return m;
+      if (m && typeof m.sha === "string" && SHA256_HEX.test(m.sha)) return m;
     }
     return this.mem.get(key)?.meta ?? null;
   }
 
   read(id: string): string | null {
     const key = id.replace(/^\[|\]$/g, "");
+    if (!BLOB_ID.test(key)) return null;
     if (!this.dir && !this.fallbackDirs.length) return this.mem.get(key)?.text ?? null;
     for (const d of this.readDirs()) {
       const m = readJson<BlobMeta | null>(join(d, `${key.slice(2)}.json`), null);
-      if (!m) continue;
+      if (!m || typeof m.sha !== "string" || !SHA256_HEX.test(m.sha)) continue;
       try {
         return readFileSync(join(d, m.sha), "utf8");
       } catch {
@@ -107,29 +111,9 @@ export function guardToolResult(text: string, maxTokens: number, blobs: BlobStor
   return { text: `${body}\n[${blob.id} · full output: ${tokens} tokens · recall("${blob.id}", page) opens it]`, blob };
 }
 
-/** Split text into pages of at most `pageTokens`, on line boundaries where possible. */
+/** Split text into pages of at most `pageTokens`, on line boundaries where possible (CJK-aware). */
 export function paginate(text: string, pageTokens = PAGE_TOKENS): string[] {
-  if (estimateTokens(text) <= pageTokens) return [text];
-  const maxChars = pageTokens * 4;
-  const pages: string[] = [];
-  let cur = "";
-  for (const line of text.split("\n")) {
-    let rest = line;
-    while (rest.length > maxChars) {
-      if (cur) {
-        pages.push(cur);
-        cur = "";
-      }
-      pages.push(rest.slice(0, maxChars));
-      rest = rest.slice(maxChars);
-    }
-    if (cur.length + rest.length + 1 > maxChars) {
-      pages.push(cur);
-      cur = rest;
-    } else cur = cur ? `${cur}\n${rest}` : rest;
-  }
-  if (cur) pages.push(cur);
-  return pages;
+  return chunkText(text, pageTokens);
 }
 
 /** Pick the page that best matches `lookingFor` (most term hits), else the requested page. */

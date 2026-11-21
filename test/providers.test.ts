@@ -241,6 +241,15 @@ describe("embedding clients", () => {
     expect(wrongWidth.healthy()).toBe(false);
     const dense = new MultiVectorEmbeddingClient({ url: "http://e", model: "colbert" }, { fetch: fakeFetch(() => ({ json: { data: [{ index: 0, embedding: [1, 2, 3] }] } })).fetch });
     await expect(dense.embed(["x"], "document")).rejects.toThrow(/token matrix/);
+
+    // punctuation-only document with server-reported tokens falls back to unfiltered rows instead of disabling
+    const punct = new MultiVectorEmbeddingClient(
+      { url: "http://e", model: "colbert", dims: 2 },
+      { fetch: fakeFetch(() => ({ json: { data: [{ index: 0, embedding: [[1, 0], [0, 1]], tokens: ["---", "..."] }] } })).fetch },
+    );
+    const [m] = await punct.embed(["--- ..."], "document");
+    expect(m!.length).toBe(2);
+    expect(punct.healthy()).toBe(true);
   });
 });
 

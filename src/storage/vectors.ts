@@ -45,6 +45,7 @@ export class VectorTables {
   private denseCache = new Map<string, Map<string, Float32Array>>();
   private fdeCache = new Map<string, Map<string, Uint8Array>>();
   private tokenCache = new Map<string, Map<string, PackedMatrix>>();
+  private tokenCacheSize = new Map<string, number>();
   /** Token matrices are cached in memory only below this many bytes per model. */
   tokenCacheBytes = 64 * 1024 * 1024;
   fdeDims: number;
@@ -66,6 +67,50 @@ export class VectorTables {
     this.denseCache.delete(model);
     this.fdeCache.delete(model);
     this.tokenCache.delete(model);
+    this.tokenCacheSize.delete(model);
+  }
+
+  private cacheToken(model: string, id: string, packed: PackedMatrix): void {
+    const m = this.tokenCache.get(model);
+    if (!m) return;
+    const prev = m.get(id)?.data.byteLength ?? 0;
+    const nextSize = (this.tokenCacheSize.get(model) ?? 0) - prev + packed.data.byteLength;
+    if (nextSize > this.tokenCacheBytes) {
+      this.tokenCache.delete(model);
+      this.tokenCacheSize.delete(model);
+      return;
+    }
+    m.set(id, packed);
+    this.tokenCacheSize.set(model, nextSize);
+  }
+
+  private uncacheToken(id: string): void {
+    for (const [model, m] of this.tokenCache) {
+      const prev = m.get(id);
+      if (!prev) continue;
+      m.delete(id);
+      this.tokenCacheSize.set(model, Math.max(0, (this.tokenCacheSize.get(model) ?? 0) - prev.data.byteLength));
+    }
+  }
+
+  /** Rebuild every FDE blob from stored token matrices (called when `fdeDims` or `fdeQuant` changes). */
+  rebuildFde(): number {
+    let n = 0;
+    this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM ${this.t}_fde`).run();
+      const rows = this.db.prepare(`SELECT id, model, quant, rows, dims, data FROM ${this.t}_tokens`).all();
+      const ins = this.db.prepare(`INSERT OR REPLACE INTO ${this.t}_fde (id, model, vec) VALUES (?, ?, ?)`);
+      for (const r of rows) {
+        const packed: PackedMatrix = { quant: String(r.quant) as Quant, rows: Number(r.rows), dims: Number(r.dims), data: blob(r.data) };
+        if (!packed.rows || !packed.dims) continue;
+        const matrix = unpackMatrix(packed);
+        const fde = packFde(encoder(packed.dims, this.fdeDims).document(matrix), this.fdeQuant);
+        ins.run(String(r.id), String(r.model), fde);
+        n++;
+      }
+    });
+    this.fdeCache.clear();
+    return n;
   }
 
   // ───────────── writes
@@ -86,7 +131,7 @@ export class VectorTables {
     const fde = packFde(encoder(packed.dims, this.fdeDims).document(matrix), this.fdeQuant);
     this.db.prepare(`INSERT OR REPLACE INTO ${this.t}_fde (id, model, vec) VALUES (?, ?, ?)`).run(id, model, fde);
     this.fdeCache.get(model)?.set(id, fde);
-    this.tokenCache.get(model)?.set(id, packed);
+    this.cacheToken(model, id, packed);
   }
 
   /** Move a stored matrix to a smaller tier (int8 → 1-bit as raw turns age, §9.2.2). */
@@ -95,7 +140,7 @@ export class VectorTables {
     if (!p || p.quant === quant) return false;
     const next = requantize(p, quant);
     this.db.prepare(`UPDATE ${this.t}_tokens SET quant = ?, data = ? WHERE id = ? AND model = ?`).run(quant, next.data, id, model);
-    this.tokenCache.get(model)?.set(id, next);
+    this.cacheToken(model, id, next);
     return true;
   }
 
@@ -103,12 +148,12 @@ export class VectorTables {
     for (const table of ["dense", "tokens", "fde"]) this.db.prepare(`DELETE FROM ${this.t}_${table} WHERE id = ?`).run(id);
     for (const m of this.denseCache.values()) m.delete(id);
     for (const m of this.fdeCache.values()) m.delete(id);
-    for (const m of this.tokenCache.values()) m.delete(id);
+    this.uncacheToken(id);
   }
 
   deleteTokens(id: string): void {
     this.db.prepare(`DELETE FROM ${this.t}_tokens WHERE id = ?`).run(id);
-    for (const m of this.tokenCache.values()) m.delete(id);
+    this.uncacheToken(id);
   }
 
   deleteFdeAndDense(id: string): void {
@@ -198,10 +243,14 @@ export class VectorTables {
     const total = Number(this.db.prepare(`SELECT COALESCE(SUM(LENGTH(data)), 0) AS n FROM ${this.t}_tokens WHERE model = ?`).get(model)?.n ?? 0);
     if (total > this.tokenCacheBytes) return null;
     const m = new Map<string, PackedMatrix>();
+    let bytes = 0;
     for (const r of this.db.prepare(`SELECT id, quant, rows, dims, data FROM ${this.t}_tokens WHERE model = ?`).all(model)) {
-      m.set(String(r.id), { quant: String(r.quant) as Quant, rows: Number(r.rows), dims: Number(r.dims), data: blob(r.data) });
+      const data = blob(r.data);
+      bytes += data.byteLength;
+      m.set(String(r.id), { quant: String(r.quant) as Quant, rows: Number(r.rows), dims: Number(r.dims), data });
     }
     this.tokenCache.set(model, m);
+    this.tokenCacheSize.set(model, bytes);
     return m;
   }
 

@@ -323,6 +323,7 @@ export interface AuxResult<T> {
 export interface AuxSessionRunner {
   run<T>(task: AuxTask<T>): Promise<AuxResult<T>>; // refuses inside an aux session (no recursion)
   available(): boolean;
+  resetCooldowns?(): void;
 }
 
 // ───────────────────────────── Decision model (§9.1.1)
