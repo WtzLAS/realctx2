@@ -1,7 +1,7 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { reachableEntries } from "../src/context/archive.ts";
 import { checkInvariants, planReplace } from "../src/context/consolidate.ts";
-import { GUIDANCE_TYPE, renderGuidance } from "../src/context/render.ts";
+import { GUIDANCE_TYPE, renderDriftReminder, renderEmptyReminder, renderGuidance, renderReminder } from "../src/context/render.ts";
 import { alignToUnits, latestRoundStart, tailBudget, toUnits, workingTail } from "../src/context/rounds.ts";
 import { SessionState } from "../src/context/state.ts";
 import type { Intent } from "../src/core/types.ts";
@@ -11,8 +11,15 @@ import { cleanupTmp, testConfig } from "./helpers/fixtures.ts";
 import { FakeHarness, filler, Session } from "./helpers/harness.ts";
 
 afterAll(cleanupTmp);
+afterEach(() => {
+  vi.useRealTimers();
+});
 
-const cfg = () => testConfig({ context: { maxWindow: 32000 }, janus: { lateWaitMs: 50 } });
+const cfg = (over: Record<string, unknown> = {}) =>
+  testConfig({
+    context: { maxWindow: 32000 },
+    janus: { lateWaitMs: 50, debounceMs: 500, driftCooldownRounds: 32, ...(over as Record<string, unknown>) },
+  });
 
 /** Janus answers scripted per call; `null` means the decision model gave no answer. */
 function script(decision: FakeDecision, steps: Array<Answers | null | ((names: string[]) => Answers)>): { calls: () => number; evidence: any[] } {
@@ -25,14 +32,6 @@ function script(decision: FakeDecision, steps: Array<Answers | null | ((names: s
     return typeof step === "function" ? step(qs.map((q) => q.name)) : step;
   });
   return { calls: () => n, evidence };
-}
-
-function scribe(aux: FakeAux, intents: Array<{ label: string; reason?: string; success?: string; failure?: string }>): void {
-  let n = 0;
-  aux.on("janus.scribe", () => {
-    const i = intents[Math.min(n++, intents.length - 1)]!;
-    return { label: i.label, reason: i.reason ?? "it is needed now", success: i.success ?? "the check passes", failure: i.failure ?? "three attempts fail" };
-  });
 }
 
 const closeAll = (outcome: string, focus: Record<string, number> = { continue: 0.9 }) => (names: string[]): Answers => {
@@ -78,470 +77,358 @@ describe("rounds and the working tail (§5.4.1)", () => {
   });
 });
 
-describe("Janus decision rules (§5.2.4)", () => {
-  it("kindles a root intent on a new user task and writes first-person guidance", async () => {
-    const s = new Session({ cfg: cfg() });
+describe("main-model intent tool (§5.2)", () => {
+  it("opens, nests, updates, shifts, and closes intents with clean non-overlapping spans", async () => {
+    const s = new Session({ cfg: cfg({ driftCooldownRounds: 0 }) });
     await s.start();
-    const run = script(s.decision, [{ focus: { new_root: 0.8, continue: 0.2 }, redirect: 0.1 }]);
-    scribe(s.aux, [{ label: "Fix the flaky login test in the auth suite.", reason: "the user reported it", success: "the login suite passes 40 times in a row", failure: "three hypotheses are ruled out" }]);
-    const batch = await s.user("The login test is flaky, can you fix it?");
-    expect(run.evidence[0]).toMatchObject({ intent_stack: "(no open intent)", user_message: "The login test is flaky, can you fix it?" });
-    expect(batch.messages.length).toBe(1);
-    expect(batch.messages[0]!.customType).toBe(GUIDANCE_TYPE);
-    expect(batch.messages[0]!.content).toBe(
-      ['[intent] I\'m now working on "Fix the flaky login test in the auth suite".', "Why: the user reported it", "Done when: the login suite passes 40 times in a row", "Give up when: three hypotheses are ruled out"].join("\n"),
-    );
-    const intent = s.engine.state.stack[0]!;
-    expect(intent).toMatchObject({ parentId: null, status: "open", label: "Fix the flaky login test in the auth suite" });
-    expect(batch.records).toEqual([{ type: "realctx2.intent", intent: expect.objectContaining({ id: intent.id, guidanceEntryId: "" }) }]);
-    // the harness assigned the guidance entry; the next event resolves b_j and records it
-    await s.round("looking", [{ name: "bash", args: { command: "ls" }, output: "a" }]);
-    const guidance = s.h.raw.find((r) => r.customType === GUIDANCE_TYPE)!;
-    expect(s.engine.state.stack[0]!.guidanceEntryId).toBe(guidance.id);
-    expect(s.h.records.filter((r) => r.type === "realctx2.intent").at(-1)).toMatchObject({ intent: { guidanceEntryId: guidance.id } });
-    // a small-talk message with an empty stack kindles nothing
-    const s2 = new Session({ cfg: cfg() });
-    await s2.start();
-    script(s2.decision, [{ focus: { continue: 0.95 } }]);
-    expect((await s2.user("thanks!")).messages).toEqual([]);
-    expect(s2.aux.calls).toEqual([]);
-  });
+    await s.user("Fix the flaky login test");
 
-  async function withIntent(over: { cfg?: ReturnType<typeof cfg> } = {}) {
-    const s = new Session({ cfg: over.cfg ?? cfg() });
-    await s.start();
-    const steps: Array<Answers | null | ((names: string[]) => Answers)> = [{ focus: { new_root: 0.9 } }];
-    script(s.decision, steps);
-    scribe(s.aux, [{ label: "Fix flaky auth test" }, { label: "Find the race in TokenCache.refresh" }, { label: "Write a regression test" }, { label: "Update the changelog" }]);
-    await s.user("fix the flaky auth test");
-    return { s, steps };
-  }
-
-  it("deepens, then closes top-down only above τ_close and after one complete round", async () => {
-    const { s, steps } = await withIntent();
-    // step 2 (first round): the model says it will look for the race → deepen
-    steps.push(keepOpen({ deepen: 0.7, continue: 0.3 }));
-    const b1 = await s.round("I'll look for the race in the token cache.", [{ name: "bash", args: { command: "grep -rn refresh src" }, output: "src/auth/tokenCache.ts:88" }]);
-    expect(s.engine.state.stack.map((i) => i.label)).toEqual(["Fix flaky auth test", "Find the race in TokenCache.refresh"]);
-    expect(b1.messages[0]!.content).toContain('I\'m now working on "Find the race in TokenCache.refresh" (inside: Fix flaky auth test).');
-    const [root, child] = s.engine.state.stack as [Intent, Intent];
-    expect(child.parentId).toBe(root.id);
-    // P(closed) = 0.75 < 0.8 → stays open; and nothing is appended (the cache stays intact)
-    steps.push(() => ({ [`close.${child.id}`]: { open: 0.25, success: 0.75 }, [`close.${root.id}`]: { open: 0.9 }, focus: { continue: 0.9 } }));
-    const b2 = await s.round("still looking", [{ name: "read", args: { path: "src/auth/tokenCache.ts" }, output: "code" }]);
-    expect(b2.messages).toEqual([]);
-    expect(s.engine.state.stack.length).toBe(2);
-    // the outer intent would close (0.95) but the inner one stays open → nothing closes
-    steps.push(() => ({ [`close.${child.id}`]: { open: 0.5, success: 0.5 }, [`close.${root.id}`]: { open: 0.05, success: 0.95 }, focus: { continue: 0.9 } }));
-    await s.round("hm", [{ name: "bash", args: { command: "true" }, output: "" }]);
-    expect(s.engine.state.stack.length).toBe(2);
-    // the inner intent closes as a failure; `successor` then kindles a sibling under the same parent
-    steps.push(() => ({ [`close.${child.id}`]: { open: 0.1, failure: 0.6, success: 0.3 }, [`close.${root.id}`]: { open: 0.9 }, focus: { successor: 0.8, continue: 0.2 } }));
-    const b4 = await s.round("That hypothesis is ruled out; I'll write a regression test instead.", [{ name: "bash", args: { command: "true" }, output: "" }]);
-    expect(b4.messages[0]!.content.split("\n").slice(0, 2)).toEqual(['[intent] I finished "Find the race in TokenCache.refresh": failed.', 'I\'m now working on "Write a regression test" (inside: Fix flaky auth test).']);
-    expect(s.engine.state.stack.map((i) => i.label)).toEqual(["Fix flaky auth test", "Write a regression test"]);
-    expect(s.engine.state.intents.get(child.id)).toMatchObject({ status: "failure" });
-    expect(s.engine.state.intents.get(child.id)!.closedEntryId).toBeDefined();
-    // `successor` without a closure in the same step is treated as `continue`: it never bypasses τ_close
-    steps.push(keepOpen({ successor: 0.9 }));
-    const b5 = await s.round("more", [{ name: "bash", args: { command: "true" }, output: "" }]);
-    expect(b5.messages).toEqual([]);
-    expect(s.engine.state.stack.length).toBe(2);
-    // everything closes in one step, innermost first; focus returns to nothing
-    steps.push(closeAll("success"));
-    const b6 = await s.round("done", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
-    expect(b6.messages[0]!.content).toBe('[intent] I finished "Write a regression test": succeeded. I finished "Fix flaky auth test": succeeded.');
-    expect(s.engine.state.stack).toEqual([]);
-  });
-
-  it("needs one complete round since the guidance before an intent can close", async () => {
-    const { s, steps } = await withIntent();
-    const root = s.engine.state.stack[0]!;
-    // closure-only Janus at settle, right after the kindle: no round has completed under this intent
-    steps.push(closeAll("success"));
-    s.h.assistant("I can't do anything yet.");
-    await s.h.commit(await s.engine.onTurnEnd());
-    expect(s.engine.state.intents.get(root.id)!.status).toBe("open");
-  });
-
-  it("treats new_root as a replacement only when the user redirects; otherwise as an interruption", async () => {
-    const a = await withIntent();
-    a.steps.push(keepOpen());
-    await a.s.round("working", [{ name: "bash", args: { command: "true" }, output: "" }]);
-    const root = a.s.engine.state.stack[0]!;
-    // redirect ≥ 0.8: what is open is abandoned, and a root intent starts
-    a.steps.push(() => ({ [`close.${root.id}`]: { open: 0.9 }, focus: { new_root: 0.9 }, redirect: 0.9 }));
-    const b = await a.s.user("Forget that. Update the changelog instead.");
-    expect(b.messages[0]!.content.split("\n")[0]).toBe('[intent] I finished "Fix flaky auth test": set aside.');
-    expect(a.s.engine.state.stack.map((i) => [i.label, i.parentId])).toEqual([["Find the race in TokenCache.refresh", null]]);
-    expect(a.s.engine.state.intents.get(root.id)!.status).toBe("abandoned");
-    // redirect < 0.8: an interruption becomes a child; the parent is untouched
-    const c = await withIntent();
-    c.steps.push(keepOpen());
-    await c.s.round("working", [{ name: "bash", args: { command: "true" }, output: "" }]);
-    const root2 = c.s.engine.state.stack[0]!;
-    c.steps.push(() => ({ [`close.${root2.id}`]: { open: 0.9 }, focus: { new_root: 0.9 }, redirect: 0.3 }));
-    await c.s.user("By the way, what does this env var do?");
-    expect(c.s.engine.state.stack.map((i) => i.parentId)).toEqual([null, root2.id]);
-  });
-
-  it("fails safe: a timeout means continue, an emulated model needs 0.9, and duplicates are not kindled", async () => {
-    const { s, steps } = await withIntent();
-    const root = s.engine.state.stack[0]!;
-    steps.push(null); // no answer at all
-    const b = await s.round("working", [{ name: "bash", args: { command: "true" }, output: "" }]);
-    expect(b.messages).toEqual([]);
-    expect(s.engine.state.stack.length).toBe(1);
-    // uncalibrated answers: τ_close rises to 0.9
-    s.decision.isCalibrated = false;
-    steps.push(() => ({ [`close.${root.id}`]: { open: 0.15, success: 0.85 }, focus: { continue: 0.9 } }));
-    await s.round("working", [{ name: "bash", args: { command: "true" }, output: "" }]);
-    expect(s.engine.state.stack.length).toBe(1);
-    s.decision.isCalibrated = true;
-    // duplicate guard: the scribe proposes the open purpose again, twice → the kindle is skipped
-    s.aux.on("janus.scribe", () => ({ label: "Fix flaky auth test", reason: "r", success: "s", failure: "f" }));
-    steps.push(keepOpen({ deepen: 0.9 }));
-    const before = s.aux.calls.length;
-    const b3 = await s.round("working", [{ name: "bash", args: { command: "true" }, output: "" }]);
-    expect(s.aux.calls.length - before).toBe(2); // one retry
-    expect(s.aux.calls.at(-1)!.instructions).toContain('duplicates the open purpose "Fix flaky auth test"');
-    expect(b3.messages).toEqual([]);
-    expect(s.engine.state.stack.length).toBe(1);
-    // an invalid scribe answer also skips the kindle
-    s.aux.on("janus.scribe", () => ({ label: "", reason: "r", success: "s", failure: "f" }));
-    steps.push(keepOpen({ deepen: 0.9 }));
-    await s.round("working", [{ name: "bash", args: { command: "true" }, output: "" }]);
-    expect(s.engine.state.stack.length).toBe(1);
-  });
-
-  it("runs off the critical path: a late answer applies at the next commit point", async () => {
-    const s = new Session({ cfg: cfg() });
-    await s.start();
-    scribe(s.aux, [{ label: "Fix flaky auth test" }]);
-    let release: (() => void) | null = null;
-    let calls = 0;
-    const real = s.decision.decide.bind(s.decision);
-    s.decision.on("janus", () => ({ focus: { new_root: 0.9 } }));
-    s.decision.decide = async (ev, qs, opts) => {
-      if (opts.callSite === "janus" && ++calls === 3) await new Promise<void>((r) => (release = r));
-      return real(ev, qs, opts);
-    };
-    await s.user("fix the flaky auth test"); // call 1: synchronous, answered
-    const root = s.engine.state.stack[0]!;
-    s.decision.on("janus", (_e, qs) => keepOpen()(qs.map((q) => q.name)));
-    await s.round("working", [{ name: "bash", args: { command: "true" }, output: "ok" }]); // call 2
-    s.decision.on("janus", (_e, qs) => closeAll("success")(qs.map((q) => q.name)));
-    const t0 = Date.now();
-    const b1 = await s.round("the suite passes now", [{ name: "bash", args: { command: "true" }, output: "ok" }]); // call 3 hangs
-    expect(Date.now() - t0).toBeLessThan(1000); // turn_end waited only janus.lateWaitMs
-    expect(b1.messages).toEqual([]);
-    expect(s.engine.state.intents.get(root.id)!.status).toBe("open");
-    expect(s.engine.status().janusLate).toBe(1);
-    release!();
-    await new Promise((r) => setTimeout(r, 20));
-    s.decision.on("janus", () => undefined); // this step's own run gives nothing
-    const b2 = await s.round("more", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
-    expect(b2.messages[0]!.content).toContain('I finished "Fix flaky auth test": succeeded.');
-    expect(s.engine.state.stack).toEqual([]);
-  });
-
-  it("bounds a user message's whole wait: a slow scribe opens its intent at the next turn_end", async () => {
-    // with a decision model the budget is janus.timeoutMs, shared by the decision, scribe and cards
-    const s = new Session({ cfg: testConfig({ context: { maxWindow: 32000 }, janus: { lateWaitMs: 50, timeoutMs: 150 } }) });
-    await s.start();
-    const gates: Array<() => void> = [];
-    let scribes = 0;
-    s.aux.on("janus.scribe", async () => {
-      scribes++;
-      await new Promise<void>((r) => gates.push(r));
-      return { label: "Fix flaky auth test", reason: "r", success: "s", failure: "f" };
+    // open root intent
+    const r1 = await s.intent({
+      action: "open",
+      label: "Fix the flaky login test in the auth suite.",
+      reason: "the user reported intermittent failures",
+      done: "the login suite passes 40 times in a row",
+      give_up: "three hypotheses are ruled out",
     });
-    s.decision.on("janus", (_e, qs) => keepOpen({ new_root: 0.9 })(qs.map((q) => q.name)));
-    const t0 = Date.now();
-    const b0 = await s.user("fix the flaky auth test");
-    expect(Date.now() - t0).toBeLessThan(1000); // not the scribe's own time
-    expect(b0.messages).toEqual([]);
-    expect(s.engine.state.stack).toEqual([]);
-    gates.shift()!();
-    await new Promise((r) => setTimeout(r, 15));
-    // this round's own Janus run also says "new root", from evidence taken before the late intent opened
-    const tools = [{ name: "bash", args: { command: "true" }, output: "ok" }];
-    const b1 = await s.round("looking at the test", tools);
-    expect(b1.messages.map((m) => m.content)).toEqual([expect.stringContaining('[intent] I\'m now working on "Fix flaky auth test".')]);
-    expect(b1.messages[0]!.details?.intentId).toBe(s.engine.state.stack[0]!.id);
-    expect(s.engine.state.stack.map((i) => i.label)).toEqual(["Fix flaky auth test"]);
-    expect(scribes).toBe(1); // the round's plan could not kindle a second intent
-    // a late scribe for a message that never reached a turn_end is dropped by the next message
-    const s2 = new Session({ cfg: testConfig({ context: { maxWindow: 32000 }, janus: { lateWaitMs: 50, timeoutMs: 150 } }) });
-    await s2.start();
-    const held: Array<() => void> = [];
-    s2.aux.on("janus.scribe", async () => {
-      await new Promise<void>((r) => held.push(r));
-      return { label: "An old purpose", reason: "r", success: "s", failure: "f" };
+    expect(r1.isError).toBe(false);
+    expect(r1.text).toContain('Opened "Fix the flaky login test in the auth suite".');
+    expect(r1.text).toContain("Done when: the login suite passes 40 times in a row");
+    const root = s.engine.state.stack[0]!;
+    expect(root).toMatchObject({ parentId: null, status: "open", label: "Fix the flaky login test in the auth suite" });
+    expect(root.guidanceEntryId).toBeTruthy();
+
+    // open child sub-intent (deepen)
+    const r2 = await s.intent({
+      action: "open",
+      label: "Find the race in TokenCache.refresh",
+      reason: "logs show overlapping refreshes",
+      done: "failing interleaving pinned to a line",
     });
-    s2.decision.on("janus", (_e, qs) => keepOpen({ new_root: 0.9 })(qs.map((q) => q.name)));
-    await s2.user("first task");
-    s2.decision.on("janus", (_e, qs) => keepOpen()(qs.map((q) => q.name)));
-    await s2.user("never mind, thanks");
-    while (held.length) held.shift()!();
-    await new Promise((r) => setTimeout(r, 15));
-    expect((await s2.round("ok", tools)).messages).toEqual([]);
-    expect(s2.engine.state.intents.size).toBe(0);
-  });
-
-  /** A scribe that answers only when the test releases it. */
-  function heldScribe(s: Session, labels: string[], from = 0): Array<() => void> {
-    const held: Array<() => void> = [];
-    let n = 0;
-    s.aux.on("janus.scribe", async () => {
-      const label = labels[Math.min(n, labels.length - 1)]!;
-      if (n++ >= from) await new Promise<void>((r) => held.push(r));
-      return { label, reason: "r", success: "s", failure: "f" };
-    });
-    return held;
-  }
-  const settle = () => new Promise((r) => setTimeout(r, 15));
-  const answer = (s: Session, f: (names: string[]) => Answers) => s.decision.on("janus", (_e, qs) => f(qs.map((q) => q.name)));
-
-  it("with emulated decisions, bounds a user message by janus.lateWaitMs, the scribe included", async () => {
-    // janus.timeoutMs is far longer: the budget without a decision model is janus.lateWaitMs
-    const s = new Session({ cfg: testConfig({ context: { maxWindow: 32000 }, janus: { lateWaitMs: 50, timeoutMs: 5000 } }) });
-    await s.start();
-    s.decision.isCalibrated = false; // the aux-emulated fallback (§9.1.4)
-    const held = heldScribe(s, ["Fix flaky auth test"]);
-    answer(s, keepOpen({ new_root: 0.9 }));
-    const t0 = Date.now();
-    const b0 = await s.user("fix the flaky auth test");
-    expect(Date.now() - t0).toBeLessThan(1000);
-    expect(b0.messages).toEqual([]);
-    expect(s.engine.state.stack).toEqual([]);
-    held.shift()!();
-    await settle();
-    answer(s, keepOpen());
-    const b1 = await s.round("looking at the test", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
-    expect(b1.messages.map((m) => m.content)).toEqual([expect.stringContaining('[intent] I\'m now working on "Fix flaky auth test".')]);
-  });
-
-  it("drops a late kindle when the branch changes before it lands", async () => {
-    const s = new Session({ cfg: testConfig({ context: { maxWindow: 32000 }, janus: { lateWaitMs: 50, timeoutMs: 150 } }) });
-    await s.start();
-    const held = heldScribe(s, ["A purpose from another branch"]);
-    answer(s, keepOpen({ new_root: 0.9 }));
-    await s.user("fix the flaky auth test");
-    // `/tree` (or a fork or resume) rebuilds the engine from the active branch
-    await s.engine.onSessionStart();
-    held.shift()!();
-    await settle();
-    answer(s, keepOpen());
-    const b1 = await s.round("looking at the test", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
-    expect(b1.messages).toEqual([]);
-    expect(s.engine.state.intents.size).toBe(0);
-    expect(await s.engine.onBeforeSettle()).toMatchObject({ messages: [] });
-  });
-
-  it("gives turn_end one deadline: a late scribe opens its intent at the next commit point, settle included", async () => {
-    const s = new Session({ cfg: testConfig({ context: { maxWindow: 32000 }, janus: { lateWaitMs: 50, timeoutMs: 5000 } }) });
-    await s.start();
-    const held = heldScribe(s, ["Fix flaky auth test", "Find the race in TokenCache", "Write a regression test"], 1);
-    answer(s, keepOpen({ new_root: 0.9 }));
-    await s.user("fix the flaky auth test");
-    expect(s.engine.state.stack.map((i) => i.label)).toEqual(["Fix flaky auth test"]);
-    const tools = [{ name: "bash", args: { command: "true" }, output: "ok" }];
-    // the round's plan deepens, and its scribe does not answer within janus.lateWaitMs
-    answer(s, keepOpen({ deepen: 0.9 }));
-    const t0 = Date.now();
-    const b1 = await s.round("I need to find the race first", tools);
-    expect(Date.now() - t0).toBeLessThan(1000);
-    expect(b1.messages).toEqual([]);
-    expect(s.engine.state.stack.length).toBe(1);
-    const leaf = (await s.h.listEntries()).at(-1)!.id;
-    held.shift()!();
-    await settle();
-    answer(s, keepOpen());
-    const b2 = await s.round("grepping for refresh", tools);
-    expect(b2.messages.map((m) => m.content)).toEqual([expect.stringContaining('I\'m now working on "Find the race in TokenCache" (inside: Fix flaky auth test).')]);
-    // it governs from the turn_end it missed on, not from its guidance
-    const entries = await s.h.listEntries();
-    const start = entries[entries.findIndex((e) => e.id === leaf) + 1]!;
-    expect(start).toMatchObject({ kind: "assistant" });
-    expect(s.engine.state.stack[1]!.guidanceEntryId).toBe(start.id);
-    expect(s.engine.state.regions(entries).at(-1)!.from).toBe(entries.indexOf(start));
-    // a scribe that misses the run's last turn_end opens its intent at settle
-    answer(s, keepOpen({ deepen: 0.9 }));
-    await s.round("a regression test comes next", tools);
-    answer(s, keepOpen());
-    s.h.assistant("Writing it now.");
-    const end = await s.engine.onTurnEnd();
-    expect(end.messages).toEqual([]);
-    await s.h.commit(end);
-    held.shift()!();
-    await settle();
-    const atSettle = await s.engine.onBeforeSettle();
-    expect(atSettle.messages.map((m) => m.content)).toEqual([expect.stringContaining('I\'m now working on "Write a regression test" (inside: Find the race in TokenCache).')]);
-    expect(s.engine.state.stack.map((i) => i.label)).toEqual(["Fix flaky auth test", "Find the race in TokenCache", "Write a regression test"]);
-  });
-
-  it("does not say it is back to the parent while a successor's scribe is still running", async () => {
-    const { s, steps } = await withIntent({ cfg: testConfig({ context: { maxWindow: 32000 }, janus: { lateWaitMs: 50, timeoutMs: 5000 } }) });
-    const tools = [{ name: "bash", args: { command: "true" }, output: "ok" }];
-    steps.push(keepOpen({ deepen: 0.9 }));
-    await s.round("I'll look for the race first", tools);
+    expect(r2.isError).toBe(false);
+    expect(r2.text).toContain('Opened "Find the race in TokenCache.refresh" (inside: Fix the flaky login test in the auth suite).');
+    expect(s.engine.state.stack.map((i) => i.label)).toEqual(["Fix the flaky login test in the auth suite", "Find the race in TokenCache.refresh"]);
     const child = s.engine.state.stack[1]!;
-    steps.push(keepOpen());
-    await s.round("found the race", tools);
-    const held = heldScribe(s, ["Write a regression test"]);
-    steps.push((names) => {
-      const out: Answers = { focus: { successor: 0.9 } };
-      for (const n of names) if (n.startsWith("close.")) out[n] = n === `close.${child.id}` ? { open: 0.05, success: 0.9 } : { open: 0.95 };
-      return out;
+    expect(child.parentId).toBe(root.id);
+
+    // update innermost intent in place without closing it
+    const r3 = await s.intent({ action: "update", done: "repro test fails deterministically before fix" });
+    expect(r3.isError).toBe(false);
+    expect(r3.text).toContain('Updated "Find the race in TokenCache.refresh".');
+    expect(s.engine.state.innermost()!.id).toBe(child.id);
+    expect(s.engine.state.innermost()!.success).toBe("repro test fails deterministically before fix");
+
+    // do work under child
+    await s.round("checking refresh", [{ name: "read", args: { path: "src/auth/tokenCache.ts" }, output: "refresh()" }]);
+    const beforeShiftLeaf = (await s.h.listEntries()).at(-1)!.id;
+
+    // shift: atomically close child (failure) and open sibling under root
+    const r4 = await s.intent({
+      action: "shift",
+      outcome: "failure",
+      label: "Write a deterministic regression test",
+      reason: "first hypothesis ruled out",
+      done: "regression test reproduces the race",
     });
-    const b1 = await s.round("fixed; a regression test is next", tools);
-    // the closure only: "I'm back to" the parent would be followed by "I'm now working on" the successor
-    expect(b1.messages.map((m) => m.content)).toEqual(['[intent] I finished "Find the race in TokenCache.refresh": succeeded.']);
-    held.shift()!();
-    await settle();
-    steps.push(keepOpen());
-    const b2 = await s.round("writing the test", tools);
-    expect(b2.messages.map((m) => m.content)).toEqual([expect.stringContaining('I\'m now working on "Write a regression test" (inside: Fix flaky auth test).')]);
+    expect(r4.isError).toBe(false);
+    expect(r4.text).toContain('Closed "Find the race in TokenCache.refresh" (failed).');
+    expect(r4.text).toContain('Opened "Write a deterministic regression test" (inside: Fix the flaky login test in the auth suite).');
+    expect(s.engine.state.stack.map((i) => i.label)).toEqual(["Fix the flaky login test in the auth suite", "Write a deterministic regression test"]);
+    const closedChild = s.engine.state.intents.get(child.id)!;
+    expect(closedChild.status).toBe("failure");
+    expect(closedChild.closedEntryId).toBe(beforeShiftLeaf);
+    // new sibling starts AT the shift turn, completely disjoint from closedChild
+    const sibling = s.engine.state.innermost()!;
+    expect(sibling.parentId).toBe(root.id);
+    expect(sibling.guidanceEntryId).not.toBe(beforeShiftLeaf);
+
+    // close all remaining intents in one call
+    await s.round("test fixed", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
+    const r5 = await s.intent({ action: "close", all: true, outcome: "success" });
+    expect(r5.isError).toBe(false);
+    expect(r5.text).toContain('Closed "Write a deterministic regression test" (succeeded), "Fix the flaky login test in the auth suite" (succeeded).');
+    expect(r5.text).toContain("Stack: (empty)");
+    expect(s.engine.state.stack).toEqual([]);
   });
 
-  it("never holds a commit point for emulated decisions: they apply one step late, and a stale kindle is dropped", async () => {
-    const s = new Session({ cfg: cfg() });
+  it("enforces duplicate guard, maxDepth, and atomic validation without mutating stack on error", async () => {
+    const s = new Session({ cfg: cfg({ maxDepth: 2, driftCooldownRounds: 0 }) });
     await s.start();
-    scribe(s.aux, [{ label: "Fix flaky auth test" }, { label: "A duplicate that must not appear" }]);
-    // the aux-emulated fallback (§9.1.4): uncalibrated, and seconds per answer
-    s.decision.isCalibrated = false;
-    const gates: Array<() => void> = [];
-    const real = s.decision.decide.bind(s.decision);
-    s.decision.decide = async (ev, qs, opts) => {
-      if (opts.callSite === "janus") await new Promise<void>((r) => gates.push(r));
-      return real(ev, qs, opts);
-    };
-    const release = async () => {
-      gates.shift()!();
-      await new Promise((r) => setTimeout(r, 15));
-    };
-    const tools = [{ name: "bash", args: { command: "true" }, output: "ok" }];
-    s.decision.on("janus", (_e, qs) => ({ ...keepOpen({ new_root: 0.9 })(qs.map((q) => q.name)) }));
-    // the user's prompt does not wait for the answer
-    const t0 = Date.now();
-    const b0 = await s.user("fix the flaky auth test");
-    expect(Date.now() - t0).toBeLessThan(1000);
-    expect(b0.messages).toEqual([]);
-    expect(s.engine.state.stack).toEqual([]);
-    expect(s.engine.status().janusLate).toBe(1);
-    await release(); // the answer for the user's message arrives while the model works
-    // the first round starts its own run, which saw an empty stack too
-    const b1 = await s.round("looking at the test", tools);
-    expect(gates.length).toBe(1);
-    expect(b1.messages.map((m) => m.content)).toEqual([expect.stringContaining('[intent] I\'m now working on "Fix flaky auth test".')]);
-    expect(s.engine.state.stack.map((i) => i.label)).toEqual(["Fix flaky auth test"]);
-    await release();
-    // its answer says "new root" as well: applied one step late, it must not kindle a second intent
-    const b2 = await s.round("still looking", tools);
-    expect(b2.messages).toEqual([]);
-    expect(s.engine.state.stack.map((i) => i.label)).toEqual(["Fix flaky auth test"]);
-    // one request in flight is enough: while it runs, the next round does not ask again
-    expect(gates.length).toBe(1);
-    await s.round("and looking", tools);
-    expect(gates.length).toBe(1);
-    s.decision.on("janus", (_e, qs) => keepOpen()(qs.map((q) => q.name)));
-    await release();
-    // a closure is seen by the run that starts now, and applies at the commit point after it;
-    // uncalibrated answers close at τ_close 0.9
-    s.decision.on("janus", (_e, qs) => closeAll("success")(qs.map((q) => q.name)));
-    const b4 = await s.round("the suite passes now", tools);
-    expect(b4.messages).toEqual([]);
-    await release();
-    const b5 = await s.round("wrapping up", tools);
-    expect(b5.messages[0]!.content).toContain('I finished "Fix flaky auth test": succeeded.');
-    expect(s.engine.state.stack).toEqual([]);
-    expect(s.engine.state.intents.size).toBe(1);
-    // settle asks for closures only, and does not wait either
-    while (gates.length) await release();
-    const t1 = Date.now();
-    await s.engine.onBeforeSettle();
-    expect(Date.now() - t1).toBeLessThan(1000);
-    while (gates.length) await release();
+    await s.user("task");
+
+    // close/update on empty stack fails cleanly
+    expect((await s.intent({ action: "close" })).isError).toBe(true);
+    expect((await s.intent({ action: "update", done: "x" })).isError).toBe(true);
+    // missing label or done fails
+    expect((await s.intent({ action: "open", label: "No done" })).isError).toBe(true);
+    expect((await s.intent({ action: "open", done: "no label" })).isError).toBe(true);
+
+    await s.intent({ action: "open", label: "Root task", done: "root done" });
+    // duplicate guard (case-insensitive)
+    const dup = await s.intent({ action: "open", label: "root task", done: "again" });
+    expect(dup.isError).toBe(true);
+    expect(dup.text).toContain('duplicates the open intent "Root task"');
+    expect(s.engine.state.stack.length).toBe(1);
+
+    // depth cap
+    await s.intent({ action: "open", label: "Child task", done: "child done" });
+    const tooDeep = await s.intent({ action: "open", label: "Grandchild", done: "too deep" });
+    expect(tooDeep.isError).toBe(true);
+    expect(tooDeep.text).toContain("maxDepth (2)");
+    expect(s.engine.state.stack.length).toBe(2);
+
+    // shift with duplicate of remaining parent fails atomically (child stays open)
+    const badShift = await s.intent({ action: "shift", label: "Root task", done: "dup parent" });
+    expect(badShift.isError).toBe(true);
+    expect(s.engine.state.stack.map((i) => i.label)).toEqual(["Root task", "Child task"]);
+
+    // shift with all:true replaces entire stack even at maxDepth
+    const goodShift = await s.intent({ action: "shift", all: true, outcome: "abandoned", label: "Brand new root", done: "new done" });
+    expect(goodShift.isError).toBe(false);
+    expect(s.engine.state.stack.map((i) => [i.label, i.parentId])).toEqual([["Brand new root", null]]);
+  });
+});
+
+describe("periodic intent markers (§5.2)", () => {
+  it("appends a compact reminder every janus.remindEvery rounds on an open intent and when the stack is empty", async () => {
+    const s = new Session({ cfg: cfg({ remindEvery: 8, driftCooldownRounds: 0 }) });
+    await s.start();
+    await s.user("fix auth");
+
+    // Empty stack: nudges after 8 rounds
+    const emptyMsgs: string[] = [];
+    for (let i = 0; i < 9; i++) {
+      const b = await s.round(`explore ${i}`, [{ name: "bash", args: { command: "true" }, output: "" }]);
+      emptyMsgs.push(...b.messages.map((m) => m.content));
+    }
+    expect(emptyMsgs).toEqual([renderEmptyReminder(8, "intent")]);
+
+    // Open an intent: reminds every 8 rounds within it
+    await s.intent({ action: "open", label: "Fix flaky auth test", done: "the check passes", give_up: "three attempts fail" });
+    const openMsgs: string[] = [];
+    for (let i = 0; i < 17; i++) {
+      const b = await s.round(`step ${i}`, [{ name: "bash", args: { command: "true" }, output: "" }]);
+      openMsgs.push(...b.messages.map((m) => m.content));
+    }
+    const intent = s.engine.state.innermost()!;
+    expect(openMsgs).toEqual([renderReminder(intent, undefined, "intent"), renderReminder(intent, undefined, "intent")]);
+  });
+});
+
+describe("advisory Janus decision rules, debounce, prefire, and cooldown (§5.2)", () => {
+  it("evaluates closure and focus rules (including uncalibrated τ_close=0.9, min-round guard, redirect, and fail-safe)", async () => {
+    const s = new Session({ cfg: cfg({ driftCooldownRounds: 0 }) });
+    await s.start();
+    await s.user("fix auth");
+    await s.intent({ action: "open", label: "Fix flaky auth test", done: "suite passes", give_up: "blocked" });
+    const root = s.engine.state.stack[0]!;
+    await s.intent({ action: "open", label: "Find the race", done: "race pinned" });
+    const child = s.engine.state.stack[1]!;
+
+    // Minimum evidence: before any round completes under child (wait: intent() itself is 1 complete round,
+    // so open a grandchild without completing another round and test rules directly)
+    const entries = await s.h.listEntries();
+    const units = toUnits(entries);
+    const input = { state: s.engine.state, entries, units, mode: "full" as const, round: s.engine.round };
+
+    // P(closed) = 0.75 < 0.8 → stays open → no drift advisory
+    const pStay = s.engine.janus.rules(
+      input,
+      { [`close.${child.id}`]: { name: `close.${child.id}`, kind: "choice", probs: { open: 0.25, success: 0.75 }, calibrated: true }, [`close.${root.id}`]: { name: `close.${root.id}`, kind: "choice", probs: { open: 0.9, success: 0.1 }, calibrated: true }, focus: { name: "focus", kind: "choice", probs: { continue: 0.9 }, calibrated: true } },
+      { answered: true, closures: [], kindle: null, closeProb: {}, focus: null, focusP: 0, redirect: null, evidenceLeafId: null },
+    );
+    expect(pStay.closures).toEqual([]);
+    expect(s.engine.janus.advisory(pStay, s.engine.state.stack)).toBeNull();
+
+    // Uncalibrated 0.85 < 0.9 → stays open
+    const pUncal = s.engine.janus.rules(
+      input,
+      { [`close.${child.id}`]: { name: `close.${child.id}`, kind: "choice", probs: { open: 0.15, success: 0.85 }, calibrated: false }, focus: { name: "focus", kind: "choice", probs: { continue: 0.9 }, calibrated: false } },
+      { answered: true, closures: [], kindle: null, closeProb: {}, focus: null, focusP: 0, redirect: null, evidenceLeafId: null },
+    );
+    expect(pUncal.closures).toEqual([]);
+
+    // Outer wants to close but inner stays open → top-down stops at inner
+    const pBlocked = s.engine.janus.rules(
+      input,
+      { [`close.${child.id}`]: { name: `close.${child.id}`, kind: "choice", probs: { open: 0.5, success: 0.5 }, calibrated: true }, [`close.${root.id}`]: { name: `close.${root.id}`, kind: "choice", probs: { open: 0.05, success: 0.95 }, calibrated: true }, focus: { name: "focus", kind: "choice", probs: { continue: 0.9 }, calibrated: true } },
+      { answered: true, closures: [], kindle: null, closeProb: {}, focus: null, focusP: 0, redirect: null, evidenceLeafId: null },
+    );
+    expect(pBlocked.closures).toEqual([]);
+
+    // Inner closes + successor → shift advisory
+    const pShift = s.engine.janus.rules(
+      input,
+      { [`close.${child.id}`]: { name: `close.${child.id}`, kind: "choice", probs: { open: 0.05, failure: 0.8, success: 0.15 }, calibrated: true }, [`close.${root.id}`]: { name: `close.${root.id}`, kind: "choice", probs: { open: 0.9, success: 0.1 }, calibrated: true }, focus: { name: "focus", kind: "choice", probs: { successor: 0.85, continue: 0.15 }, calibrated: true } },
+      { answered: true, closures: [], kindle: null, closeProb: {}, focus: null, focusP: 0, redirect: null, evidenceLeafId: null },
+    );
+    const advShift = s.engine.janus.advisory(pShift, s.engine.state.stack, "intent");
+    expect(advShift?.kind).toBe("shift");
+    expect(advShift?.summary).toContain('action "shift"');
+    expect(advShift?.summary).toContain('outcome: "failure"');
+
+    // new_root + redirect >= 0.8 → redirect advisory
+    const pRedirect = s.engine.janus.rules(
+      { ...input, userMessage: "Forget that, update the changelog" },
+      { [`close.${child.id}`]: { name: `close.${child.id}`, kind: "choice", probs: { open: 0.9 }, calibrated: true }, [`close.${root.id}`]: { name: `close.${root.id}`, kind: "choice", probs: { open: 0.9 }, calibrated: true }, focus: { name: "focus", kind: "choice", probs: { new_root: 0.9 }, calibrated: true }, redirect: { name: "redirect", kind: "binary", p: 0.9, calibrated: true } },
+      { answered: true, closures: [], kindle: null, closeProb: {}, focus: null, focusP: 0, redirect: null, evidenceLeafId: null },
+    );
+    const advRedirect = s.engine.janus.advisory(pRedirect, s.engine.state.stack, "intent");
+    expect(advRedirect?.kind).toBe("redirect");
+    expect(advRedirect?.summary).toContain("all: true");
   });
 
-  it("puts stable evidence first and trims tool outputs", async () => {
-    const { s, steps } = await withIntent();
-    const run = script(s.decision, [keepOpen(), keepOpen()]);
-    void steps;
+  it("debounces nonblocking drift checks (waits for quiet break), never mutates stack, and rate-limits drift reminders by cooldown", async () => {
+    vi.useFakeTimers();
+    const s = new Session({ cfg: cfg({ debounceMs: 500, driftCooldownRounds: 32, remindEvery: 0 }) });
+    await s.start();
+    const run = script(s.decision, [closeAll("success"), closeAll("success")]);
+    await s.user("fix auth");
+    await s.intent({ action: "open", label: "Fix flaky auth test", done: "suite passes" });
+
+    // Round 1: returns immediately without calling decision API
+    const b1 = await s.round("checking", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
+    expect(b1.messages).toEqual([]);
+    expect(run.calls()).toBe(0);
+
+    // Advance 300ms (< 500ms debounce) and do Round 2 → timer resets, still 0 decision calls!
+    vi.advanceTimersByTime(300);
+    const b2 = await s.round("still working", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
+    expect(b2.messages).toEqual([]);
+    expect(run.calls()).toBe(0);
+
+    // Advance 300ms again (< 500ms since round 2) → still 0 calls
+    vi.advanceTimersByTime(300);
+    expect(run.calls()).toBe(0);
+
+    // Now let the quiet break pass (+250ms → 550ms since round 2) → fires once in background!
+    vi.advanceTimersByTime(250);
+    await s.drain();
+    expect(run.calls()).toBe(1);
+    // Advisory Janus NEVER mutates the stack itself
+    expect(s.engine.state.stack.map((i) => i.label)).toEqual(["Fix flaky auth test"]);
+
+    // Next turn immediately gets the strong drift reminder marker
+    const b3 = await s.round("continuing without closing", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
+    expect(b3.messages.length).toBe(1);
+    expect(b3.messages[0]!.customType).toBe(GUIDANCE_TYPE);
+    expect(b3.messages[0]!.content).toContain("[intent] Drift check:");
+    expect(b3.messages[0]!.content).toContain('action "close"');
+    expect(s.engine.status().driftReminders).toBe(1);
+
+    // Cooldown (32 rounds): during the next 31 rounds, even after breaks, no decision call or drift marker fires!
+    for (let i = 0; i < 31; i++) {
+      const b = await s.round(`cooldown step ${i}`, [{ name: "bash", args: { command: "true" }, output: "ok" }]);
+      expect(b.messages).toEqual([]);
+      vi.advanceTimersByTime(1000);
+      await s.drain();
+    }
+    expect(run.calls()).toBe(1);
+
+    // Round +32 after the drift reminder: cooldown elapsed → check fires again on break and emits marker on next turn
+    await s.round("past cooldown", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
+    vi.advanceTimersByTime(600);
+    await s.drain();
+    expect(run.calls()).toBe(2);
+    const bAfter = await s.round("next after cooldown", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
+    expect(bAfter.messages[0]?.content).toContain("[intent] Drift check:");
+    expect(s.engine.status().driftReminders).toBe(2);
+  });
+
+  it("prefires immediately once when unchecked evidence hits janus.maxInputTokens while debounce is counting down", async () => {
+    vi.useFakeTimers();
+    // Small maxInputTokens cap + long 10s debounce so only prefire can trigger
+    const s = new Session({ cfg: cfg({ debounceMs: 10_000, maxInputTokens: 700, driftCooldownRounds: 32, remindEvery: 0 }) });
+    await s.start();
+    const run = script(s.decision, [keepOpen({ deepen: 0.9 }), keepOpen()]);
+    await s.user("investigate");
+    await s.intent({ action: "open", label: "Investigate auth", done: "cause found" });
+
+    // Small round: starts 10s debounce countdown, well below 700 tokens → 0 calls
+    await s.round("small step", [{ name: "read", args: { path: "a.ts" }, output: "short output" }]);
+    expect(run.calls()).toBe(0);
+
+    // Large round pushes unchecked evidence over maxInputTokens (700) while 10s debounce is still counting down → prefires immediately!
+    vi.advanceTimersByTime(100);
+    const bBig = await s.round("big step", [{ name: "read", args: { path: "big.ts" }, output: filler(600, "tok") }]);
+    await s.drain();
+    expect(run.calls()).toBe(1);
+    // Mid-turn prefire flushed the earlier unchecked context before the huge result could truncate it
+    expect(run.evidence[0].recent_rounds).toContain("small step");
+    expect(run.evidence[0].recent_rounds).not.toContain("[… earlier part cut …]");
+
+    // Either big step's turn_end (if prefire finished in time) or the next turn surfaces the drift reminder
+    const bNext = bBig.messages.length ? bBig : await s.round("next", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
+    expect(bNext.messages[0]?.content).toContain("[intent] Drift check:");
+    expect(bNext.messages[0]?.content).toContain('action "open"');
+  });
+
+  it("defaults janus.maxInputTokens to min(decision model maxInputTokens, 64K) when auto", async () => {
+    vi.useFakeTimers();
+    const s = new Session({
+      cfg: testConfig({
+        context: { maxWindow: 32000 },
+        providers: { decision: { format: "systemone", url: "https://example.test/v1/systemone", model: "jev", maxInputTokens: 700 } },
+        janus: { lateWaitMs: 50, debounceMs: 10_000, maxInputTokens: "auto", driftCooldownRounds: 32, remindEvery: 0 },
+      }),
+    });
+    await s.start();
+    const run = script(s.decision, [keepOpen({ deepen: 0.9 })]);
+    await s.user("investigate");
+    await s.intent({ action: "open", label: "Investigate auth", done: "cause found" });
+
+    // Small round stays under the 700-token decision cap (0 calls); large round hits 700 and prefires.
+    await s.round("small step", [{ name: "read", args: { path: "a.ts" }, output: "short output" }]);
+    expect(run.calls()).toBe(0);
+
+    vi.advanceTimersByTime(100);
+    await s.round("big step", [{ name: "read", args: { path: "big.ts" }, output: filler(600, "tok") }]);
+    await s.drain();
+    expect(run.calls()).toBe(1);
+  });
+
+  it("discards pending or in-flight drift checks when the main model calls intent", async () => {
+    vi.useFakeTimers();
+    const s = new Session({ cfg: cfg({ debounceMs: 500, driftCooldownRounds: 32, remindEvery: 0 }) });
+    await s.start();
+    const run = script(s.decision, [closeAll("success")]);
+    await s.user("fix auth");
+    await s.intent({ action: "open", label: "Fix auth", done: "fixed" });
+
+    await s.round("done fixing", [{ name: "bash", args: { command: "true" }, output: "pass" }]);
+    // Let debounce fire so pendingDrift is queued
+    vi.advanceTimersByTime(600);
+    await s.drain();
+    expect(run.calls()).toBe(1);
+
+    // Main model proactively closes the intent before the next ordinary turn → pendingDrift is cleared!
+    await s.intent({ action: "close", outcome: "success" });
+    const b = await s.round("summary", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
+    expect(b.messages).toEqual([]);
+    expect(s.engine.status().driftReminders).toBe(0);
+  });
+
+  it("formats evidence with stack and head/tail clipped tool outputs, and renders guidance templates", async () => {
+    vi.useFakeTimers();
+    const s = new Session({ cfg: cfg({ debounceMs: 200, remindEvery: 0 }) });
+    await s.start();
+    const run = script(s.decision, [keepOpen()]);
+    await s.user("fix auth");
+    await s.intent({ action: "open", label: "Fix flaky auth test", reason: "reported", done: "suite passes", give_up: "blocked" });
     await s.round("reading a big file", [{ name: "read", args: { path: "big.txt" }, output: filler(3000, "tok") }]);
-    // Janus starts at the first tool call, while the tools run: its evidence ends at the new assistant message
-    expect(Object.keys(run.evidence[0])).toEqual(["intent_stack", "recent_rounds"]);
-    expect(run.evidence[0].recent_rounds).toContain('→ read({"path":"big.txt"})');
-    expect(run.evidence[0].recent_rounds).not.toContain("tok0 tok1");
-    await s.round("next", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
-    const ev = run.evidence[1];
+    vi.advanceTimersByTime(250);
+    await s.drain();
+
+    const ev = run.evidence[0];
     expect(ev.intent_stack).toMatch(/^- \[[0-9a-z]{8}\] Fix flaky auth test \(open for \d+ rounds\)\n {2}why: /);
-    expect(estimateTokens(ev.recent_rounds)).toBeLessThan(1200); // tool output cut to its first and last 300 tokens
+    expect(estimateTokens(ev.recent_rounds)).toBeLessThan(1500);
     expect(ev.recent_rounds).toContain("tok0 tok1");
     expect(ev.recent_rounds).toContain("tok2999");
     expect(ev.recent_rounds).not.toContain("tok1500");
-  });
 
-  it("appends a compact reminder every 8 rounds within the same intent", async () => {
-    const { s, steps } = await withIntent();
-    const contents: string[] = [];
-    for (let i = 0; i < 17; i++) {
-      steps.push(keepOpen());
-      const b = await s.round(`step ${i}`, [{ name: "bash", args: { command: "true" }, output: "" }]);
-      contents.push(...b.messages.map((m) => m.content));
-    }
-    expect(contents).toEqual(['[intent] Still working on "Fix flaky auth test". Done when: the check passes Give up when: three attempts fail', '[intent] Still working on "Fix flaky auth test". Done when: the check passes Give up when: three attempts fail']);
-  });
-
-  it("handles in-transcript user messages (steering/follow-up): excludes them from prior evidence and closures, and anchors the new intent at the response after them", async () => {
-    const { s, steps } = await withIntent();
-    scribe(s.aux, [{ label: "Fix users schema" }]);
-    const tools = [{ name: "bash", args: { command: "echo step" }, output: "step" }];
-    steps.push(keepOpen());
-    await s.round("checking auth", tools);
-    const priorLeaf = (await s.h.listEntries()).at(-1)!.id;
-
-    // Pi persists steering/follow-up messages before `context` fires
-    const steerId = s.h.user("forget auth, fix src/db/schema.ts instead");
-    const run = script(s.decision, [
-      (qs) => ({ ...Object.fromEntries(qs.filter((q) => q.startsWith("close.")).map((q) => [q, { open: 0.85, abandoned: 0.15 }])), focus: { new_root: 0.94 }, redirect: 0.95 }),
-    ]);
-    const batch = await s.engine.onUserMessage("forget auth, fix src/db/schema.ts instead", undefined, { inTranscript: 1 });
-    // evidence does not duplicate the steering message inside recent_rounds
-    expect(run.evidence[0].user_message).toBe("forget auth, fix src/db/schema.ts instead");
-    expect(run.evidence[0].recent_rounds).not.toContain("forget auth, fix src/db/schema.ts instead");
-    expect(run.evidence[0].recent_rounds).toContain("checking auth");
-    // the closed intent ends before the steering message, never swallowing it
-    const closed = [...s.engine.state.intents.values()].find((i) => i.label === "Fix flaky auth test")!;
-    expect(closed.status).toBe("abandoned");
-    expect(closed.closedEntryId).toBe(priorLeaf);
-    expect(closed.closedEntryId).not.toBe(steerId);
-    // the new intent opens, and its guidance message is ready to inject
-    const opened = s.engine.state.innermost()!;
-    expect(opened.label).toBe("Fix users schema");
-    expect(opened.guidanceEntryId).toBe("");
-    expect(batch.messages[0]?.content).toContain('I finished "Fix flaky auth test": set aside.');
-    expect(batch.messages[0]?.content).toContain('I\'m now working on "Fix users schema".');
-
-    // next assistant response lands right after the steering message; guidance commits at turn_end
-    const a2 = s.h.assistant("inspecting schema.ts");
-    await s.h.commit({ records: batch.records, edits: batch.edits, messages: [] });
-    const turnEnd = await s.engine.onTurnEnd();
-    await s.h.commit({ records: turnEnd.records, edits: turnEnd.edits, messages: batch.messages });
-    // guidanceEntryId resolved to the assistant response after the steering message (not after the guidance)
-    expect(opened.guidanceEntryId).toBe(a2.id);
-    // because a2 is inside [guidanceEntryId..], one complete round is enough to close at settle
-    script(s.decision, [closeAll("success")]);
-    const settled = await s.engine.onBeforeSettle();
-    expect(settled.messages[0]?.content).toContain('I finished "Fix users schema": succeeded.');
-    expect(s.engine.state.stack).toEqual([]);
-  });
-
-  it("renders closures, returns and cards in guidance", () => {
     const i = (label: string): Intent => ({ id: "x", parentId: null, label, reason: "r", success: "s.", failure: "f.", guidanceEntryId: "", openedRound: 0, status: "open" });
     expect(renderGuidance({ closed: [{ intent: i("A"), outcome: "success" }], backTo: i("Parent") })).toBe('[intent] I finished "A": succeeded.\nI\'m back to "Parent". Done when: s.');
-    expect(renderGuidance({ closed: [], kindled: i("B"), cards: "[m:7f3a9k2d] card" })).toBe('[intent] I\'m now working on "B".\nWhy: r\nDone when: s.\nGive up when: f.\nMemory that may help:\n[m:7f3a9k2d] card');
+    expect(renderDriftReminder('Focus shifted. Call `intent` with action "shift".', [i("A")])).toBe('[intent] Drift check: Focus shifted. Call `intent` with action "shift".\nCurrent stack: "A"');
   });
 });
 

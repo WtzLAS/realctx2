@@ -478,6 +478,7 @@ export class Host {
           closures: this.engine.state.closedOrder.length,
           consolidations: s.records,
           janusLate: s.janusLate,
+          driftReminders: s.driftReminders,
           foldsSkippedByCost: s.foldsSkippedByCost,
         });
       }

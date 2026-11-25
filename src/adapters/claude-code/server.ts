@@ -160,7 +160,7 @@ export class ClaudeServer {
 
   // ───────────── start and stop
   async start(): Promise<void> {
-    this.mcp = new McpServer({ input: this.o.input, output: this.o.output, tools: () => this.mcpTools(), instructions: () => "realctx2 keeps long-term memory and the archive of consolidated turns for this session. search looks through both; recall opens an ID; inspect shows where it comes from." });
+    this.mcp = new McpServer({ input: this.o.input, output: this.o.output, tools: () => this.mcpTools(), instructions: () => "realctx2 manages the session's intent stack, long-term memory, and archive of consolidated turns. Use intent to open, close, shift, or update the active purpose stack; search looks through memory and earlier turns; recall opens an ID; inspect shows where it comes from." });
     if (this.aux) return;
     this.socket = socketPath(this.env.CLAUDE_PLUGIN_DATA, process.pid);
     this.net = await listen(this.socket, (req) => this.dispatch(req));

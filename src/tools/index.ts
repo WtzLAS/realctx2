@@ -1,11 +1,12 @@
 /**
- * The five agent-facing tools (§8.1). Parameters are plain JSON Schema objects; the pi adapter
+ * The six agent-facing tools (§8.1). Parameters are plain JSON Schema objects; the pi adapter
  * hands them to `registerTool`, the Claude Code adapter to its MCP server.
  */
 import type { JSONSchema, ToolCallContext, ToolDef, ToolResultPayload } from "../core/types.ts";
 import { errMsg } from "../util/errors.ts";
 import { AUX_TOOL_KEYS, fail, TOOL_KEYS, type ToolEnv, type ToolKey, toolNames } from "./env.ts";
 import { runInspect } from "./inspect.ts";
+import { runIntent } from "./intent.ts";
 import { runForget, runRemember } from "./memwrite.ts";
 import { runRecall } from "./recall.ts";
 import { runSearch } from "./search.ts";
@@ -81,6 +82,50 @@ function schemas(aux: boolean): Record<ToolKey, JSONSchema> {
         purge: { type: "boolean", description: "Permanently remove instead of retiring. Only when the user asked for permanent removal; refused for shared memories." },
       },
     },
+    intent: {
+      type: "object",
+      additionalProperties: false,
+      required: ["action"],
+      properties: {
+        action: {
+          type: "string",
+          enum: ["open", "close", "shift", "update"],
+          description:
+            'open: push a new root or sub-intent onto the stack. close: pop innermost intent(s) once done or abandoned (triggers consolidation). shift: atomically close innermost intent(s) and open the next purpose in one call. update: edit the innermost intent\'s label, reason, or conditions in place without closing it.',
+        },
+        label: {
+          type: "string",
+          description: 'Short purpose (at most 12 words) — name a purpose, not an action (e.g. "Find why login is flaky", not "Run the tests"). Required for open and shift.',
+        },
+        reason: {
+          type: "string",
+          description: "Why this purpose now, in one sentence.",
+        },
+        done: {
+          type: "string",
+          description: "Observable condition in the transcript that means this purpose is complete. Required for open and shift.",
+        },
+        give_up: {
+          type: "string",
+          description: "Optional observable condition that means giving up or escalating.",
+        },
+        outcome: {
+          type: "string",
+          enum: ["success", "failure", "abandoned"],
+          description: 'Outcome for close or shift (default: "success").',
+        },
+        count: {
+          type: "integer",
+          minimum: 1,
+          maximum: 20,
+          description: "Number of innermost intents to pop for close or shift (default: 1).",
+        },
+        all: {
+          type: "boolean",
+          description: "Close every open intent on the stack (for close, or for shift when starting an unrelated root goal).",
+        },
+      },
+    },
   };
 }
 
@@ -90,6 +135,7 @@ const RUNNERS: Record<ToolKey, (env: ToolEnv, params: Record<string, unknown>, c
   inspect: runInspect,
   remember: runRemember,
   forget: runForget,
+  intent: runIntent,
 };
 
 export interface BuildOptions {
@@ -138,6 +184,17 @@ export function buildTools(getEnv: () => ToolEnv | null, cfg: ToolEnv["cfg"], op
       description: "Retire a memory that is wrong or obsolete. It acts at once: the memory is archived with the reason and leaves retrieval. A description acts only if it matches exactly one memory; otherwise the candidates come back.",
       snippet: "Retire a memory that is wrong or obsolete",
       guidelines: [`Use ${shown.forget} when a memory card turned out wrong; give the reason.`],
+      readOnly: false,
+    },
+    intent: {
+      label: "Manage intent stack",
+      description:
+        "Maintain the nested intent stack (`open`, `close`, `shift`, `update`). Opening an intent records your purpose and completion condition and surfaces relevant memories and path rules; closing or shifting consolidates finished work to keep context clean.",
+      snippet: "Open, close, shift, or update the active intent stack",
+      guidelines: [
+        `Maintain the intent stack with ${shown.intent} whenever possible: open at the start of a task or distinct sub-goal, close when finished or abandoned, shift to move directly to the next purpose, or update to refine conditions.`,
+        `Closing completed sub-intents lets realctx2 consolidate finished work automatically; keep labels purpose-oriented (≤12 words) with concrete, observable completion conditions.`,
+      ],
       readOnly: false,
     },
   };

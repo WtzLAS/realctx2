@@ -11,7 +11,7 @@ import { getKeybindings, matchesKey } from "@earendil-works/pi-tui";
 import { type DecisionProviderConfig, Layout, loadGlobalConfig, normalizeEnvVarName, resolveApiKey, saveConfig } from "../../core/config.ts";
 import { Host } from "../../core/host.ts";
 import { SETTINGS_CATEGORIES } from "../../core/settings-schema.ts";
-import type { CommandIO, CommitBatch, ConsolidationRecord, ContextEdit, DecisionQuestion, GuidanceMessage, SessionRecord } from "../../core/types.ts";
+import type { CommandIO, ConsolidationRecord, ContextEdit, DecisionQuestion, GuidanceMessage, SessionRecord } from "../../core/types.ts";
 import { SUBCOMMANDS } from "../../commands/index.ts";
 import type { ReviewModel } from "../../commands/review.ts";
 import type { PendingDelivery } from "../../context/engine.ts";
@@ -243,7 +243,6 @@ class PiExtension {
   private providerRegistered = false;
   private notified = new Set<string>();
   /** `agent_start` events seen: tells the Working row whether pi started the run it waited for. */
-  private runsStarted = 0;
 
   constructor(pi: ExtensionAPI) {
     this.pi = pi;
@@ -426,22 +425,7 @@ class PiExtension {
       return undefined;
     }
     this.expectInitialUser = true;
-    // pi shows its Working row only at the first turn_start, after every before_agent_start
-    // handler; until then the prompt has left the editor and nothing says the run is waiting
-    const runs = this.runsStarted;
-    const working = workingRow(ctx, { started: () => this.runsStarted !== runs });
-    // Esc cancels the wait: Janus stops, pi aborts the run when it starts
-    const interrupt = interruptWatch(ctx);
-    working.show(interrupt.active ? `${WORKING_MESSAGE} (${interruptKeyText()} to interrupt)` : WORKING_MESSAGE);
-    const signal = ctx.signal ? AbortSignal.any([ctx.signal, interrupt.signal]) : interrupt.signal;
-    let batch: CommitBatch;
-    try {
-      batch = await host.engine.onUserMessage(event.prompt ?? "", signal);
-    } finally {
-      interrupt.dispose();
-      working.restore();
-    }
-    if (interrupt.signal.aborted) host.telemetry.event("pi.prompt_interrupted", {});
+    const batch = await host.engine.onUserMessage(event.prompt ?? "", ctx.signal);
     this.adapter.deferred.edits.push(...batch.edits);
     host.updateStatus();
     const msg = batch.messages[0];
@@ -484,6 +468,7 @@ class PiExtension {
     }
     const deliveries = own ? ((event.details as { deliveries?: PendingDelivery[] } | undefined)?.deliveries ?? undefined) : undefined;
     const patch = await host.engine.onToolResult({ toolCallId: event.toolCallId, toolName: event.toolName, text: textOf(event.content), isError: event.isError, event: pathEvent, nested: !!event.parentToolCallId, own, deliveries });
+    if (own) host.updateStatus();
     if (!patch) return undefined;
     // text is replaced as one part; images stay. structuredContent is forwarded, so structured
     // tool outputs are not dropped when the content is patched.
@@ -766,9 +751,6 @@ class PiExtension {
       }),
     );
     pi.on("before_agent_start", this.safe("before_agent_start", (e, ctx) => this.onBeforeAgentStart(e, ctx)));
-    pi.on("agent_start", () => {
-      this.runsStarted++;
-    });
     pi.on("message_end", this.safe("message_end", (e) => this.onMessageEnd(e)));
     pi.on("context", this.safe("context", (e, ctx) => this.onContext(e, ctx)));
     pi.on("agent_end", () => {

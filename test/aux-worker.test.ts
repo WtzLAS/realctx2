@@ -79,14 +79,14 @@ describe("aux session plumbing (§9.3)", () => {
     const cfg = testConfig({ providers: { aux: { pi: { model: "anthropic/claude-haiku", thinking: "high", roles: { precip: { tools: "read-only+bash", model: "anthropic/claude-sonnet", timeoutMs: 5 }, reverify: { tools: "read-only+bash", maxTurns: 3 } } } } } });
     const t = (role: AuxTask["role"], over: Partial<AuxTask> = {}): AuxTask => ({ role, instructions: "", data: [], schema: {}, ...over });
     expect(roleSettings(cfg, "pi", t("precip"))).toEqual({ tools: "none", thinking: "medium", maxTurns: 1, timeoutMs: 1000, model: "anthropic/claude-sonnet" });
-    expect(roleSettings(cfg, "pi", t("janus.scribe"))).toMatchObject({ tools: "none", thinking: "off", model: "anthropic/claude-haiku" });
+    expect(roleSettings(cfg, "pi", t("decision.emulate"))).toMatchObject({ tools: "none", thinking: "off", model: "anthropic/claude-haiku" });
     expect(roleSettings(cfg, "pi", t("reverify"))).toMatchObject({ tools: "read-only+bash", thinking: "high", maxTurns: 3, timeoutMs: 360_000 });
     // default timeouts: twice the old ones, never under 30 s
     expect(Object.fromEntries(Object.entries(ROLE_DEFAULTS).map(([r, s]) => [r, s.timeoutMs / 1000]))).toEqual({
-      "janus.scribe": 30, precip: 120, palim: 120, "qemem.planner": 30, "qemem.constructor": 240, "write.merge": 60,
+      precip: 120, palim: 120, "qemem.planner": 30, "qemem.constructor": 240, "write.merge": 60,
       "evo.operator": 240, "ingest.slicer": 600, reverify: 360, "review.resolve": 240, "decision.emulate": 30,
     });
-    expect(roleSettings(cfg, "pi", t("janus.scribe")).timeoutMs).toBe(30_000);
+    expect(roleSettings(cfg, "pi", t("qemem.planner")).timeoutMs).toBe(30_000);
     expect(roleSettings(cfg, "pi", t("reverify", { tools: "none" })).tools).toBe("none");
     expect(roleSettings(cfg, "pi", t("palim", { budget: { timeoutMs: 30_000, thinking: "low" } }))).toMatchObject({ thinking: "low", timeoutMs: 30_000 });
     expect(roleSettings(cfg, "claudeCode", t("evo.operator"))).toMatchObject({ tools: "read-only", maxTurns: 6 });
@@ -249,7 +249,7 @@ describe("aux sessions in pi (§9.3.3)", () => {
     expect(t.seen[0]!.opts).toMatchObject({ reasoning: "low", maxTokens: 4000 });
     expect(t.seen[1]!.last).toBe('That did not match the schema ($.verdict: must be one of ["holds","changed"]). Answer again with one JSON object that matches it, and nothing else.');
     const off = runner([() => say('{"verdict":"holds"}')]);
-    await off.r.run({ role: "janus.scribe", instructions: "n", data: [], schema });
+    await off.r.run({ role: "decision.emulate", instructions: "n", data: [], schema });
     expect(off.seen[0]!.opts).toMatchObject({ temperature: 0 });
     expect(off.seen[0]!.opts.reasoning).toBeUndefined();
     // the call is logged and counted against the daily aux budget
@@ -378,7 +378,7 @@ describe("aux sessions in pi (§9.3.3)", () => {
       memory: () => null,
       ownTools: () => [],
     });
-    const out = await r.run({ role: "janus.scribe", instructions: "n", data: [], schema });
+    const out = await r.run({ role: "decision.emulate", instructions: "n", data: [], schema });
     expect(out.output).toEqual({ verdict: "holds" });
     expect(seen[0]).toMatchObject({ reasoning: "low" });
     expect(seen[0]!.temperature).toBeUndefined();

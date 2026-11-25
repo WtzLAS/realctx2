@@ -8,37 +8,19 @@ import type { AuxTask, ConsolidationRecord, EntryView } from "../src/core/types.
 import { MemoryRuntime } from "../src/memory/runtime.ts";
 import { MemoryWriter } from "../src/memory/write.ts";
 import { estimateTokens } from "../src/util/text.ts";
-import { type Answers, FakeAux, FakeDecision, world, type World } from "./helpers/fakes.ts";
+import { type Answers, FakeAux, world, type World } from "./helpers/fakes.ts";
 import { cleanupTmp, commitAll, initRepo, testConfig, tmp, write } from "./helpers/fixtures.ts";
 import { filler, Session } from "./helpers/harness.ts";
 
 afterAll(cleanupTmp);
 
-const cfg = (over: Record<string, unknown> = {}) => testConfig({ context: { maxWindow: 32000, ...over }, janus: { lateWaitMs: 30 } });
+const cfg = (over: Record<string, unknown> = {}) => testConfig({ context: { maxWindow: 32000, ...over }, janus: { lateWaitMs: 30, driftCooldownRounds: 0 } });
 
-/** A Janus that follows a script of focus moves and closures by label. */
-function director(decision: FakeDecision, aux: FakeAux) {
-  const plan: Array<{ kindle?: string; close?: string[]; focus?: string; redirect?: number; outcome?: string }> = [];
-  let pendingLabel = "";
-  decision.on("janus", (ev, qs) => {
-    const step = plan.shift() ?? {};
-    const out: Answers = {};
-    for (const q of qs) {
-      if (q.name.startsWith("close.")) {
-        const label = /"([^"]+)"/.exec(q.instructions)?.[1] ?? "";
-        out[q.name] = step.close?.includes(label) ? { open: 0.05, [step.outcome ?? "success"]: 0.9 } : { open: 0.95 };
-      }
-    }
-    if (step.kindle) {
-      pendingLabel = step.kindle;
-      out.focus = { [step.focus ?? (String(ev.intent_stack).startsWith("(no open") ? "new_root" : step.close?.length ? "successor" : "deepen")]: 0.9 };
-    } else out.focus = { continue: 0.95 };
-    if (step.redirect !== undefined) out.redirect = step.redirect;
-    return out;
-  });
-  aux.on("janus.scribe", () => ({ label: pendingLabel, reason: `because ${pendingLabel}`, success: `${pendingLabel} is done`, failure: `${pendingLabel} cannot be done` }));
-  return plan;
-}
+const openIntent = (s: Session, label: string) =>
+  s.intent({ action: "open", label, reason: `because ${label}`, done: `${label} is done`, give_up: `${label} cannot be done` });
+
+const closeIntent = (s: Session, opts: { count?: number; all?: boolean; outcome?: "success" | "failure" | "abandoned" } = {}) =>
+  s.intent({ action: "close", ...opts });
 
 function consolidators(aux: FakeAux, log: AuxTask[] = []) {
   aux.on("precip", (task) => {
@@ -66,34 +48,29 @@ async function hiddenReachable(s: Session): Promise<void> {
 }
 
 describe("Precip (§5.3)", () => {
-  it("consolidates a closed intent asynchronously and commits at the next turn end, anchored on its guidance", async () => {
+  it("consolidates a closed intent asynchronously and commits at the next turn end, anchored on its opening round", async () => {
     const s = new Session({ cfg: cfg() });
     const log = consolidators(s.aux);
-    const plan = director(s.decision, s.aux);
     await s.start();
-    plan.push({ kindle: "Fix the flaky auth test" });
     await s.user("please fix the flaky auth test");
-    plan.push({ kindle: "Find the race in TokenCache" });
-    await s.round("first I need to find the race", work(0));
-    for (let i = 1; i < 4; i++) {
-      plan.push({});
-      await s.round(`investigating ${i}`, work(i));
-    }
+    await openIntent(s, "Fix the flaky auth test");
+    await openIntent(s, "Find the race in TokenCache");
+    for (let i = 1; i < 4; i++) await s.round(`investigating ${i}`, work(i));
     const child = s.engine.state.stack[1]!;
-    // the closure record and guidance commit at once; Precip's aux call runs in the background
-    plan.push({ close: ["Find the race in TokenCache"] });
-    const b1 = await s.round("found it: two refreshes overlap", work(4));
+    // closing commits the closure record at once; Precip's aux call runs in the background
+    const closeRes = await closeIntent(s);
+    const b1 = closeRes.batch;
     const before = await s.h.requestTokens();
     expect(b1.records.some((r) => r.type === "realctx2.intent" && r.intent.status === "success")).toBe(true);
     expect(b1.edits).toEqual([]);
-    expect(b1.messages[0]!.content).toBe('[intent] I finished "Find the race in TokenCache": succeeded.\nI\'m back to "Fix the flaky auth test". Done when: Fix the flaky auth test is done');
+    expect(closeRes.text).toContain('Closed "Find the race in TokenCache" (succeeded).');
+    expect(closeRes.text).toContain('Back to "Fix the flaky auth test". Done when: Fix the flaky auth test is done');
     await s.drain();
-    plan.push({});
     const b2 = await s.round("now fixing", work(5, 50));
     const record = b2.records.find((r) => r.type === "realctx2.consolidation")!.record as ConsolidationRecord;
     expect(record).toMatchObject({ kind: "precip", intentId: child.id, outcome: "success", telos: ["Fix the flaky auth test"], anchorId: child.guidanceEntryId });
     expect(record.id).toMatch(/^t:[0-9a-z]{8}$/);
-    // one edit replaces the guidance, the rest omit; all in one batch, so the cache breaks once
+    // one edit replaces the anchor, the rest omit; all in one batch, so the cache breaks once
     expect(b2.edits[0]).toEqual({ targetId: child.guidanceEntryId, replacement: expect.stringContaining(`[${record.id} · intent "Find the race in TokenCache" · succeeded · details archived]\nI worked on`) });
     expect(b2.edits.slice(1).every((e) => e.replacement === null)).toBe(true);
     expect(b2.edits.length).toBe(record.children.length);
@@ -103,81 +80,27 @@ describe("Precip (§5.3)", () => {
     expect(task.data.map((d) => d.label)).toEqual(["PURPOSE", "ENCLOSING PURPOSES (outermost first)", "WORK TO CONSOLIDATE"]);
     expect(task.data[0]!.text).toContain('"Find the race in TokenCache" — succeeded');
     expect(task.data[2]!.text).toContain("investigating 3");
-    // the latest round at closure time was excluded (invariant 3): the closing round is still raw
+    // the closing round itself stays raw outside the closed span; the open parent stays intact
     const ctx = await s.h.contextText();
-    expect(ctx).toContain("found it: two refreshes overlap");
     expect(ctx).not.toContain("investigating 2");
-    expect(ctx).toContain('[intent] I\'m now working on "Fix the flaky auth test"'); // the open intent's guidance stays
+    expect(ctx).toContain('Opened "Fix the flaky auth test".');
     await hiddenReachable(s);
     // recall opens one layer: raw entries with r: IDs
     const entries = new Map((await s.h.listEntries()).map((e) => [e.id, e] as [string, EntryView]));
     const layer = renderLayer(record, s.engine.state, entries, "sess-test");
-    expect(layer).toMatch(/^\[r:[0-9a-z]{8}\] \[intent\] I'm now working on "Find the race in TokenCache"/);
     expect(layer).toContain("investigating 2");
     expect(layer.match(/\[r:[0-9a-z]{8}\]/g)!.length).toBe(record.children.length);
-  });
-
-  it("consolidates a late intent from its user message on: the round before its guidance is included", async () => {
-    const s = new Session({ cfg: testConfig({ context: { maxWindow: 32000 }, janus: { lateWaitMs: 30, timeoutMs: 100 } }) });
-    consolidators(s.aux);
-    const plan = director(s.decision, s.aux);
-    await s.start();
-    plan.push({});
-    await s.user("hello");
-    await s.round("hi, what should I do?", []);
-    // the scribe misses the user message's budget: the intent opens at the first turn_end
-    const held: Array<() => void> = [];
-    s.aux.on("janus.scribe", async () => {
-      await new Promise<void>((r) => held.push(r));
-      return { label: "Fix the flaky auth test", reason: "the user asked", success: "the suite passes", failure: "no cause found" };
-    });
-    plan.push({ kindle: "Fix the flaky auth test" });
-    expect((await s.user("please fix the flaky auth test")).messages).toEqual([]);
-    held.shift()!();
-    await new Promise((r) => setTimeout(r, 15));
-    plan.push({});
-    const b1 = await s.round("first I'll read the test", work(0));
-    expect(b1.messages[0]!.content).toContain('I\'m now working on "Fix the flaky auth test"');
-    const intent = s.engine.state.stack[0]!;
-    const entries = await s.h.listEntries();
-    const user = entries.findIndex((e) => e.kind === "user" && e.text === "please fix the flaky auth test");
-    const first = entries[user + 1]!;
-    expect(first).toMatchObject({ kind: "assistant" });
-    expect(intent.guidanceEntryId).toBe(first.id);
-    const guidance = entries.find((e) => (e.details as { intentId?: string } | undefined)?.intentId === intent.id)!;
-    expect(entries.indexOf(guidance)).toBeGreaterThan(user + 1);
-    // the start is in the intent's record: a rebuild keeps it, and resolving ids does not move it
-    await s.engine.onSessionStart();
-    expect(s.engine.state.stack[0]!.guidanceEntryId).toBe(first.id);
-    for (let i = 1; i < 3; i++) {
-      plan.push({});
-      await s.round(`investigating ${i}`, work(i));
-    }
-    plan.push({ close: ["Fix the flaky auth test"] });
-    await s.round("the suite passes now", work(3));
-    await s.drain();
-    plan.push({});
-    const b2 = await s.round("wrapping up", work(4, 50));
-    const record = b2.records.find((r) => r.type === "realctx2.consolidation")!.record as ConsolidationRecord;
-    expect(record).toMatchObject({ kind: "precip", intentId: intent.id, anchorId: guidance.id });
-    expect(record.children[0]).toEqual({ entryId: first.id });
-    expect(await s.h.contextText()).not.toContain("first I'll read the test");
-    await hiddenReachable(s);
   });
 
   it("skips the replacement when the span is small, and consolidates intent-only closures together", async () => {
     const s = new Session({ cfg: cfg() });
     const log = consolidators(s.aux);
-    const plan = director(s.decision, s.aux);
     await s.start();
-    plan.push({ kindle: "Tidy the README" });
     await s.user("tidy the readme");
-    plan.push({});
+    await openIntent(s, "Tidy the README");
     await s.round("small edit", work(0, 40));
-    plan.push({ close: ["Tidy the README"] });
-    await s.round("done", work(1, 40));
+    await closeIntent(s);
     await s.drain();
-    plan.push({});
     const b = await s.round("next", work(2, 40));
     // under 1,500 tokens: the closure is recorded, but nothing is replaced and no aux call is spent
     expect(b.edits).toEqual([]);
@@ -187,21 +110,15 @@ describe("Precip (§5.3)", () => {
     // a parent whose region holds only its guidance and the child's span closes together with the child
     const s2 = new Session({ cfg: cfg() });
     const log2 = consolidators(s2.aux);
-    const plan2 = director(s2.decision, s2.aux);
     const intent = (id: string, label: string, parentId: string | null) => ({ id, parentId, label, reason: "r", success: "s", failure: "f", guidanceEntryId: "", openedRound: 0, status: "open" as const });
     s2.h.user("do the outer thing, starting with the inner one");
     await s2.h.commit({ records: [{ type: "realctx2.intent", intent: intent("outer001", "Outer purpose", null) }], edits: [], messages: [{ customType: GUIDANCE_TYPE, content: '[intent] I\'m now working on "Outer purpose".', display: true, details: { intentId: "outer001" } }] });
     await s2.h.commit({ records: [{ type: "realctx2.intent", intent: intent("inner001", "Inner purpose", "outer001") }], edits: [], messages: [{ customType: GUIDANCE_TYPE, content: '[intent] I\'m now working on "Inner purpose" (inside: Outer purpose).', display: true, details: { intentId: "inner001" } }] });
     await s2.start();
     expect(s2.engine.state.stack.map((i) => i.label)).toEqual(["Outer purpose", "Inner purpose"]);
-    for (let i = 0; i < 4; i++) {
-      plan2.push({});
-      await s2.round(`inner work ${i}`, work(i));
-    }
-    plan2.push({ close: ["Inner purpose", "Outer purpose"] });
-    await s2.round("all done", work(4, 30));
+    for (let i = 0; i < 4; i++) await s2.round(`inner work ${i}`, work(i));
+    await closeIntent(s2, { all: true });
     await s2.drain();
-    plan2.push({});
     const b2 = await s2.round("after", work(5, 30));
     const records = b2.records.filter((r) => r.type === "realctx2.consolidation").map((r) => (r as { record: ConsolidationRecord }).record);
     expect(records.length).toBe(1);
@@ -218,26 +135,17 @@ describe("Precip (§5.3)", () => {
   it("consolidates nested closures innermost first, so the outer record nests the inner one", async () => {
     const s = new Session({ cfg: cfg() });
     consolidators(s.aux);
-    const plan = director(s.decision, s.aux);
     await s.start();
-    plan.push({ kindle: "Outer purpose" });
     await s.user("outer");
-    plan.push({});
+    await openIntent(s, "Outer purpose");
     await s.round("outer work a", work(0));
-    plan.push({ kindle: "Inner purpose" });
-    await s.round("starting inner", work(1));
-    for (let i = 2; i < 5; i++) {
-      plan.push({});
-      await s.round(`inner work ${i}`, work(i));
-    }
-    plan.push({ close: ["Inner purpose", "Outer purpose"] });
-    await s.round("both done", work(5, 30));
+    await openIntent(s, "Inner purpose");
+    for (let i = 2; i < 5; i++) await s.round(`inner work ${i}`, work(i));
+    await closeIntent(s, { all: true });
     await s.drain();
-    plan.push({});
     const b1 = await s.round("after 1", work(6, 30)); // the inner Precip commits; the outer one starts
     expect(b1.records.filter((r) => r.type === "realctx2.consolidation").map((r) => (r as { record: ConsolidationRecord }).record.intentId)).toEqual([[...s.engine.state.intents.values()].find((i) => i.label === "Inner purpose")!.id]);
     await s.drain();
-    plan.push({});
     const b2 = await s.round("after 2", work(7, 30));
     const outer = b2.records.find((r) => r.type === "realctx2.consolidation")!.record as ConsolidationRecord;
     const inner = b1.records.find((r) => r.type === "realctx2.consolidation")!.record as ConsolidationRecord;
@@ -252,53 +160,50 @@ describe("Precip (§5.3)", () => {
     expect(renderLayer(outer, s.engine.state, entries, "sess-test")).toContain(`[${inner.id} · intent "Inner purpose" · succeeded · details archived]`);
   });
 
-  it("runs Precip for intents closed at settle during idle time, and commits at the next turn end", async () => {
+  it("runs slow Precip during idle time and commits at the next turn end", async () => {
     const s = new Session({ cfg: cfg() });
-    const log = consolidators(s.aux);
-    const plan = director(s.decision, s.aux);
+    let release!: () => void;
+    let precipCalls = 0;
+    s.aux.on("precip", async () => {
+      precipCalls++;
+      await new Promise<void>((r) => (release = r));
+      return { memory: "Idle-finished summary.", sidecar: { outcome_summary: "ok", state_changes: [], artifacts: [], open_threads: [] } };
+    });
     await s.start();
-    plan.push({ kindle: "Fix the build" });
     await s.user("fix the build");
-    for (let i = 0; i < 4; i++) {
-      plan.push({});
-      await s.round(`build work ${i}`, work(i));
-    }
-    plan.push({ close: ["Fix the build"] }); // closure-only Janus at settle (the final response made no tool call)
-    const settle = await s.finish("The build is green now.");
-    expect(settle.messages.at(-1)!.content).toBe('[intent] I finished "Fix the build": succeeded.');
-    expect(log.filter((t) => t.role === "precip")).toEqual([]); // the prompt cursor never waits on an aux call
-    await s.engine.onIdle();
-    expect(log.filter((t) => t.role === "precip").length).toBe(1);
-    plan.push({ kindle: "Next task" });
+    await openIntent(s, "Fix the build");
+    for (let i = 0; i < 4; i++) await s.round(`build work ${i}`, work(i));
+    await closeIntent(s);
+    await s.finish("The build is green now.");
+    const idle = s.engine.onIdle();
+    release();
+    await idle;
+    expect(precipCalls).toBe(1);
     await s.user("now something else");
-    plan.push({});
     const b = await s.round("starting", work(9, 30));
     expect(b.records.some((r) => r.type === "realctx2.consolidation")).toBe(true);
     expect(await s.h.contextText()).toContain('intent "Fix the build" · succeeded · details archived]');
     await hiddenReachable(s);
   });
 
-  it("retries a deferred Precip job when idle is aborted by user input", async () => {
+  it("retries an aborted idle Precip job when idle is interrupted by user input", async () => {
     const s = new Session({ cfg: cfg() });
     let precipCalls = 0;
     s.aux.on("precip", async (task) => {
       precipCalls++;
       if (precipCalls === 1) {
-        // simulate an aux call interrupted by user input during idle
         await new Promise((r) => setTimeout(r, 40));
         if (task.signal?.aborted) return null;
       }
       return { memory: "Deferred summary after retry.", sidecar: { artifacts: [], entities: [], outcome: "ok" } };
     });
-    const plan = director(s.decision, s.aux);
     await s.start();
-    plan.push({ kindle: "Retryable task" });
     await s.user("do retryable task");
-    for (let i = 0; i < 4; i++) {
-      plan.push({});
-      await s.round(`retry work ${i}`, work(i));
-    }
-    plan.push({ close: ["Retryable task"] });
+    await openIntent(s, "Retryable task");
+    for (let i = 0; i < 4; i++) await s.round(`retry work ${i}`, work(i));
+    // Close without triggering turn_end start, simulating a deferred Precip job queued for idle
+    await s.engine.applyIntentAction({ action: "close" });
+    for (const j of (s.engine as unknown as { precipJobs: Array<{ deferred: boolean }> }).precipJobs) j.deferred = true;
     await s.finish("Done.");
     const ac = new AbortController();
     const firstIdle = s.engine.onIdle(ac.signal);
@@ -309,9 +214,7 @@ describe("Precip (§5.3)", () => {
     // second idle retries and completes the deferred Precip instead of losing it
     await s.engine.onIdle();
     expect(precipCalls).toBe(2);
-    plan.push({ kindle: "Follow-up" });
     await s.user("next");
-    plan.push({});
     const b = await s.round("working", work(9, 30));
     expect(b.records.some((r) => r.type === "realctx2.consolidation")).toBe(true);
     expect(await s.h.contextText()).toContain('intent "Retryable task" · succeeded · details archived]');
@@ -319,18 +222,13 @@ describe("Precip (§5.3)", () => {
 });
 
 describe("Palim (§5.4)", () => {
-  async function twoClosedIntents(s: Session, plan: ReturnType<typeof director>, rounds = 4, words = 1400): Promise<void> {
+  async function twoClosedIntents(s: Session, rounds = 4, words = 1400): Promise<void> {
     for (const [n, label] of ["First task", "Second task"].entries()) {
-      plan.push({ kindle: label, focus: "new_root" });
       await s.user(`do ${label}`);
-      for (let i = 0; i < rounds; i++) {
-        plan.push({});
-        await s.round(`${label} step ${i}`, work(n * 10 + i, words));
-      }
-      plan.push({ close: [label] });
-      await s.round(`${label} finished`, work(n * 10 + 9, 30));
+      await openIntent(s, label);
+      for (let i = 0; i < rounds; i++) await s.round(`${label} step ${i}`, work(n * 10 + i, words));
+      await closeIntent(s);
       await s.drain();
-      plan.push({});
       await s.round(`${label} wrap-up`, work(n * 10 + 8, 30));
     }
   }
@@ -339,15 +237,13 @@ describe("Palim (§5.4)", () => {
     // free cache writes: the cost check passes, so this test is about the size rule
     const s = new Session({ cfg: cfg({ Tmin: 100, deltaMin: 100, climb: { costCheck: false } }) });
     const log = consolidators(s.aux);
-    const plan = director(s.decision, s.aux);
     await s.start();
-    await twoClosedIntents(s, plan);
+    await twoClosedIntents(s);
     expect(s.engine.state.records.size).toBe(2);
     expect(log.filter((t) => t.role === "palim")).toEqual([]); // T_min is floored at 8,192: two short Precip messages are not enough
     // more material in the root region: once the unfolded part before the working tail passes T_min, it folds
     const palim = () => [...s.engine.state.records.values()].find((r) => r.kind === "palim");
     for (let i = 0; i < 12 && !palim(); i++) {
-      plan.push({});
       await s.round(`loose work ${i}`, work(50 + i, 1500));
       await s.drain();
     }
@@ -371,15 +267,11 @@ describe("Palim (§5.4)", () => {
   it("skips ordinary folds that do not pay for the cache break, and counts them", async () => {
     const s = new Session({ cfg: cfg() });
     const log = consolidators(s.aux);
-    const plan = director(s.decision, s.aux);
     s.h.price = { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 };
     s.h.systemTokens = 500; // stay under climb.fastOccupancy, where every ordinary fold must pay for itself
     await s.start();
-    await twoClosedIntents(s, plan, 3, 600);
-    for (let i = 0; i < 7; i++) {
-      plan.push({});
-      await s.round(`loose work ${i}`, work(50 + i, 880));
-    }
+    await twoClosedIntents(s, 3, 600);
+    for (let i = 0; i < 7; i++) await s.round(`loose work ${i}`, work(50 + i, 880));
     await s.drain();
     expect(s.engine.status().occupancy).toBeLessThan(16000);
     // warm cache: Δ̂·p_read·R̂ = 0.65·span·0.1·20 = 1.3·span never covers re-caching the suffix plus the aux call
@@ -393,7 +285,6 @@ describe("Palim (§5.4)", () => {
     // a cheaper aux model changes that: Δ̂·(p_write + p_read·(R̂ − 1)) = 2.05·span ≥ C_fold = 1.5·span,
     // while on a warm cache 1.3·span still does not cover C_fold, let alone the suffix
     s.h.auxPrice = { input: 0.8, output: 2, cacheRead: 0.08, cacheWrite: 1 };
-    plan.push({});
     await s.round("one more", work(79, 30));
     expect(folds().size).toBe(0); // still not worth breaking a warm cache
     await s.engine.onIdle();
@@ -406,7 +297,6 @@ describe("Palim (§5.4)", () => {
     expect(edits!.length).toBeGreaterThan(5);
     expect(edits![0]!.replacement).toContain("consolidated earlier work");
     // …and persisted at the next commit point
-    plan.push({});
     const b = await s.round("after the gap", work(80, 30));
     expect(b.edits).toEqual(edits);
     expect(b.records.some((r) => r.type === "realctx2.consolidation" && r.record.kind === "palim")).toBe(true);
@@ -417,23 +307,19 @@ describe("Palim (§5.4)", () => {
     const c = cfg({ climb: { costCheck: false, stableRounds: 2, roundsPerLevel: 2 } });
     const s = new Session({ cfg: c });
     const log = consolidators(s.aux);
-    const plan = director(s.decision, s.aux);
     await s.start();
     const frontiers: number[] = [];
     const note = () => frontiers.push(s.engine.status().frontier);
-    plan.push({ kindle: "Outer" });
     await s.user("outer");
+    await openIntent(s, "Outer");
     note();
     for (let i = 0; i < 3; i++) {
-      plan.push({});
       await s.round(`outer ${i}`, work(i, 1500));
       note();
     }
-    plan.push({ kindle: "Inner" });
-    await s.round("starting inner", work(3, 1500));
+    await openIntent(s, "Inner");
     note();
     for (let i = 0; i < 12; i++) {
-      plan.push({});
       await s.round(`inner ${i}`, work(10 + i, 1500));
       note();
     }
@@ -443,40 +329,32 @@ describe("Palim (§5.4)", () => {
     for (let i = 1; i < frontiers.length; i++) expect(frontiers[i]! - frontiers[i - 1]!).toBeLessThanOrEqual(1);
     expect(frontiers.indexOf(2) - frontiers.indexOf(1)).toBeGreaterThanOrEqual(2);
     await s.drain();
-    plan.push({});
     await s.round("more inner", work(40, 30));
     const folds = [...s.engine.state.records.values()].filter((r) => r.kind === "palim");
-    // the innermost level folds once the part before the working tail holds 2·T_min; guidance is never folded
+    // the innermost level folds once the part before the working tail holds 2·T_min; opening rounds are never folded
     expect(folds.length).toBeGreaterThanOrEqual(1);
     const ctx = await s.h.contextText();
-    expect(ctx).toContain('[intent] I\'m now working on "Outer"');
-    expect(ctx).toContain('[intent] I\'m now working on "Inner" (inside: Outer)');
+    expect(ctx).toContain('Opened "Outer".');
+    expect(ctx).toContain('Opened "Inner" (inside: Outer).');
     expect(log.filter((t) => t.role === "palim")[0]!.data[0]).toMatchObject({ label: "CURRENT PURPOSES (outermost first)" });
     await hiddenReachable(s);
     // an intent at level 2 closes: its consolidation lands in level 1, so the frontier falls back to 0
-    plan.push({ close: ["Inner"] });
-    await s.round("inner done", work(41, 30));
+    await closeIntent(s);
     expect(s.engine.status().frontier).toBe(0);
-    // an intent about to close is not folded: Precip takes it whole
     expect(s.engine.status().stack.map((i) => i.label)).toEqual(["Outer"]);
   });
 
-  it("relieves pressure before the next request: root prefix first, then open intents, guidance kept", async () => {
+  it("relieves pressure before the next request: root prefix first, then open intents, opening round kept", async () => {
     const s = new Session({ cfg: cfg({ climb: { enabled: false } }) });
     const log = consolidators(s.aux);
-    const plan = director(s.decision, s.aux);
     s.h.contextWindow = 32000;
     await s.start();
     // a long root prefix without any intent, then an open intent that keeps growing
-    director(s.decision, s.aux);
     for (let i = 0; i < 5; i++) await s.round(`root work ${i}`, work(i, 1300));
-    plan.length = 0;
-    const plan2 = director(s.decision, s.aux);
-    plan2.push({ kindle: "Long investigation" });
     await s.user("investigate");
+    await openIntent(s, "Long investigation");
     let peak = 0;
     for (let i = 0; i < 16; i++) {
-      plan2.push({});
       await s.round(`digging ${i}`, work(20 + i, 1300));
       peak = Math.max(peak, await s.h.requestTokens());
     }
@@ -489,7 +367,7 @@ describe("Palim (§5.4)", () => {
     // each fold saved at least Δ_min
     for (const f of folds) expect(f.tokensBefore - f.tokensAfter).toBeGreaterThanOrEqual(4096);
     const ctx = await s.h.contextText();
-    expect(ctx).toContain('[intent] I\'m now working on "Long investigation"'); // the purpose stays visible
+    expect(ctx).toContain('Opened "Long investigation".'); // the purpose stays visible
     expect(ctx).toContain("digging 15");
     expect(s.h.notices).toEqual([]);
     // under pressure the fold runs with tight limits
@@ -541,23 +419,15 @@ describe("session state (§5.1)", () => {
   it("rebuilds the intent stack, the consolidation map and the ledger from the branch's records", async () => {
     const s = new Session({ cfg: cfg() });
     consolidators(s.aux);
-    const plan = director(s.decision, s.aux);
     await s.start();
-    plan.push({ kindle: "Outer" });
     await s.user("outer");
-    plan.push({ kindle: "Inner" });
-    await s.round("go inner", work(0));
-    for (let i = 1; i < 4; i++) {
-      plan.push({});
-      await s.round(`inner ${i}`, work(i));
-    }
-    plan.push({ close: ["Inner"] });
-    await s.round("inner done", work(4, 30));
+    await openIntent(s, "Outer");
+    await openIntent(s, "Inner");
+    for (let i = 1; i < 4; i++) await s.round(`inner ${i}`, work(i));
+    await closeIntent(s);
     await s.drain();
-    plan.push({ kindle: "Second inner" });
-    await s.round("next inner", work(5, 30));
-    plan.push({});
-    await s.round("working on it", work(6, 30)); // the harness has assigned the new guidance entry by now
+    await openIntent(s, "Second inner");
+    await s.round("working on it", work(6, 30));
     const before = s.engine.state;
     // a new process: everything comes back from the session's custom records
     const again = SessionState.from(await s.h.listRecords());
@@ -568,7 +438,7 @@ describe("session state (§5.1)", () => {
     const entries = await s.h.listEntries();
     const regions = again.regions(entries);
     expect(regions.map((r) => r.level)).toEqual([0, 1, 2]);
-    expect(entries[regions[1]!.from]!.customType).toBe(GUIDANCE_TYPE);
+    expect(entries[regions[1]!.from]!.kind).toBe("assistant");
     expect(regions[1]!.to).toBe(regions[2]!.from);
     expect(regions[2]!.to).toBe(entries.length);
     expect(again.telos(again.stack[1]!)).toEqual(["Outer"]);
@@ -579,26 +449,19 @@ describe("append-only harnesses (level L0, §4.6.3)", () => {
   it("consolidates in shadow and re-injects the state after the harness compacts", async () => {
     const s = new Session({ cfg: cfg({ Tmin: 100 }), level: 0 });
     consolidators(s.aux);
-    const plan = director(s.decision, s.aux);
     await s.start();
     for (const label of ["Task one", "Task two", "Task three"]) {
-      plan.push({ kindle: label, focus: "new_root" });
       await s.user(`do ${label}`);
-      for (let i = 0; i < 3; i++) {
-        plan.push({});
-        await s.round(`${label} step ${i}`, work(i, 2500));
-      }
-      plan.push({ close: [label] });
-      const b = await s.round(`${label} finished`, work(9, 30));
+      await openIntent(s, label);
+      for (let i = 0; i < 3; i++) await s.round(`${label} step ${i}`, work(i, 2500));
+      const b = (await closeIntent(s)).batch;
       expect(b.edits).toEqual([]);
       await s.drain();
-      plan.push({});
       expect((await s.round(`${label} wrap`, work(8, 30))).edits).toEqual([]);
     }
-    plan.push({ kindle: "Open task", focus: "new_root" });
     await s.user("one more");
+    await openIntent(s, "Open task");
     await s.drain();
-    plan.push({});
     await s.round("working", work(7, 30));
     await s.drain();
     // the transcript keeps the raw messages
@@ -648,20 +511,19 @@ describe("oversized tool results (§5.4.6)", () => {
 });
 
 describe("memory in the loop", () => {
-  async function setup(over: { embeddings?: "none" | "dense"; cfg?: Record<string, unknown> } = {}): Promise<{ w: World; mem: MemoryRuntime; s: Session; plan: ReturnType<typeof director>; repo: string }> {
+  async function setup(over: { embeddings?: "none" | "dense"; cfg?: Record<string, unknown> } = {}): Promise<{ w: World; mem: MemoryRuntime; s: Session; repo: string }> {
     const repo = initRepo();
     write(repo, "src/db/schema.ts", "export const users = { deletedAt: null };\n");
     write(repo, "src/db/generated/client.ts", "// generated\n");
     write(repo, "src/auth/tokenCache.ts", "export class TokenCache { refresh() {} }\n");
     commitAll(repo);
-    const w = world({ cwd: repo, cfg: { context: { maxWindow: 32000 }, janus: { lateWaitMs: 30 }, ...(over.cfg ?? {}) }, embeddings: over.embeddings });
+    const w = world({ cwd: repo, cfg: { context: { maxWindow: 32000 }, janus: { lateWaitMs: 30, driftCooldownRounds: 0 }, ...(over.cfg ?? {}) }, embeddings: over.embeddings });
     w.close();
     const mem = new MemoryRuntime({ layout: w.layout, cfg: w.cfg, cwd: repo, trusted: true, decision: w.decision, aux: w.aux, dense: w.dense, clock: w.clock, sessionId: "sess-test", harness: "test", random: () => 0.99 });
     const s = new Session({ world: w, memory: mem });
     consolidators(s.aux);
-    const plan = director(s.decision, s.aux);
     await s.start();
-    return { w, mem, s, plan, repo };
+    return { w, mem, s, repo };
   }
   const remember = async (mem: MemoryRuntime, text: string, over: Record<string, unknown> = {}) => (await new MemoryWriter(mem).write([{ text, origin: "explicit", scope: "personal", urgency: "hint", skipConflicts: true, skipDedup: true, ...over }]))[0]!.id!;
 
@@ -687,25 +549,21 @@ describe("memory in the loop", () => {
   });
 
   it("gates an edit once per intent, records the block as a delivery, and attributes use when the intent closes", async () => {
-    const { mem, s, plan } = await setup();
+    const { mem, s } = await setup();
     const never = await remember(mem, "Never edit files in src/db/generated; they are regenerated by `pnpm db:generate`.", { kind: "rule", severity: "must", urgency: "immediate", paths: ["src/db/generated/"], triggersOn: ["edit"] });
     const helpful = await remember(mem, "Run `pnpm db:generate` after editing src/db/schema.ts.", { kind: "procedure", paths: ["src/db/schema.ts"] });
     const unshown = await remember(mem, "Schema changes need a migration note in docs/migrations.md.", { kind: "rule", severity: "should", urgency: "caption", paths: ["src/db/"], triggersOn: ["commit"] });
-    plan.push({ kindle: "Add an email column" });
     await s.user("add an email column to users");
+    await openIntent(s, "Add an email column");
     const intent = s.engine.state.stack[0]!;
-    plan.push({});
     await s.round("I'll edit the generated client", [{ name: "edit", args: { path: "src/db/generated/client.ts" }, output: "edited" }]);
     expect(s.blocked).toEqual([`[gate] Before this edit: MUST [m:${never}] Never edit files in src/db/generated; they are regenerated by \`pnpm db:generate\`. If the action still complies, repeat it.`]);
-    expect((await s.h.listEntries()).find((e) => e.kind === "toolResult")).toMatchObject({ isError: true });
+    expect((await s.h.listEntries()).find((e) => e.kind === "toolResult" && e.toolName === "edit")).toMatchObject({ isError: true });
     // the agent changes course: edit the schema, then run the generator named by the memory
-    plan.push({});
     await s.round("Right — I'll edit the schema instead.", [{ name: "edit", args: { path: "src/db/schema.ts" }, output: "edited" }]);
-    expect((await s.h.listEntries()).filter((e) => e.kind === "toolResult")[1]!.text).toContain(`[m:${helpful}] procedure · as of 2026-11-20: Run \`pnpm db:generate\``);
-    plan.push({});
+    expect((await s.h.listEntries()).filter((e) => e.kind === "toolResult" && e.toolName === "edit")[1]!.text).toContain(`[m:${helpful}] procedure · as of 2026-11-20: Run \`pnpm db:generate\``);
     await s.round(`Following [m:${helpful}], regenerating the client.`, [{ name: "bash", args: { command: "pnpm db:generate" }, output: "done" }]);
     // a second attempt in the same intent is not gated again
-    plan.push({});
     await s.round("one more generated edit", [{ name: "edit", args: { path: "src/db/generated/client.ts" }, output: "edited" }]);
     expect(s.blocked.length).toBe(1);
     // closing the intent runs attribution on the region, in one decision request
@@ -724,11 +582,11 @@ describe("memory in the loop", () => {
       }
       return out;
     });
-    plan.push({ close: ["Add an email column"] });
     await s.round("committing", [{ name: "bash", args: { command: "git commit -am 'add email'" }, output: "ok" }]);
+    await closeIntent(s);
     await s.drain();
     expect(asked.filter((n) => n.startsWith("use.")).length).toBe(s.engine.state.deliveries.filter((d) => d.intentId === intent.id).length);
-    expect(asked).not.toContain("outcome"); // Janus's outcome (success) is used
+    expect(asked).not.toContain("outcome"); // intent's outcome (success) is used
     expect(asked.filter((n) => n.startsWith("comply.")).length).toBe(3); // two shown, plus the unshown caption rule whose trigger matched
     const records = s.engine.state.attributed;
     const of = (id: string, channel: string) => records.get(s.engine.state.deliveries.find((d) => d.id === `m:${id}` && d.channel === channel)!.deliveryId)!;
@@ -755,7 +613,7 @@ describe("memory in the loop", () => {
     mem.shutdown();
   });
 
-  it("with emulated decisions, the kindle does not wait for the gate: the cards follow at the next commit point", async () => {
+  it("with slow proactive gate, opening an intent does not hang: late cards follow at the next commit point", async () => {
     const { mem, s } = await setup();
     const card = await remember(mem, "TokenCache.refresh must be single-flight; concurrent refreshes race on pending.", {});
     const seen = await remember(mem, "TokenCache keeps one pending promise per key.", { paths: ["src/auth/tokenCache.ts"] });
@@ -764,23 +622,23 @@ describe("memory in the loop", () => {
     const gates: Array<() => void> = [];
     const real = s.decision.decide.bind(s.decision);
     s.decision.decide = async (ev, qs, opts) => {
-      if (opts.callSite === "janus" || opts.callSite === "proactive.gate") await new Promise<void>((r) => gates.push(r));
+      if (opts.callSite === "proactive.gate") await new Promise<void>((r) => gates.push(r));
       return real(ev, qs, opts);
     };
     const release = async () => {
       gates.shift()!();
       await new Promise((r) => setTimeout(r, 15));
     };
-    s.decision.on("janus", () => ({ focus: { new_root: 0.9 } }));
     s.decision.on("proactive.gate", (_e, qs) => Object.fromEntries(qs.map((q) => [q.name, 0.9])));
-    s.aux.on("janus.scribe", () => ({ label: "Fix the TokenCache refresh race", reason: "it races", success: "no race", failure: "no cause" }));
     await s.user("the token cache refresh races, please fix");
-    await release(); // Janus answers while the model works
     const t0 = Date.now();
-    const b1 = await s.round("reading the cache", [{ name: "read", args: { path: "src/auth/tokenCache.ts" }, output: "export class TokenCache { refresh() {} }" }]);
+    const openRes = await s.intent({ action: "open", label: "Fix the TokenCache refresh race", reason: "it races", done: "no race", give_up: "no cause" });
     expect(Date.now() - t0).toBeLessThan(1000);
-    // the intent is kindled without cards; the gate is still running
-    expect(b1.messages.map((m) => m.content)).toEqual([expect.stringMatching(/^\[intent\] I'm now working on "Fix the TokenCache refresh race"\.\nWhy: it races\nDone when: no race\nGive up when: no cause$/)]);
+    // opened without waiting past lateWaitMs; proactive gate is still running
+    expect(openRes.text).toContain('Opened "Fix the TokenCache refresh race".');
+    expect(openRes.text).not.toContain("Memory that may help");
+    // path delivery shows `seen` before late cards arrive
+    await s.round("reading the cache", [{ name: "read", args: { path: "src/auth/tokenCache.ts" }, output: "export class TokenCache { refresh() {} }" }]);
     expect(s.engine.state.deliveries.map((d) => d.channel)).toEqual(["path"]);
     // the gate answers; the next commit point brings the cards, minus what a path delivery already showed
     while (gates.length) await release();
@@ -790,25 +648,23 @@ describe("memory in the loop", () => {
     expect(late.content).not.toContain(seen);
     expect(s.engine.state.deliveries.filter((d) => d.channel === "proactive").map((d) => d.id)).toEqual([`m:${card}`]);
     // delivered once
-    while (gates.length) await release();
     const b3 = await s.round("more", [{ name: "bash", args: { command: "true" }, output: "ok" }]);
     expect(b3.messages.filter((m) => m.content.includes("Memory that may help"))).toEqual([]);
-    while (gates.length) await release();
   });
 
-  it("keeps late cards for each intent: a second kindle does not drop the first one's", async () => {
+  it("keeps late cards for each intent: a second open does not drop the first one's", async () => {
     const { mem, s } = await setup();
     const forFix = await remember(mem, "TokenCache.refresh must be single-flight; concurrent refreshes race on pending.", {});
     const forTest = await remember(mem, "TokenCache refresh race tests run under vitest with fake timers.", {});
     s.decision.isCalibrated = false; // aux-emulated and slow (§9.1.4)
-    const gates: Array<{ site: string; open: () => void }> = [];
+    const gates: Array<() => void> = [];
     const real = s.decision.decide.bind(s.decision);
     s.decision.decide = async (ev, qs, opts) => {
-      if (opts.callSite === "janus" || opts.callSite === "proactive.gate") await new Promise<void>((r) => gates.push({ site: opts.callSite, open: r }));
+      if (opts.callSite === "proactive.gate") await new Promise<void>((r) => gates.push(r));
       return real(ev, qs, opts);
     };
-    const release = async (site: string) => {
-      gates.splice(gates.findIndex((g) => g.site === site), 1)[0]!.open();
+    const release = async () => {
+      gates.shift()!();
       await new Promise((r) => setTimeout(r, 15));
     };
     // each intent's gate picks the memory for its own purpose
@@ -817,52 +673,35 @@ describe("memory in the loop", () => {
       return Object.fromEntries(qs.map((q) => [q.name, q.name.startsWith("rel.") ? (ev.memories[Number(q.name.slice(4))].text.includes(want) ? 0.9 : 0.01) : 0.9]));
     });
     const labels = ["Fix the TokenCache refresh race", "Write a regression test for the refresh race"];
-    let n = 0;
-    s.aux.on("janus.scribe", () => ({ label: labels[n++]!, reason: "r", success: "s", failure: "f" }));
-    s.decision.on("janus", (_e, qs) => {
-      const out: Answers = { focus: { [n === 0 ? "new_root" : "deepen"]: 0.9 } };
-      for (const q of qs) if (q.name.startsWith("close.")) out[q.name] = { open: 0.95 };
-      return out;
-    });
     const tools = [{ name: "bash", args: { command: "true" }, output: "ok" }];
     await s.user("the token cache refresh races, please fix");
-    await release("janus"); // the answer for the message arrives while the model works
-    await s.round("reading the cache", tools); // kindles the first intent; its gate is still running
+    await openIntent(s, labels[0]!);
     expect(s.engine.state.stack.map((i) => i.label)).toEqual([labels[0]]);
-    await release("janus"); // the round's own run, from before the intent: it cannot kindle
-    await s.round("found the race", tools);
-    await release("janus"); // this round's run deepens
-    await s.round("a regression test first", tools); // kindles the second intent; its gate is still running too
+    await openIntent(s, labels[1]!);
     expect(s.engine.state.stack.map((i) => i.label)).toEqual(labels);
-    expect(gates.filter((g) => g.site === "proactive.gate").length).toBe(2);
-    await release("proactive.gate");
-    await release("proactive.gate");
+    expect(gates.length).toBe(2);
+    await release();
+    await release();
     const b = await s.round("writing it", tools);
     const late = b.messages.filter((m) => m.content.startsWith("[intent] Memory that may help")).map((m) => m.content);
     expect(late).toEqual([expect.stringContaining(`with "${labels[0]}":\n[m:${forFix}]`), expect.stringContaining(`with "${labels[1]}":\n[m:${forTest}]`)]);
-    while (gates.length) await release(gates[0]!.site);
   });
 
-  it("offers proactive cards only when an intent is kindled, and writes episodes and knowledge on the way out", async () => {
-    const { mem, s, plan } = await setup();
+  it("offers proactive cards when an intent is opened, and writes episodes and knowledge on the way out", async () => {
+    const { mem, s } = await setup();
     const card = await remember(mem, "TokenCache.refresh must be single-flight; concurrent refreshes race on pending.", {});
     s.decision.on("proactive.gate", (_e, qs) => Object.fromEntries(qs.map((q) => [q.name, 0.9])));
     s.decision.on("write.route", (_e, qs) => Object.fromEntries(qs.map((q): [string, number | Record<string, number>] => [q.name, q.name.startsWith("scope.") ? { project_personal: 0.9 } : q.name.startsWith("urgency.") ? { caption: 0.9 } : 0.01])));
-    plan.push({ kindle: "Fix the TokenCache refresh race" });
-    const b = await s.user("the token cache refresh races, please fix");
-    expect(b.messages[0]!.content).toContain(`Memory that may help:\n[m:${card}] personal · short-term · as of 2026-11-20`);
+    await s.user("the token cache refresh races, please fix");
+    const opened = await openIntent(s, "Fix the TokenCache refresh race");
+    expect(opened.text).toContain(`Memory that may help:\n[m:${card}] personal · short-term · as of 2026-11-20`);
     expect(s.engine.state.deliveries.map((d) => [d.id, d.channel])).toEqual([[`m:${card}`, "proactive"]]);
     // the purpose is remembered for importance and for EvoDisco's query cache
     expect(mem.graph.handle("personal").index!.purposes().map((p) => p.text)).toEqual(["Fix the TokenCache refresh race\nbecause Fix the TokenCache refresh race"]);
     expect(mem.caches.for("personal")).toEqual(["Fix the TokenCache refresh race because Fix the TokenCache refresh race"]);
-    for (let i = 0; i < 4; i++) {
-      plan.push({});
-      await s.round(`fixing ${i}`, work(i));
-    }
-    plan.push({ close: ["Fix the TokenCache refresh race"] });
-    await s.round("fixed", work(8, 30));
+    for (let i = 0; i < 4; i++) await s.round(`fixing ${i}`, work(i));
+    await closeIntent(s);
     await s.drain();
-    plan.push({});
     await s.round("after", work(9, 30));
     await s.drain();
     // Precip's memory and sidecar became an episode, with provenance pointing back at the t: ID
@@ -1082,21 +921,22 @@ describe("memory in the loop", () => {
 
   it("applies idle-completed Precip in onContext before the next prompt's first request and persists at turn_end", async () => {
     const s = new Session({ cfg: cfg() });
-    consolidators(s.aux);
-    const plan = director(s.decision, s.aux);
+    let release!: () => void;
+    s.aux.on("precip", async () => {
+      await new Promise<void>((r) => (release = r));
+      return { memory: "Finished first job cleanly.", sidecar: { outcome_summary: "ok", state_changes: [], artifacts: [], open_threads: [] } };
+    });
     await s.start();
-    plan.push({ kindle: "First job" });
     await s.user("do first job");
-    for (let i = 0; i < 4; i++) {
-      plan.push({});
-      await s.round(`first work ${i}`, work(i));
-    }
-    plan.push({ close: ["First job"] });
+    await openIntent(s, "First job");
+    for (let i = 0; i < 4; i++) await s.round(`first work ${i}`, work(i));
+    await closeIntent(s);
     await s.finish("First job done.");
-    await s.engine.onIdle();
+    const idle = s.engine.onIdle();
+    release();
+    await idle;
 
     // User submits next prompt: onContext applies the finished idle Precip immediately before the first LLM request
-    plan.push({ kindle: "Second job" });
     await s.user("do second job");
     const occBefore = s.engine.status().occupancy;
     const edits = await s.engine.onContext();
@@ -1108,7 +948,6 @@ describe("memory in the loop", () => {
     expect(await s.engine.onContext()).toEqual(edits);
 
     // Next turn_end persists those exact edits and record
-    plan.push({});
     const b = await s.round("starting second job", work(9, 30));
     expect(b.edits).toEqual(edits);
     expect(b.records.some((r) => r.type === "realctx2.consolidation" && r.record.kind === "precip" && !r.record.shadow)).toBe(true);
@@ -1127,15 +966,12 @@ describe("memory in the loop", () => {
       }
       return { memory: "Retried on next turn.", sidecar: { artifacts: [], entities: [], outcome: "ok" } };
     });
-    const plan = director(s.decision, s.aux);
     await s.start();
-    plan.push({ kindle: "Interrupted task" });
     await s.user("do interrupted task");
-    for (let i = 0; i < 4; i++) {
-      plan.push({});
-      await s.round(`work ${i}`, work(i));
-    }
-    plan.push({ close: ["Interrupted task"] });
+    await openIntent(s, "Interrupted task");
+    for (let i = 0; i < 4; i++) await s.round(`work ${i}`, work(i));
+    await s.engine.applyIntentAction({ action: "close" });
+    for (const j of (s.engine as unknown as { precipJobs: Array<{ deferred: boolean }> }).precipJobs) j.deferred = true;
     await s.finish("Done.");
 
     // Abort idle Precip as if the user typed immediately
@@ -1147,11 +983,9 @@ describe("memory in the loop", () => {
     expect(precipCalls).toBe(1);
 
     // User immediately sends the next prompt without a second onIdle(): Precip retries and commits on the turn
-    plan.push({ kindle: "Follow-up task" });
     await s.user("follow up");
     await s.drain();
     expect(precipCalls).toBe(2);
-    plan.push({});
     const b = await s.round("follow-up work", work(9, 30));
     expect(b.records.some((r) => r.type === "realctx2.consolidation" && r.record.kind === "precip")).toBe(true);
     expect(await s.h.contextText()).toContain('intent "Interrupted task" · succeeded · details archived]');
@@ -1160,15 +994,11 @@ describe("memory in the loop", () => {
   it("reports actual context tokens in status().occupancy (not Q_q headroom) and scales post-edit occupancy accurately", async () => {
     const s = new Session({ cfg: cfg() });
     consolidators(s.aux);
-    const plan = director(s.decision, s.aux);
     s.h.systemTokens = 4000;
     await s.start();
-    plan.push({ kindle: "Big task" });
     await s.user("big task");
-    for (let i = 0; i < 4; i++) {
-      plan.push({});
-      await s.round(`round ${i}`, work(i, 1200));
-    }
+    await openIntent(s, "Big task");
+    for (let i = 0; i < 4; i++) await s.round(`round ${i}`, work(i, 1200));
     // Simulate a provider whose tokenizer uses 1.25x more tokens than chars/4
     const origReq = s.h.requestTokens.bind(s.h);
     s.h.requestTokens = async () => {
@@ -1176,7 +1006,6 @@ describe("memory in the loop", () => {
       return s.h.systemTokens + Math.round(entries.reduce((sum, e) => sum + e.tokens, 0) * 1.25);
     };
     // Run a plain round (no guidance appended after turn_end) so requestTokens() matches what onTurnEnd measured
-    plan.push({});
     await s.round("steady work", work(4, 100));
     const st = s.engine.status();
     const actualReq = await s.h.requestTokens();
@@ -1185,10 +1014,8 @@ describe("memory in the loop", () => {
     expect(st.predictedOccupancy).toBeGreaterThan(st.occupancy);
 
     // Close the intent, wait for Precip, and commit on the next turn_end (while requestTokens still reflects pre-edit usage)
-    plan.push({ close: ["Big task"] });
-    await s.round("finishing", work(5, 100));
+    await closeIntent(s);
     await s.drain();
-    plan.push({});
     const beforeCommitEntries = (await s.h.listEntries()).reduce((sum, e) => sum + e.tokens, 0);
     await s.round("after close", work(6, 50));
     const afterCommitEntries = (await s.h.listEntries()).reduce((sum, e) => sum + e.tokens, 0);
@@ -1201,18 +1028,20 @@ describe("memory in the loop", () => {
 
   it("downgrades uncommitted consolidations to shadow records on shutdown when persistEdits is false", async () => {
     const s = new Session({ cfg: cfg() });
-    consolidators(s.aux);
-    const plan = director(s.decision, s.aux);
+    let release!: () => void;
+    s.aux.on("precip", async () => {
+      await new Promise<void>((r) => (release = r));
+      return { memory: "Finished final task.", sidecar: { outcome_summary: "ok", state_changes: [], artifacts: [], open_threads: [] } };
+    });
     await s.start();
-    plan.push({ kindle: "Final task" });
     await s.user("final task");
-    for (let i = 0; i < 4; i++) {
-      plan.push({});
-      await s.round(`final work ${i}`, work(i));
-    }
-    plan.push({ close: ["Final task"] });
+    await openIntent(s, "Final task");
+    for (let i = 0; i < 4; i++) await s.round(`final work ${i}`, work(i));
+    await closeIntent(s);
     await s.finish("All done.");
-    await s.engine.onIdle();
+    const idle = s.engine.onIdle();
+    release();
+    await idle;
 
     const last = await s.engine.onShutdown({ persistEdits: false });
     const consol = last.records.filter((r) => r.type === "realctx2.consolidation");

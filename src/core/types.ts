@@ -110,6 +110,10 @@ export interface StatsRecord {
   frontier?: number;
   lastClimbRound?: number;
   round?: number;
+  /** Round of the last strong Janus drift reminder (for the cooldown window). */
+  lastDriftReminderRound?: number;
+  /** Number of strong Janus drift reminders emitted in this session. */
+  driftReminders?: number;
 }
 
 export type SessionRecord =
@@ -210,7 +214,7 @@ export interface ToolResultPayload {
 }
 
 export interface ToolDef {
-  /** Canonical name (search, recall, inspect, remember, forget). */
+  /** Canonical name (search, recall, inspect, remember, forget, intent). */
   key: string;
   /** Effective name after tools.names. */
   name: string;
@@ -292,7 +296,6 @@ export interface HarnessAdapter {
 // ───────────────────────────── Aux sessions (Appendix B.2)
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type AuxRole =
-  | "janus.scribe"
   | "precip"
   | "palim"
   | "qemem.planner"

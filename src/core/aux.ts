@@ -19,7 +19,6 @@ export interface RoleSettings {
  * No default timeout is below 30 s: LLM calls through a harness often need that long just to start answering.
  */
 export const ROLE_DEFAULTS: Record<AuxRole, RoleSettings> = {
-  "janus.scribe": { tools: "none", thinking: "off", maxTurns: 1, timeoutMs: 30_000 },
   precip: { tools: "none", thinking: "medium", maxTurns: 1, timeoutMs: 120_000 },
   palim: { tools: "none", thinking: "medium", maxTurns: 1, timeoutMs: 120_000 },
   "qemem.planner": { tools: "none", thinking: "low", maxTurns: 1, timeoutMs: 30_000 },
@@ -35,7 +34,7 @@ export const ROLE_DEFAULTS: Record<AuxRole, RoleSettings> = {
 };
 
 /** Roles that only structure input they were handed never get tools, whatever the configuration says. */
-const TRANSCRIPT_ONLY = new Set<AuxRole>(["janus.scribe", "precip", "palim", "qemem.planner", "write.merge", "decision.emulate"]);
+const TRANSCRIPT_ONLY = new Set<AuxRole>(["precip", "palim", "qemem.planner", "write.merge", "decision.emulate"]);
 
 export function roleSettings(cfg: Config, harness: "pi" | "claudeCode", task: AuxTask): RoleSettings {
   const base = ROLE_DEFAULTS[task.role];

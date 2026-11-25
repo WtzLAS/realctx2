@@ -104,8 +104,19 @@ export function renderLateCards(i: Intent, cards: string): string {
   return `[intent] Memory that may help with "${i.label}":\n${cards}`;
 }
 
-export function renderReminder(i: Intent, parentLabel?: string): string {
-  return `[intent] Still working on "${i.label}"${parentLabel ? ` (inside: ${parentLabel})` : ""}. Done when: ${i.success} Give up when: ${i.failure}`;
+export function renderReminder(i: Intent, parentLabel?: string, intentTool?: string): string {
+  const giveUp = i.failure ? ` Give up when: ${i.failure}` : "";
+  const hint = intentTool ? ` Update with \`${intentTool}\` if finished or shifting.` : "";
+  return `[intent] Still working on "${i.label}"${parentLabel ? ` (inside: ${parentLabel})` : ""}. Done when: ${i.success}${giveUp}${hint}`;
+}
+
+export function renderEmptyReminder(round: number, intentTool = "intent"): string {
+  return `[intent] No active intent on the stack after ${round} rounds. Call \`${intentTool}\` (action: "open") to set your current purpose so completed work can consolidate.`;
+}
+
+export function renderDriftReminder(summary: string, stack: Intent[]): string {
+  const stackLine = stack.length ? stack.map((i) => `"${i.label}"`).join(" > ") : "(empty)";
+  return `[intent] Drift check: ${summary}\nCurrent stack: ${stackLine}`;
 }
 
 /** `[t:c7f3a2e8 · intent "…" · succeeded · details archived]` + first-person prose. */

@@ -3,7 +3,7 @@
 Context and memory management for agent harnesses, implemented from
 [`docs/realctx2-design.md`](docs/realctx2-design.md) (v0.7).
 
-- **Context engine**: tracks what the agent is working on (Janus), replaces finished work with a
+- **Context engine**: lets the main model track its active purpose stack (`intent`) with debounced, nonblocking drift checks (Janus), replaces finished work with a
   first-person memory (Precip), folds stable prefixes and relieves window pressure (Palim), and
   records which delivered memories were used.
 - **Long-term memory**: a graph in three scopes (global, project-personal, project-shared) stored
@@ -98,7 +98,7 @@ realctx2 uses three outside resources. Each one is optional:
 
 ## What the agent and the user get
 
-- **Agent tools** (§8.1): `search`, `recall`, `inspect`, `remember`, `forget`. In Claude Code
+- **Agent tools** (§8.1): `search`, `recall`, `inspect`, `remember`, `forget`, `intent`. In Claude Code
   they are `mcp__plugin_realctx2_realctx2__<tool>`.
 - **Commands** (§10): `/realctx2 <command>` in pi, `/realctx2:<command>` in Claude Code. Run
   `/realctx2` (pi) or `/realctx2:realctx2` (Claude Code) for the list. `status` and `doctor` are

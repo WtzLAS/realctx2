@@ -3,6 +3,8 @@ import { BlobStore } from "../../src/context/archive.ts";
 import { ContextEngine, type PendingDelivery } from "../../src/context/engine.ts";
 import type { PathEvent } from "../../src/memory/delivery.ts";
 import { MemoryRuntime } from "../../src/memory/runtime.ts";
+import { Layout } from "../../src/core/config.ts";
+import { runIntent } from "../../src/tools/intent.ts";
 import { estimateTokens } from "../../src/util/text.ts";
 import { analyzeCommand } from "../../src/util/shell.ts";
 import { FakeAux, FakeDecision, type World } from "./fakes.ts";
@@ -191,6 +193,29 @@ export class Session {
     return { text: res.text, details, isError: res.isError === true, batch };
   }
 
+  /** Run the `intent` tool as the main model would. */
+  async intent(params: Record<string, unknown>, say = "updating intent stack"): Promise<{ text: string; details: Record<string, unknown>; isError: boolean; batch: CommitBatch }> {
+    const def = {
+      name: this.engine.cfg.tools.names.intent ?? "intent",
+      execute: (p: Record<string, unknown>, ctx: { toolCallId?: string }) =>
+        runIntent(
+          {
+            cfg: this.engine.cfg,
+            layout: new Layout("/tmp/realctx2-test-unused"),
+            sessionId: this.engine.sessionId,
+            harness: "test",
+            memory: this.engine.memory,
+            engine: this.engine,
+            clock: () => new Date(),
+            entries: () => this.h.listEntries(),
+          },
+          p,
+          ctx,
+        ),
+    };
+    return this.tool(def, params, say);
+  }
+
   async start(): Promise<void> {
     await this.engine.onSessionStart();
   }
@@ -223,7 +248,7 @@ export class Session {
       const t = tools[i]!;
       const call = a.calls[i]!;
       const event = this.eventFor(t.name, t.args);
-      const own = ["search", "recall", "inspect", "remember", "forget"].includes(t.name);
+      const own = ["search", "recall", "inspect", "remember", "forget", "intent"].includes(t.name);
       const gate = await this.engine.onToolCall({ toolCallId: call.id, event, own });
       if (gate) {
         this.blocked.push(gate.block);

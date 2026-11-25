@@ -8,7 +8,7 @@ import { applyEditsToMessages, DECISION_PROVIDER, interruptWatch, isInterruptKey
 import { CustomMessageComponent, initTheme } from "@earendil-works/pi-coding-agent";
 import { guidanceLines, guidanceRenderer, parseGuidance } from "../src/adapters/pi/guidance-renderer.ts";
 import { toolRenderers } from "../src/adapters/pi/tool-renderers.ts";
-import { renderGuidance, renderLateCards, renderReminder } from "../src/context/render.ts";
+import { renderDriftReminder, renderEmptyReminder, renderGuidance, renderLateCards, renderReminder } from "../src/context/render.ts";
 import type { Intent } from "../src/core/types.ts";
 import { DEFAULT_CONFIG, Layout } from "../src/core/config.ts";
 import { resolveProject } from "../src/core/project.ts";
@@ -57,14 +57,12 @@ function janus(steps: Array<{ kindle?: boolean; close?: string[] }>): Decide {
   };
 }
 
-const scribe = (label: string) => ({ when: '"label"', reply: () => ({ label, reason: `because ${label}`, success: `${label} is done`, failure: `${label} cannot be done` }) });
-
 describe("realctx2 as a pi extension (§4.1–4.4)", () => {
-  it("registers tools, the prompt section and the classifier provider; guides, delivers path memories and gates edits", async () => {
+  it("registers tools, the prompt section and the classifier provider; manages intents, delivers path memories and gates edits", async () => {
     const cwd = repo();
-    const r = await piRig({ cwd });
+    const r = await piRig({ cwd, config: { janus: { lateWaitMs: 200, timeoutMs: 3000, driftCooldownRounds: 0 } } });
     expect(r.errors).toEqual([]);
-    expect(r.session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "bash", "search", "recall", "inspect", "remember", "forget"]));
+    expect(r.session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "bash", "search", "recall", "inspect", "remember", "forget", "intent"]));
     // the configured decision endpoint is discoverable as a pi classifier model, and classify() reaches it
     const registry = r.modelRuntime;
     const classifier = registry.getAllModels(DECISION_PROVIDER)[0] as Parameters<typeof registry.classify>[0];
@@ -81,38 +79,28 @@ describe("realctx2 as a pi extension (§4.1–4.4)", () => {
     expect(remembered.length).toBe(2);
     const [rule, fact] = remembered;
 
-    // a user turn: Janus kindles, the scribe names the intent, guidance follows the user message
-    const decide = janus([{ kindle: true }, {}, {}, {}]);
-    const workingAtJanus: string[][] = [];
-    r.decision.handler = (names, state, questions) => {
-      if (names.includes("focus")) workingAtJanus.push([...r.ui.working]);
-      return decide(names, state, questions);
-    };
-    r.aux.push(scribe("Add an email column"));
+    // main model manages its own intent stack via the `intent` tool; before_agent_start never blocks
     r.main.push(
+      { text: "Opening intent for the email column.", tools: [{ name: "intent", args: { action: "open", label: "Add an email column", reason: "because Add an email column", done: "Add an email column is done", give_up: "Add an email column cannot be done" } }] },
       { text: "I'll look at the schema.", tools: [{ name: "read", args: { path: "src/db/schema.ts" } }] },
       { text: "Now the generated client.", tools: [{ name: "edit", args: { path: "src/db/generated/client.ts", edits: [{ oldText: "// generated", newText: "// generated v2" }] } }] },
       { text: "Understood, I will not touch generated files." },
     );
     await r.prompt("add an email column to users");
     expect(r.errors).toEqual([]);
-    // pi shows no Working row until the first turn starts: realctx2 shows it while the user
-    // message waits for Janus in before_agent_start, and restores pi's own message afterwards
-    expect(workingAtJanus[0]).toEqual([`message:${WORKING_MESSAGE}`, "visible:true"]);
-    expect(r.ui.working).toEqual([`message:${WORKING_MESSAGE}`, "visible:true", "message:"]);
+    // prompt start is nonblocking: no custom Working row wait
+    expect(r.ui.working).toEqual([]);
     const b = r.branch();
-    const user = b.findIndex((e) => e.role === "user" && e.text === "add an email column to users");
-    const guidance = b[user + 1]!;
-    expect(guidance).toMatchObject({ type: "custom_message", customType: "realctx2.guidance" });
-    expect(guidance.text).toBe('[intent] I\'m now working on "Add an email column".\nWhy: because Add an email column\nDone when: Add an email column is done\nGive up when: Add an email column cannot be done');
-    // the intent record rides in the guidance message, after the user message it belongs to
-    expect(guidance.raw.details.records.map((x: { type: string }) => x.type)).toEqual(["realctx2.intent"]);
-    // pi's chat shows it through realctx2's registered renderer, styled like a tool, not as the default custom-message box
+    // intent record persisted as a custom entry on the branch
+    const intentRec = b.find((e) => e.customType === "realctx2.intent");
+    expect(intentRec?.raw.data.intent).toMatchObject({ label: "Add an email column", status: "open" });
+    // guidance renderer is registered and renders tool-style on toolSuccessBg
     const renderer = r.session.extensionRunner.getMessageRenderer("realctx2.guidance")!;
     expect(renderer).toBeDefined();
     initTheme("dark");
     let piTheme: Parameters<typeof renderer>[2] | undefined;
-    const view = new CustomMessageComponent({ role: "custom", customType: guidance.raw.customType, content: guidance.raw.content, display: true, details: guidance.raw.details, timestamp: 0 }, (m, o, t) => {
+    const sampleGuidance = '[intent] I\'m now working on "Add an email column".\nWhy: because Add an email column\nDone when: Add an email column is done\nGive up when: Add an email column cannot be done';
+    const view = new CustomMessageComponent({ role: "custom", customType: "realctx2.guidance", content: sampleGuidance, display: true, timestamp: 0 }, (m, o, t) => {
       piTheme = t;
       return renderer(m, o, t);
     });
@@ -122,16 +110,16 @@ describe("realctx2 as a pi extension (§4.1–4.4)", () => {
     const plain = (lines: readonly string[]) => lines.map((l) => l.replace(/\x1b\[[0-9;:]*m/g, "").trimEnd()).filter(Boolean);
     expect(collapsed.some((l) => l.includes(sgr("toolSuccessBg")))).toBe(true);
     expect(collapsed.some((l) => l.includes(sgr("customMessageBg")))).toBe(false);
-    expect(plain(collapsed)).toEqual([" realctx2 intent", ' → now working on "Add an email column"', "   Done when: Add an email column is done", " expand to view"]); // no keybindings are loaded in tests
+    expect(plain(collapsed)).toEqual([" realctx2 intent", ' → now working on "Add an email column"', "   Done when: Add an email column is done", " expand to view"]);
     view.setExpanded(true);
     expect(plain(view.render(100))).toEqual([" realctx2 intent", ' → now working on "Add an email column"', "   Why: because Add an email column", "   Done when: Add an email column is done", "   Give up when: Add an email column cannot be done"]);
-    // the first request already carries the section and the guidance
+    // the first request already carries the realctx2 system prompt section emphasizing the `intent` tool
     expect(r.calls[0]!.system).toContain("<realctx2>\n## Context and memory (realctx2)\n- Messages that start with [t:…] are my own earlier work");
-    expect(r.calls[0]!.text).toContain('user: add an email column to users\nuser: [intent] I\'m now working on "Add an email column".');
+    expect(r.calls[0]!.system).toContain("Intent stack (intent): I maintain my intent stack whenever possible");
     // the read result arrives with the path memory; the model sees it in the next request
     const read = b.find((e) => e.role === "toolResult" && e.raw.message.toolName === "read")!;
     expect(read.text).toBe(`export const users = { deletedAt: null };\n\n\n[paths] src/db/schema.ts\nsrc/db/schema.ts\n- [m:${fact}] fact · as of ${new Date().toISOString().slice(0, 10)}: users rows are soft-deleted via deletedAt.`);
-    expect(r.calls[1]!.text).toContain(`[m:${fact}] fact`);
+    expect(r.calls[2]!.text).toContain(`[m:${fact}] fact`);
     // the edit was blocked once, before it ran, with the memory as the reason
     const edit = b.find((e) => e.role === "toolResult" && e.raw.message.toolName === "edit")!;
     expect(edit.raw.message.isError).toBe(true);
@@ -154,29 +142,35 @@ describe("realctx2 as a pi extension (§4.1–4.4)", () => {
     const layout = new Layout(r.home);
     const key = resolveProject(cwd).projectKey!;
     expect(listTree(layout.projectDir(key)).some((f) => /^updates\/.*\.loro$/.test(f))).toBe(true);
-    expect(JSON.parse(readFileSync(join(layout.projectDir(key), "sessions.json"), "utf8"))[0]).toMatchObject({ harness: "pi", requests: 3 });
+    expect(JSON.parse(readFileSync(join(layout.projectDir(key), "sessions.json"), "utf8"))[0]).toMatchObject({ harness: "pi", requests: 4 });
     expect(existsSync(JSON.parse(readFileSync(join(layout.projectDir(key), "sessions.json"), "utf8"))[0].file)).toBe(true);
   }, 60_000);
 
   it("consolidates a closed intent with persisted context edits, and recall opens it", async () => {
     const cwd = repo();
-    const r = await piRig({ cwd });
-    r.aux.push(scribe("Find the race in TokenCache"));
+    const r = await piRig({ cwd, config: { janus: { lateWaitMs: 200, timeoutMs: 3000, driftCooldownRounds: 0 } } });
     r.aux.push({ when: '"sidecar"', reply: () => ({ memory: "I looked for the race and found that two refreshes overlap.\n> src/auth/tokenCache.ts:1 `refresh() {}` (from: tool read)", sidecar: { outcome_summary: "Found the race", state_changes: [], artifacts: ["src/auth/tokenCache.ts"], open_threads: [] } }) });
-    // one prompt: kindle, four rounds of work, closure at the fifth, two more rounds
-    r.decision.handler = janus([{ kindle: true }, {}, {}, {}, {}, { close: ["Find the race in TokenCache"] }, {}, {}, {}]);
+    r.decision.handler = janus([]);
     const work = (i: number) => ({ text: `digging ${i}`, tools: [{ name: "bash", args: { command: `echo ${filler(900, `w${i}_`)}` } }] });
     let recallId = "";
-    r.main.push(work(0), work(1), work(2), work(3), { text: "found it: two refreshes overlap", tools: [{ name: "bash", args: { command: "echo done" } }] }, async () => {
-      // a real model takes seconds here; give the background Precip call the same chance to finish
-      for (let i = 0; i < 100 && !r.auxCalls.some((c) => c.system.includes('"sidecar"')); i++) await new Promise((res) => setTimeout(res, 20));
-      await new Promise((res) => setTimeout(res, 100));
-      return { text: "wrapping up", tools: [{ name: "bash", args: { command: "echo wrap" } }] };
-    }, (call) => {
-      // by now the closed intent is one consolidated message in my context
-      recallId = /\[(t:[0-9a-z]{8}) · intent "Find the race in TokenCache" · succeeded · details archived\]/.exec(call.text)?.[1] ?? "";
-      return { text: "let me check the details", tools: [{ name: "recall", args: { id: recallId } }] };
-    }, { text: "all good" });
+    r.main.push(
+      { text: "Starting investigation.", tools: [{ name: "intent", args: { action: "open", label: "Find the race in TokenCache", reason: "tests flake", done: "race found" } }] },
+      work(0),
+      work(1),
+      work(2),
+      work(3),
+      { text: "found it: two refreshes overlap", tools: [{ name: "intent", args: { action: "close", outcome: "success" } }] },
+      async () => {
+        for (let i = 0; i < 100 && !r.auxCalls.some((c) => c.system.includes('"sidecar"')); i++) await new Promise((res) => setTimeout(res, 20));
+        await new Promise((res) => setTimeout(res, 100));
+        return { text: "wrapping up", tools: [{ name: "bash", args: { command: "echo wrap" } }] };
+      },
+      (call) => {
+        recallId = /\[(t:[0-9a-z]{8}) · intent "Find the race in TokenCache" · succeeded · details archived\]/.exec(call.text)?.[1] ?? "";
+        return { text: "let me check the details", tools: [{ name: "recall", args: { id: recallId } }] };
+      },
+      { text: "all good" },
+    );
     await r.prompt("find the race in the token cache");
     expect(r.errors).toEqual([]);
     expect(recallId).toMatch(/^t:/);
@@ -184,26 +178,25 @@ describe("realctx2 as a pi extension (§4.1–4.4)", () => {
     const edits = b.filter((e) => e.type === "context_edit");
     const record = b.find((e) => e.customType === "realctx2.consolidation")!.raw.data.record;
     expect(record).toMatchObject({ id: recallId, kind: "precip", outcome: "success" });
-    // one edit replaces the guidance message, the others omit; all persisted in one boundary
-    const guidance = b.find((e) => e.customType === "realctx2.guidance")!;
-    expect(record.anchorId).toBe(guidance.id);
+    const openEntry = b.find((e) => e.role === "assistant" && e.text.includes("Starting investigation."))!;
+    expect(record.anchorId).toBe(openEntry.id);
     expect(edits.length).toBe(record.children.length);
-    expect(edits.filter((e) => e.raw.replacement !== null).map((e) => e.raw.targetId)).toEqual([guidance.id]);
-    expect(edits[0]!.raw.replacement.content).toContain(`[${recallId} · intent "Find the race in TokenCache" · succeeded · details archived]\nI looked for the race`);
-    // the request after the commit no longer carries the raw rounds; the closing round is still there
+    expect(edits.filter((e) => e.raw.replacement !== null).map((e) => e.raw.targetId)).toEqual([openEntry.id]);
+    const rep = edits[0]!.raw.replacement.content;
+    const repText = typeof rep === "string" ? rep : rep.map((p: { text?: string }) => p.text ?? "").join("\n");
+    expect(repText).toContain(`[${recallId} · intent "Find the race in TokenCache" · succeeded · details archived]\nI looked for the race`);
     const after = r.calls.at(-2)!;
     expect(after.text).not.toContain("digging 2");
     expect(after.text).not.toContain("w1_17");
     expect(after.text).toContain("found it: two refreshes overlap");
     expect(after.roles.filter((x) => x === "toolResult").length).toBeLessThan(5);
-    // raw entries are untouched in the session file, and recall rendered them with r: IDs
     expect(b.filter((e) => e.role === "assistant" && e.text.startsWith("digging")).length).toBe(4);
     const recalled = b.find((e) => e.role === "toolResult" && e.raw.message.toolName === "recall")!;
-    expect(recalled.text).toMatch(new RegExp(`^\\[${recallId} · consolidated intent · one layer down · ${record.children.length} items · page 1/\\d\\]\\n\\[r:[0-9a-z]{8}\\] \\[intent\\] I'm now working on "Find the race in TokenCache"`));
+    expect(recalled.text).toMatch(new RegExp(`^\\[${recallId} · consolidated intent · one layer down · ${record.children.length} items · page 1/\\d\\]`));
+    expect(recalled.text).toContain('Opened "Find the race in TokenCache".');
     expect(recalled.text).toContain("assistant: digging 0\n→ bash(");
     expect(recalled.text).toMatch(/\[page 1 of \d: recall with page: 2 continues\]$/);
     expect(b.some((e) => e.customType === "realctx2.delivery" && e.raw.data.delivery.channel === "recall" && e.raw.data.delivery.id === recallId)).toBe(true);
-    // the episode reached memory, and the turns are searchable
     r.ui.notes.length = 0;
     await r.prompt("/realctx2 tree");
     expect(r.ui.notes[0]!.text).toContain(`[${recallId}] intent "Find the race in TokenCache" succeeded`);
@@ -211,7 +204,6 @@ describe("realctx2 as a pi extension (§4.1–4.4)", () => {
     expect(r.ui.notes.at(-1)!.text).toMatch(/Memories \(search mode: lexical\):[\s\S]*episode/);
     const sessionFile = r.session.sessionManager.getSessionFile()!;
     await r.shutdown();
-
     // resume: the state comes back from the branch's entries, and the context stays consolidated
     const r2 = await piRig({ cwd, agentDir: r.agentDir, sessionFile });
     r2.decision.handler = janus([{}, {}]);
@@ -317,43 +309,25 @@ describe("the Working row in before_agent_start", () => {
     expect(isInterruptKey("\r")).toBe(false);
   });
 
-  it("stops reading the prompt at once when the user presses Esc, and pi aborts the run", async () => {
+  it("starts prompts immediately without blocking even when the decision endpoint hangs", async () => {
     const cwd = repo();
-    const r = await piRig({ cwd, mode: "tui", config: { janus: { lateWaitMs: 200, timeoutMs: 8000 } } });
+    const r = await piRig({ cwd, mode: "tui", config: { janus: { lateWaitMs: 200, timeoutMs: 8000, debounceMs: 5000 } } });
     expect(r.errors).toEqual([]);
-    // Janus hangs on the decision until the test is over
     let release: () => void = () => undefined;
     const hung = new Promise<void>((res) => (release = res));
-    let workingAtJanus: string[] = [];
-    r.decision.handler = async (names) => {
-      if (names.includes("focus")) {
-        workingAtJanus = [...r.ui.working];
-        // the user gives up on the prompt while realctx2 reads it
-        setTimeout(() => r.press("\x1b"), 50);
-        await hung;
-      }
+    r.decision.handler = async () => {
+      await hung;
       return {};
     };
+    r.main.push({ text: "answered immediately" });
     const t0 = Date.now();
     await r.prompt("add an email column to users");
     const took = Date.now() - t0;
     release();
     expect(r.errors).toEqual([]);
-    expect(workingAtJanus).toEqual([`message:${WORKING_MESSAGE} (escape to interrupt)`, "visible:true"]);
-    // far below janus.timeoutMs: the wait ended with the key, not with the timeout
-    expect(took).toBeLessThan(3000);
-    expect(r.ui.input.size).toBe(0);
-    // pi aborted the run at agent_start: the model was never asked, no guidance was added
-    expect(r.calls).toEqual([]);
-    const b = r.branch();
-    expect(b.some((e) => e.customType === "realctx2.guidance")).toBe(false);
-    expect(b.findLast((e) => e.role === "assistant")?.raw.message.stopReason).toBe("aborted");
-    // the session is usable again: the next prompt is read and answered normally
-    r.decision.handler = janus([{}]);
-    r.main.push({ text: "done" });
-    await r.prompt("never mind, just say done");
-    expect(r.errors).toEqual([]);
-    expect(r.calls.at(-1)?.text).toContain("user: never mind, just say done");
+    // Prompt never blocked on Janus
+    expect(took).toBeLessThan(2000);
+    expect(r.calls.at(-1)?.text).toContain("user: add an email column to users");
     await r.shutdown();
   }, 20_000);
 });
@@ -678,17 +652,14 @@ describe("pressure, compaction and name conflicts in pi", () => {
 
   it("rebuilds branch-relative state cleanly on /tree navigation (mid-branch and root)", async () => {
     const cwd = repo();
-    const r = await piRig({ cwd });
-    const labels = ["Fix auth flow", "Check token cache"];
-    r.aux.push({
-      when: '"label"',
-      reply: () => {
-        const label = labels.shift() ?? "Extra";
-        return { label, reason: `because ${label}`, success: `${label} is done`, failure: `${label} cannot be done` };
-      },
-    });
-    r.decision.handler = janus([{ kindle: true }, { kindle: true }]);
-    r.main.push({ text: "investigating auth" }, { text: "checking token cache" });
+    const r = await piRig({ cwd, config: { janus: { lateWaitMs: 200, timeoutMs: 3000, driftCooldownRounds: 0 } } });
+    r.decision.handler = janus([]);
+    r.main.push(
+      { text: "opening root", tools: [{ name: "intent", args: { action: "open", label: "Fix auth flow", done: "auth flow fixed" } }] },
+      { text: "investigating auth" },
+      { text: "opening sub", tools: [{ name: "intent", args: { action: "open", label: "Check token cache", done: "token cache checked" } }] },
+      { text: "checking token cache" },
+    );
     await r.prompt("fix the auth flow");
     const afterFirst = r.branch();
     const firstUser = afterFirst.find((e) => e.role === "user" && e.text === "fix the auth flow")!;
@@ -752,7 +723,7 @@ describe("pressure, compaction and name conflicts in pi", () => {
     writeJson(join(home, "config.json"), {
       providers: { decision: { format: "systemone", url: dec.url, model: "jev-test" } },
       context: { maxWindow: 32000 },
-      janus: { lateWaitMs: 200, timeoutMs: 3000 },
+      janus: { lateWaitMs: 200, timeoutMs: 3000, driftCooldownRounds: 0 },
       maintenance: { idleMinutes: 600 },
     });
 
@@ -820,15 +791,19 @@ describe("pressure, compaction and name conflicts in pi", () => {
 
     try {
       expect(runtime.takeUnreportedDiagnostics()).toEqual([]);
-      // 1. Open an intent and produce an oversized tool output (archived behind o:...)
-      dec.handler = janus([{ kindle: true }, {}, {}]);
+      // 1. Open an intent via `intent` tool and produce an oversized tool output (archived behind o:...)
+      dec.handler = janus([]);
       const huge = Array.from({ length: 1200 }, (_, i) => `BIGBLOB_UNIQUE_TOKEN_${i} padding words here`).join("\n");
       write(cwd, "big.txt", huge);
-      scriptedMain.push({ text: "reading big file", tools: [{ name: "read", args: { path: "big.txt" } }] }, { text: "captured output" });
+      scriptedMain.push(
+        { text: "opening billing intent", tools: [{ name: "intent", args: { action: "open", label: "Refactor billing", done: "billing clean" } }] },
+        { text: "reading big file", tools: [{ name: "read", args: { path: "big.txt" } }] },
+        { text: "captured output" },
+      );
       await runtime.session.prompt("refactor billing module");
       expect(errors).toEqual([]);
       const session1File = runtime.session.sessionFile!;
-      const toolOut = runtime.session.sessionManager.getBranch().find((e: any) => e.type === "message" && e.message.role === "toolResult") as any;
+      const toolOut = runtime.session.sessionManager.getBranch().find((e: any) => e.type === "message" && e.message.role === "toolResult" && e.message.toolName === "read") as any;
       const toolText = toolOut.message.content.map((p: any) => p.text ?? "").join("\n");
       const blobId = /\[(o:[0-9a-z]{8})\]/.exec(toolText)?.[1] ?? "";
       expect(blobId).toMatch(/^o:/);
@@ -857,7 +832,7 @@ describe("pressure, compaction and name conflicts in pi", () => {
       const newRes = await runtime.newSession();
       expect(newRes.cancelled).toBe(false);
       expect(await status()).toContain("Open intents: none");
-      expect(runtime.session.getActiveToolNames()).toEqual(expect.arrayContaining(["search", "recall", "inspect", "remember", "forget"]));
+      expect(runtime.session.getActiveToolNames()).toEqual(expect.arrayContaining(["search", "recall", "inspect", "remember", "forget", "intent"]));
 
       // 5. /resume: switches back to session 1 and restores its open intent
       const resumeRes = await runtime.switchSession(session1File);
@@ -871,7 +846,7 @@ describe("pressure, compaction and name conflicts in pi", () => {
     }
   }, 120_000);
 
-  it("renders compact sanitized TUI tool summaries for all five realctx2 tools", () => {
+  it("renders compact sanitized TUI tool summaries for all six realctx2 tools", () => {
     const theme = {
       fg: (_c: string, s: string) => s,
       bold: (s: string) => s,
@@ -918,6 +893,21 @@ describe("pressure, compaction and name conflicts in pi", () => {
     const remember = toolRenderers("remember", "remember");
     const remErr = remember.renderResult!({ content: [{ type: "text", text: "bad input" }], isError: true } as any, { expanded: false, isPartial: false }, theme, { isError: true } as any).render(120);
     expect(remErr[0]).toContain("✗ bad input");
+
+    const intent = toolRenderers("intent", "intent");
+    const intentCall = intent.renderCall!({ action: "shift", label: "Write tests\x1b[31m", outcome: "success", all: true } as any, theme, {} as any).render(120);
+    expect(intentCall[0]).toContain("realctx2 intent");
+    expect(intentCall[0]).toContain('shift · "Write tests" · success · all');
+    const intentRes = intent.renderResult!(
+      {
+        content: [{ type: "text", text: 'Closed "Old" (succeeded).\nOpened "Write tests".' }],
+        details: { action: "shift", closed: [{ label: "Old", outcome: "succeeded" }], opened: { label: "Write tests", done: "vitest green" }, cards: 2 },
+      } as any,
+      { expanded: false, isPartial: false },
+      theme,
+      {} as any,
+    ).render(120);
+    expect(intentRes).toEqual(['✓ closed "Old" · succeeded', '→ opened "Write tests"', "  Done when: vitest green", "  +2 proactive memories"]);
   });
 
   it("renders every guidance form tool-style: closures, kindles, back-to, late cards, reminders and path notes, sanitized", () => {
@@ -957,6 +947,19 @@ describe("pressure, compaction and name conflicts in pi", () => {
     ]);
     expect(guidanceLines(paths, false, theme, (d) => d).lines).toEqual(["realctx2 paths  paths src/auth/cache.ts", "to expand"]);
     expect(guidanceLines("something else\nsecond line", false, theme).lines).toEqual(["realctx2  something else", "expand to view"]);
+    // drift reminder and empty-stack reminder forms
+    const driftText = renderDriftReminder('Your focus shifted. Call `intent` with action "shift".', [intent("a", "Fix login")]);
+    expect(parseGuidance(driftText)).toMatchObject({ kind: "drift", drift: 'Your focus shifted. Call `intent` with action "shift".' });
+    expect(guidanceLines(driftText, false, theme).lines).toEqual([
+      "realctx2 drift",
+      '⚠ Your focus shifted. Call `intent` with action "shift".',
+      "expand to view",
+    ]);
+    const emptyText = renderEmptyReminder(8, "intent");
+    expect(parseGuidance(emptyText)).toMatchObject({ kind: "reminder", emptyReminder: expect.stringContaining("No active intent on the stack after 8 rounds.") });
+    expect(guidanceLines(emptyText, false, theme).lines[0]).toBe("realctx2 reminder");
+    const remWithHint = renderReminder(intent("c", "Make the cache single-flight", "p"), "Fix login", "intent");
+    expect(parseGuidance(remWithHint)).toMatchObject({ kind: "reminder", now: { label: "Make the cache single-flight", inside: "Fix login" }, done: "Make the cache single-flight is done", giveUp: "Make the cache single-flight is stuck" });
 
     // untrusted labels and card text cannot inject terminal sequences
     const evil = renderGuidance({ closed: [], kindled: intent("e", "Fix \x1b[31mred\x1b]0;title\x07 bug"), cards: "[m:abcd1234] personal\n\x1b[2Jwipe" });
@@ -1074,121 +1077,40 @@ describe("pressure, compaction and name conflicts in pi", () => {
   });
 });
 
-describe("intent tracking for pi steering and follow-up", () => {
-  it("tracks a steering redirect: abandons prior intent before the steer message, injects guidance and path memories on the next request, and settles cleanly", async () => {
+describe("main-model intent tracking, steering, debounced drift reminders, and idle Precip in pi", () => {
+  it("delivers mentioned path memories on steering messages and lets the main model shift intents cleanly", async () => {
     const cwd = repo();
-    const r = await piRig({ cwd });
-    // seed a path memory on src/db/schema.ts to verify mention delivery on steering
+    const r = await piRig({ cwd, config: { janus: { lateWaitMs: 200, timeoutMs: 3000, driftCooldownRounds: 0 } } });
     r.decision.handler = janus([]);
     await r.prompt('/realctx2 remember "users rows are soft-deleted via deletedAt." --scope personal --urgency hint --path src/db/schema.ts');
     const fact = /\[m:([0-9a-z]{8})\]/.exec(r.ui.notes.at(-1)!.text)![1]!;
-    r.decision.requests.length = 0;
-
-    // 1. prompt kindles "Fix auth race"
-    // 2. turn 1 tool_call Janus keeps it open
-    // 3. steering message redirects (new_root + redirect=0.95) -> abandons "Fix auth race", kindles "Check users schema"
-    // 4. agent_before_settle closes "Check users schema" as success
-    const scribeLabels = ["Fix auth race", "Check users schema"];
-    r.aux.push({
-      when: '"label"',
-      reply: () => {
-        const label = scribeLabels.shift() ?? "Extra";
-        return { label, reason: `because ${label}`, success: `${label} is done`, failure: `${label} cannot be done` };
-      },
-    });
-    const steerRequests: Array<{ names: string[]; state: any }> = [];
-    r.decision.handler = (names, state, questions) => {
-      if (state?.user_message) steerRequests.push({ names, state });
-      const out: Record<string, number | Probs> = {};
-      if (names.includes("focus")) {
-        const um = String(state?.user_message ?? "");
-        if (um.includes("fix auth")) {
-          out.focus = { new_root: 0.94 };
-          out.redirect = 0.1;
-        } else if (um.includes("forget auth")) {
-          for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.85, abandoned: 0.15 };
-          out.focus = { new_root: 0.94 };
-          out.redirect = 0.95;
-        } else {
-          for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
-          out.focus = { continue: 0.95 };
-        }
-        return out;
-      }
-      // agent_before_settle: close-only
-      for (const n of names) {
-        if (n.startsWith("close.")) {
-          const label = /"([^"]+)"/.exec(questions[n]!.instructions)?.[1] ?? "";
-          out[n] = label === "Check users schema" ? { success: 0.94, open: 0.03 } : { open: 0.96 };
-        }
-      }
-      return out;
-    };
 
     let steered = false;
     r.main.push(
+      { text: "Opening auth intent.", tools: [{ name: "intent", args: { action: "open", label: "Fix auth race", done: "auth fixed" } }] },
       async () => {
-        // user steers while turn 1 is in progress (before tool batch finishes)
         if (!steered) {
           steered = true;
           await r.session.steer("Actually, forget auth — check src/db/schema.ts instead");
         }
         return { text: "Reading tokenCache.", tools: [{ name: "read", args: { path: "src/auth/tokenCache.ts" } }] };
       },
-      { text: "Checked src/db/schema.ts; users uses deletedAt." },
+      { text: "Shifting intent to schema.", tools: [{ name: "intent", args: { action: "shift", all: true, outcome: "abandoned", label: "Check users schema", done: "schema checked" } }] },
+      { text: "Checked src/db/schema.ts; closing.", tools: [{ name: "intent", args: { action: "close", outcome: "success" } }] },
+      { text: "All done." },
     );
 
     await r.prompt("fix auth in src/auth/tokenCache.ts");
     expect(r.errors).toEqual([]);
-    // Janus saw both the initial prompt and the steering message, with redirect question on steer
-    expect(steerRequests.map((x) => x.state.user_message)).toEqual([
-      "fix auth in src/auth/tokenCache.ts",
-      "Actually, forget auth — check src/db/schema.ts instead",
-    ]);
-    expect(steerRequests[1]!.names).toContain("redirect");
-    expect(steerRequests[1]!.state.recent_rounds).toContain("Reading tokenCache.");
-    expect(steerRequests[1]!.state.recent_rounds).not.toContain("Actually, forget auth");
+    // Steering turn's request received the steering message AND path memory for src/db/schema.ts
+    const steerCall = r.calls.find((c) => c.text.includes("Actually, forget auth"))!;
+    expect(steerCall).toBeDefined();
+    expect(steerCall.text).toContain(`[m:${fact}]`);
 
-    // Turn 2's LLM request immediately received the steering guidance AND path memory
-    expect(r.calls).toHaveLength(2);
-    expect(r.calls[1]!.text).toContain("user: Actually, forget auth — check src/db/schema.ts instead");
-    expect(r.calls[1]!.text).toContain('[intent] I finished "Fix auth race": set aside.\nI\'m now working on "Check users schema".');
-    expect(r.calls[1]!.text).toContain(`[m:${fact}]`);
-
-    // Check persisted branch records: closedEntryId of first intent is BEFORE the steering user message,
-    // and second intent's guidanceEntryId is the assistant reply after the steering user message
-    const b = r.branch();
-    const steerIdx = b.findIndex((e) => e.role === "user" && e.text === "Actually, forget auth — check src/db/schema.ts instead");
-    expect(steerIdx).toBeGreaterThan(0);
-    const turn2Assistant = b.slice(steerIdx + 1).find((e) => e.role === "assistant")!;
-    expect(turn2Assistant.text).toContain("Checked src/db/schema.ts");
-
-    const intentRecords = b.flatMap((e) => {
-      if (e.customType === "realctx2.intent") return [e.raw.data.intent];
-      const carried = e.raw?.details?.records;
-      if (Array.isArray(carried)) return carried.filter((x: any) => x.type === "realctx2.intent").map((x: any) => x.intent);
-      return [];
-    });
-    const byLabel = new Map<string, any>();
-    for (const intent of intentRecords) byLabel.set(intent.label, intent);
-
-    const authIntent = byLabel.get("Fix auth race");
-    expect(authIntent.status).toBe("abandoned");
-    const closedIdx = b.findIndex((e) => e.id === authIntent.closedEntryId);
-    expect(closedIdx).toBeGreaterThanOrEqual(0);
-    expect(closedIdx).toBeLessThan(steerIdx);
-
-    const schemaIntent = byLabel.get("Check users schema");
-    expect(schemaIntent.status).toBe("success");
-    expect(schemaIntent.guidanceEntryId).toBe(turn2Assistant.id);
-    // guidance custom_message for the steering turn was persisted
-    expect(b.some((e) => e.customType === "realctx2.guidance" && e.text.includes('I\'m now working on "Check users schema".'))).toBe(true);
-    expect(b.some((e) => e.customType === "realctx2.guidance" && e.text.includes('I finished "Check users schema": succeeded.'))).toBe(true);
-
-    // Resume from disk: rebuilt state reflects both closed intents with zero open intents
+    // Resume from disk: rebuilt state reflects both intents closed cleanly
     const sessionFile = r.session.sessionManager.getSessionFile()!;
     await r.shutdown();
-    const r2 = await piRig({ cwd, agentDir: r.agentDir, sessionFile });
+    const r2 = await piRig({ cwd, agentDir: r.agentDir, sessionFile, config: { janus: { driftCooldownRounds: 0 } } });
     r2.ui.notes.length = 0;
     await r2.prompt("/realctx2 status");
     expect(r2.errors).toEqual([]);
@@ -1196,302 +1118,73 @@ describe("intent tracking for pi steering and follow-up", () => {
     await r2.shutdown();
   }, 30_000);
 
-  it("tracks queued follow-up messages after a multi-turn task finishes, including chained follow-ups", async () => {
+  it("runs debounced nonblocking advisory drift checks and injects a rate-limited drift marker when the main model drifts", async () => {
     const cwd = repo();
-    const r = await piRig({ cwd });
-    const scribeLabels = ["Fix auth", "Inspect schema", "Summarize both"];
-    r.aux.push({
-      when: '"label"',
-      reply: () => {
-        const label = scribeLabels.shift() ?? "Extra";
-        return { label, reason: `because ${label}`, success: `${label} is done`, failure: `${label} cannot be done` };
-      },
-    });
-
-    const userMessagesSeen: string[] = [];
-    r.decision.handler = (names, state, questions) => {
-      const um = String(state?.user_message ?? "");
-      if (um) userMessagesSeen.push(um);
-      const out: Record<string, number | Probs> = {};
+    const r = await piRig({ cwd, config: { janus: { lateWaitMs: 200, timeoutMs: 3000, debounceMs: 40, driftCooldownRounds: 32, remindEvery: 0 } } });
+    let driftChecks = 0;
+    r.decision.handler = (names, _state, questions) => {
       if (names.includes("focus")) {
-        if (um.includes("fix auth")) {
-          out.focus = { new_root: 0.94 };
-          out.redirect = 0.1;
-        } else if (um.includes("inspect schema")) {
-          for (const n of names) {
-            if (!n.startsWith("close.")) continue;
-            const label = /"([^"]+)"/.exec(questions[n]!.instructions)?.[1] ?? "";
-            out[n] = label === "Fix auth" ? { success: 0.95, open: 0.02 } : { open: 0.96 };
-          }
-          out.focus = { new_root: 0.93 };
-          out.redirect = 0.1;
-        } else if (um.includes("summarize both")) {
-          for (const n of names) {
-            if (!n.startsWith("close.")) continue;
-            const label = /"([^"]+)"/.exec(questions[n]!.instructions)?.[1] ?? "";
-            out[n] = label === "Inspect schema" ? { success: 0.95, open: 0.02 } : { open: 0.96 };
-          }
-          out.focus = { new_root: 0.93 };
-          out.redirect = 0.1;
-        } else {
-          for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
-          out.focus = { continue: 0.95 };
-        }
-        return out;
-      }
-      // agent_before_settle: close "Summarize both"
-      for (const n of names) {
-        if (n.startsWith("close.")) {
-          const label = /"([^"]+)"/.exec(questions[n]!.instructions)?.[1] ?? "";
-          out[n] = label === "Summarize both" ? { success: 0.95, open: 0.02 } : { open: 0.96 };
-        }
-      }
-      return out;
-    };
-
-    let queuedFollowUps = false;
-    let sawFollowUp1BeforeTurn2 = false;
-    r.main.push(
-      async () => {
-        // queue two follow-ups while turn 1's tool call is about to run
-        if (!queuedFollowUps) {
-          queuedFollowUps = true;
-          await r.session.followUp("Now inspect schema");
-          await r.session.followUp("Finally summarize both");
-        }
-        return { text: "Reading auth.", tools: [{ name: "read", args: { path: "src/auth/tokenCache.ts" } }] };
-      },
-      (call) => {
-        // Turn 2 wraps up task 1: follow-up 1 must NOT have been injected yet
-        sawFollowUp1BeforeTurn2 = call.text.includes("Now inspect schema") || userMessagesSeen.includes("Now inspect schema");
-        return { text: "Auth fix complete." };
-      },
-      { text: "Schema inspected." },
-      { text: "Summary of auth and schema complete." },
-    );
-
-    await r.prompt("fix auth");
-    expect(r.errors).toEqual([]);
-    expect(sawFollowUp1BeforeTurn2).toBe(false);
-    expect(userMessagesSeen).toEqual(["fix auth", "Now inspect schema", "Finally summarize both"]);
-
-    // Turn 3 sees follow-up 1 + closing "Fix auth" + opening "Inspect schema"
-    expect(r.calls).toHaveLength(4);
-    expect(r.calls[2]!.text).toContain("user: Now inspect schema");
-    expect(r.calls[2]!.text).toContain('[intent] I finished "Fix auth": succeeded.\nI\'m now working on "Inspect schema".');
-    // Turn 4 sees follow-up 2 + closing "Inspect schema" + opening "Summarize both"
-    expect(r.calls[3]!.text).toContain("user: Finally summarize both");
-    expect(r.calls[3]!.text).toContain('[intent] I finished "Inspect schema": succeeded.\nI\'m now working on "Summarize both".');
-
-    // Verify all three intents closed cleanly and no follow-up message was inside a prior intent's span
-    const b = r.branch();
-    const f1Idx = b.findIndex((e) => e.role === "user" && e.text === "Now inspect schema");
-    const f2Idx = b.findIndex((e) => e.role === "user" && e.text === "Finally summarize both");
-    expect(f1Idx).toBeGreaterThan(0);
-    expect(f2Idx).toBeGreaterThan(f1Idx);
-
-    const intentRecords = b.flatMap((e) => {
-      if (e.customType === "realctx2.intent") return [e.raw.data.intent];
-      const carried = e.raw?.details?.records;
-      if (Array.isArray(carried)) return carried.filter((x: any) => x.type === "realctx2.intent").map((x: any) => x.intent);
-      return [];
-    });
-    const byLabel = new Map<string, any>();
-    for (const intent of intentRecords) byLabel.set(intent.label, intent);
-
-    expect(byLabel.get("Fix auth").status).toBe("success");
-    expect(b.findIndex((e) => e.id === byLabel.get("Fix auth").closedEntryId)).toBeLessThan(f1Idx);
-    expect(byLabel.get("Inspect schema").status).toBe("success");
-    expect(b.findIndex((e) => e.id === byLabel.get("Inspect schema").closedEntryId)).toBeLessThan(f2Idx);
-    expect(byLabel.get("Summarize both").status).toBe("success");
-    await r.shutdown();
-  }, 30_000);
-
-  it("batches multiple steering messages in 'all' mode as one Janus turn and opens a sub-intent on interruption", async () => {
-    const cwd = repo();
-    const r = await piRig({ cwd, settings: { steeringMode: "all" } });
-    const scribeLabels = ["Fix auth", "Check schema types"];
-    r.aux.push({
-      when: '"label"',
-      reply: () => {
-        const label = scribeLabels.shift() ?? "Extra";
-        return { label, reason: `because ${label}`, success: `${label} is done`, failure: `${label} cannot be done` };
-      },
-    });
-    const userMessagesSeen: string[] = [];
-    r.decision.handler = (names, state, questions) => {
-      const um = String(state?.user_message ?? "");
-      if (um) userMessagesSeen.push(um);
-      const out: Record<string, number | Probs> = {};
-      if (names.includes("focus")) {
-        if (um.includes("fix auth")) {
-          out.focus = { new_root: 0.94 };
-          out.redirect = 0.1;
-        } else if (um.includes("wait, check schema")) {
-          // interruption (new_root with low redirect -> deepens inside parent!)
-          for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
-          out.focus = { new_root: 0.94 };
-          out.redirect = 0.2;
-        } else {
-          // turn 2 tool_call closes the sub-intent and returns to parent
-          for (const n of names) {
-            if (!n.startsWith("close.")) continue;
-            const label = /"([^"]+)"/.exec(questions[n]!.instructions)?.[1] ?? "";
-            out[n] = label === "Check schema types" ? { success: 0.95, open: 0.02 } : { open: 0.96 };
-          }
-          out.focus = { continue: 0.95 };
-        }
-        return out;
-      }
-      for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
-      return out;
-    };
-
-    let steered = false;
-    r.main.push(
-      async () => {
-        if (!steered) {
-          steered = true;
-          await r.session.steer("wait, check schema first");
-          await r.session.steer("specifically check deletedAt");
-        }
-        return { text: "Reading auth.", tools: [{ name: "read", args: { path: "src/auth/tokenCache.ts" } }] };
-      },
-      { text: "Checking schema.", tools: [{ name: "read", args: { path: "src/db/schema.ts" } }] },
-      { text: "Schema has deletedAt: null; resuming auth.", tools: [{ name: "read", args: { path: "src/auth/tokenCache.ts" } }] },
-      { text: "Back to auth." },
-    );
-
-    await r.prompt("fix auth");
-    expect(r.errors).toEqual([]);
-    // Both steering messages arrived in one batch, combined into one Janus decision
-    expect(userMessagesSeen).toEqual(["fix auth", "wait, check schema first\n\nspecifically check deletedAt"]);
-    expect(r.calls[1]!.text).toContain('I\'m now working on "Check schema types" (inside: Fix auth).');
-    // Once the agent examined the schema read result, Turn 3 closed the sub-intent and returned focus to "Fix auth"
-    expect(r.calls[3]!.text).toContain('I finished "Check schema types": succeeded.\nI\'m back to "Fix auth".');
-    await r.shutdown();
-  }, 30_000);
-
-  it("tracks steering queued during before_agent_start without double-processing the initial prompt, and handles a late scribe on steering", async () => {
-    const cwd = repo();
-    const r = await piRig({ cwd, config: { janus: { lateWaitMs: 200, timeoutMs: 250 } } });
-    const scribeLabels = ["Initial task", "Immediate steer task", "Late steer task"];
-    let releaseLateScribe: (() => void) | null = null;
-    const lateScribeGate = new Promise<void>((res) => {
-      releaseLateScribe = res;
-    });
-    let scribeCalls = 0;
-    r.aux.push({
-      when: '"label"',
-      reply: async () => {
-        scribeCalls++;
-        const label = scribeLabels.shift() ?? "Extra";
-        if (label === "Late steer task") await lateScribeGate;
-        return { label, reason: `because ${label}`, success: `${label} is done`, failure: `${label} cannot be done` };
-      },
-    });
-
-    const userMessagesSeen: string[] = [];
-    let queuedDuringBeforeStart = false;
-    r.decision.handler = async (names, state) => {
-      const um = String(state?.user_message ?? "");
-      if (um) userMessagesSeen.push(um);
-      if (um === "start initial task" && !queuedDuringBeforeStart) {
-        queuedDuringBeforeStart = true;
-        // User queues a steering message while before_agent_start is still awaiting Janus
-        await r.session.steer("also handle edge case");
-      }
-      const out: Record<string, number | Probs> = {};
-      if (names.includes("focus")) {
-        if (um === "start initial task") {
-          out.focus = { new_root: 0.94 };
-          out.redirect = 0.1;
-        } else if (um === "also handle edge case") {
-          for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
-          out.focus = { deepen: 0.94 };
-          out.redirect = 0.1;
-        } else if (um === "slow steer task") {
-          for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
-          out.focus = { deepen: 0.94 };
-          out.redirect = 0.1;
-        } else {
-          for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
-          out.focus = { continue: 0.95 };
-        }
-        return out;
-      }
-      for (const n of names) if (n.startsWith("close.")) out[n] = { open: 0.96 };
-      return out;
-    };
-
-    let queuedSlowSteer = false;
-    r.main.push(
-      async () => {
-        if (!queuedSlowSteer) {
-          queuedSlowSteer = true;
-          await r.session.steer("slow steer task");
-        }
-        return { text: "Handled initial and edge case.", tools: [{ name: "read", args: { path: "src/auth/tokenCache.ts" } }] };
-      },
-      async () => {
-        // Release the late scribe while Turn 2 is executing so turn_end picks it up via takeLateKindle
-        releaseLateScribe?.();
-        return { text: "Handling slow steer task." };
-      },
-    );
-
-    await r.prompt("start initial task");
-    expect(r.errors).toEqual([]);
-    // Initial prompt processed ONCE (before_agent_start), each steering message processed ONCE (context)
-    expect(userMessagesSeen).toEqual(["start initial task", "also handle edge case", "slow steer task"]);
-    expect(scribeCalls).toBe(3);
-    expect(r.calls).toHaveLength(2);
-    expect(r.calls[0]!.text).toContain('I\'m now working on "Initial task".');
-    expect(r.calls[0]!.text).toContain("user: also handle edge case");
-    expect(r.calls[0]!.text).toContain('I\'m now working on "Immediate steer task" (inside: Initial task).');
-    // The late scribe missed Turn 2's prompt budget, so Turn 2 did not get its guidance yet...
-    expect(r.calls[1]!.text).toContain("user: slow steer task");
-    expect(r.calls[1]!.text).not.toContain('I\'m now working on "Late steer task"');
-    // ...and opened at Turn 2's turn_end with guidanceEntryId pointing to Turn 2's assistant message
-    const b = r.branch();
-    const slowSteerIdx = b.findIndex((e) => e.role === "user" && e.text === "slow steer task");
-    const slowSteerAssistant = b.slice(slowSteerIdx + 1).find((e) => e.role === "assistant")!;
-    const intentRecords = b.flatMap((e) => (e.customType === "realctx2.intent" ? [e.raw.data.intent] : []));
-    const lateIntent = intentRecords.find((i: any) => i.label === "Late steer task");
-    expect(lateIntent).toBeDefined();
-    expect(lateIntent.guidanceEntryId).toBe(slowSteerAssistant.id);
-    expect(b.some((e) => e.customType === "realctx2.guidance" && e.text.includes('I\'m now working on "Late steer task" (inside: Immediate steer task).'))).toBe(true);
-    await r.shutdown();
-  }, 30_000);
-
-  it("applies settle-deferred idle Precip before the next prompt's first LLM request and persists edits at turn_end", async () => {
-    const cwd = repo();
-    const r = await piRig({ cwd });
-    r.aux.push(
-      scribe("Refactor cache layer"),
-      { when: '"sidecar"', reply: () => ({ memory: "Refactored cache layer cleanly.", sidecar: { outcome_summary: "Refactored", state_changes: [], artifacts: [], open_threads: [] } }) },
-      scribe("Follow-up check"),
-    );
-    // Prompt 1: kindle on user prompt, keep open during work turns, close on closure-only agent_before_settle;
-    // Prompt 2: kindle "Follow-up check" on user prompt
-    const base = janus([{ kindle: true }, {}, {}, {}, { kindle: true }, {}]);
-    r.decision.handler = (names, state, questions) => {
-      if (!names.includes("focus") && names.some((n) => n.startsWith("close."))) {
-        const out: Record<string, number | Probs> = {};
+        driftChecks++;
+        const out: Record<string, number | Probs> = { focus: { continue: 0.9 } };
         for (const n of names) {
           if (!n.startsWith("close.")) continue;
           const label = /"([^"]+)"/.exec(questions[n]!.instructions)?.[1] ?? "";
-          out[n] = label === "Refactor cache layer" ? { success: 0.94, open: 0.03 } : { open: 0.96 };
+          out[n] = label === "Fix auth" ? { success: 0.95, open: 0.02 } : { open: 0.96 };
         }
         return out;
       }
-      return base(names, state, questions);
+      return {};
     };
+
+    r.main.push(
+      { text: "Opening auth intent.", tools: [{ name: "intent", args: { action: "open", label: "Fix auth", done: "auth fixed" } }] },
+      { text: "Finished auth work without closing intent.", tools: [{ name: "bash", args: { command: "echo fixed" } }] },
+      async () => {
+        // Wait for quiet break > debounceMs (40ms) so the background advisory drift check fires
+        await new Promise((res) => setTimeout(res, 120));
+        return { text: "Still going without calling intent.", tools: [{ name: "bash", args: { command: "echo more" } }] };
+      },
+      { text: "Saw the drift check!" },
+    );
+
+    await r.prompt("fix auth");
+    expect(r.errors).toEqual([]);
+    expect(driftChecks).toBe(1);
+    // Advisory Janus never auto-closed the stack, and injected the strong drift marker into the next request
+    expect(r.calls.at(-1)!.text).toContain("[intent] Drift check:");
+    expect(r.calls.at(-1)!.text).toContain('action "close"');
+    r.ui.notes.length = 0;
+    await r.prompt("/realctx2 status");
+    expect(r.ui.notes[0]!.text).toContain("Fix auth");
+    await r.shutdown();
+  }, 30_000);
+
+  it("applies idle-completed Precip in onContext before the next prompt's first LLM request and persists edits at turn_end", async () => {
+    const cwd = repo();
+    const r = await piRig({ cwd, config: { janus: { lateWaitMs: 200, timeoutMs: 3000, driftCooldownRounds: 0 } } });
+    let releasePrecip!: () => void;
+    const precipGate = new Promise<void>((res) => (releasePrecip = res));
+    r.aux.push({
+      when: '"sidecar"',
+      reply: async () => {
+        await precipGate;
+        return { memory: "Refactored cache layer cleanly.", sidecar: { outcome_summary: "Refactored", state_changes: [], artifacts: [], open_threads: [] } };
+      },
+    });
+    r.decision.handler = janus([]);
     const work = (i: number) => ({ text: `cache work ${i}`, tools: [{ name: "bash", args: { command: `echo ${filler(900, `c${i}_`)}` } }] });
-    r.main.push(work(0), work(1), work(2), { text: "All cache refactoring is done." });
+    r.main.push(
+      { text: "Opening cache refactor.", tools: [{ name: "intent", args: { action: "open", label: "Refactor cache layer", done: "cache refactored" } }] },
+      work(0),
+      work(1),
+      work(2),
+      { text: "Closing cache refactor.", tools: [{ name: "intent", args: { action: "close", outcome: "success" } }] },
+      { text: "All cache refactoring is done." },
+    );
 
     await r.prompt("refactor the cache layer");
-    // Wait for idle Precip (triggered by agent_settled) to finish before the user sends Prompt 2
+    // Release Precip during idle time before Prompt 2
+    releasePrecip();
     for (let i = 0; i < 150 && !r.auxCalls.some((c) => c.system.includes('"sidecar"')); i++) await new Promise((res) => setTimeout(res, 20));
     await new Promise((res) => setTimeout(res, 150));
     expect(r.auxCalls.some((c) => c.system.includes('"sidecar"'))).toBe(true);

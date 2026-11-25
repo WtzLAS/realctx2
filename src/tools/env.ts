@@ -7,8 +7,8 @@ import type { Clock, EntryView, SessionRecord, ToolResultPayload } from "../core
 import type { ContextEngine, PendingDelivery } from "../context/engine.ts";
 import type { MemoryRuntime, SessionEntry } from "../memory/runtime.ts";
 
-export type ToolKey = "search" | "recall" | "inspect" | "remember" | "forget";
-export const TOOL_KEYS: ToolKey[] = ["search", "recall", "inspect", "remember", "forget"];
+export type ToolKey = "search" | "recall" | "inspect" | "remember" | "forget" | "intent";
+export const TOOL_KEYS: ToolKey[] = ["search", "recall", "inspect", "remember", "forget", "intent"];
 /** Tools an aux session gets: they cannot start aux work of their own (§9.3.2). */
 export const AUX_TOOL_KEYS: ToolKey[] = ["search", "recall", "inspect"];
 

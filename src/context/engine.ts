@@ -18,14 +18,15 @@ import { raceTimeout } from "../util/async.ts";
 import { errMsg } from "../util/errors.ts";
 import { randomId8 } from "../util/ids.ts";
 import { normalizeCommandParts } from "../util/shell.ts";
-import { estimateTokens, extractPathTokens, ngramOverlap } from "../util/text.ts";
+import { toolNames } from "../tools/env.ts";
+import { clipWords, estimateTokens, extractPathTokens, headTail, ngramOverlap, sanitize } from "../util/text.ts";
 import { type BlobStore, guardToolResult } from "./archive.ts";
 import { Attributor } from "./attribution.ts";
 import { checkInvariants, Consolidator, planReplace, renderForAux, type ReplacePlan, spanFingerprint } from "./consolidate.ts";
 import { Harvester } from "./harvest.ts";
-import { Janus, type JanusInput, type JanusPlan, type KindlePlan, type ScribedIntent } from "./janus.ts";
+import { type DriftAdvisory, Janus, type JanusInput } from "./janus.ts";
 import { Palim } from "./palim.ts";
-import { GUIDANCE_TYPE, renderGuidance, renderLateCards, renderPalim, renderPrecip, renderReinjection, renderReminder } from "./render.ts";
+import { GUIDANCE_TYPE, renderDriftReminder, renderEmptyReminder, renderLateCards, renderPalim, renderPrecip, renderReinjection, renderReminder } from "./render.ts";
 import { alignToUnits, latestRoundStart, roundCount, sumTokens, toUnits, type Unit, workingTail } from "./rounds.ts";
 import { SessionState } from "./state.ts";
 
@@ -72,18 +73,29 @@ export interface PendingDelivery {
   full?: boolean;
 }
 
-/** One Janus request, from the evidence it saw to the plan it produced. */
-interface JanusRun {
-  promise: Promise<JanusPlan>;
-  input: JanusInput;
-  done: boolean;
-  plan: JanusPlan | null;
-  /** Start order: a newer answer replaces an older one that is still waiting. */
-  seq: number;
-  /** Branch generation: answers for a branch that was left are dropped. */
+export type IntentActionInput =
+  | { action: "open"; label: string; reason?: string; done: string; giveUp?: string }
+  | { action: "close"; outcome?: IntentOutcome; count?: number; all?: boolean }
+  | { action: "shift"; label: string; reason?: string; done: string; giveUp?: string; outcome?: IntentOutcome; count?: number; all?: boolean }
+  | { action: "update"; label?: string; reason?: string; done?: string; giveUp?: string };
+
+export interface IntentActionResult {
+  ok: boolean;
+  error?: string;
+  action: IntentActionInput["action"];
+  closed: Array<{ intent: Intent; outcome: IntentOutcome }>;
+  opened: Intent | null;
+  updated: Intent | null;
+  stack: Intent[];
+  cards: string;
+  paths: string;
+  deliveries: PendingDelivery[];
+}
+
+interface PendingDrift {
+  advisory: DriftAdvisory;
   gen: number;
-  /** Intents known when the evidence was taken. */
-  intents: number;
+  stackVersion: number;
 }
 
 interface PrecipJob {
@@ -102,16 +114,7 @@ interface PrecipJob {
   attributionOnly?: boolean;
 }
 
-/** A freshly opened intent and what goes into its guidance. */
-interface Kindled {
-  intent: Intent;
-  cards: string;
-  shown: Shown[];
-  pathText: string;
-  pathShown: Shown[];
-}
-
-/** Proactive cards whose (emulated) gate was still running when their intent was kindled. */
+/** Proactive cards whose (emulated) gate was still running when their intent was opened. */
 interface LateCards {
   intentId: string;
   gen: number;
@@ -119,32 +122,13 @@ interface LateCards {
   result: Awaited<ReturnType<Retriever["proactive"]>> | null;
 }
 
-/**
- * Where a late intent starts: the entry after `afterId` (the leaf when its kindle was planned),
- * past the user message it answers when it was planned for one.
- */
+/** Where a newly opened intent starts when its round's assistant entry is not in the transcript yet. */
 interface KindleStart {
   afterId: string;
   skipUser: boolean;
 }
 
-/** A kindle whose scribe missed its commit point's budget: the intent opens at a later one. */
-interface LateKindle {
-  kindle: KindlePlan;
-  gen: number;
-  intents: number;
-  done: boolean;
-  scribed: ScribedIntent | null;
-  settled: Promise<void>;
-  start: KindleStart;
-}
-
 const ROOT = "root";
-
-/** Milliseconds until `deadline` (a `Date.now()` value), never negative. */
-function timeLeft(deadline: number): number {
-  return Math.max(0, deadline - Date.now());
-}
 
 export class ContextEngine {
   readonly adapter: HarnessAdapter;
@@ -170,19 +154,23 @@ export class ContextEngine {
   /** Records and edits waiting for the next commit point. */
   private pending: CommitBatch = emptyBatch();
   private unresolvedDeliveries: Array<{ d: Delivery; guidanceKey?: string }> = [];
-  private janusRun: JanusRun | null = null;
-  /** The newest answer that missed its commit point; it applies at the next one (§5.2.1). */
-  private lateJanus: JanusRun | null = null;
-  private janusSeq = 0;
   private janusGen = 0;
-  private janusInFlight = 0;
-  /** Proactive cards that missed their kindle, one entry per intent, delivered when they arrive. */
+  private janusTimer: ReturnType<typeof setTimeout> | null = null;
+  private janusCheckInFlight = false;
+  /** Last transcript leaf covered by an advisory drift check (or the latest `intent` tool call). */
+  private janusLastEvidenceLeafId: string | null = null;
+  /** Most recent user message since the last advisory drift check. */
+  private janusPendingUserMessage: string | undefined = undefined;
+  /** Monotonic version incremented whenever the main model mutates the intent stack. */
+  private stackVersion = 0;
+  /** Ready drift reminder produced in the background, waiting for the next commit point. */
+  private pendingDrift: PendingDrift | null = null;
+  /** Proactive cards that missed their `intent` open wait, delivered when they arrive. */
   private lateCards: LateCards[] = [];
-  /** A kindle whose scribe missed its commit point's budget: the intent opens at the next one. */
-  private lateKindle: LateKindle | null = null;
-  /** Kindled intents whose guidance is deferred past the next assistant response (steering/follow-up). */
+  /** Opened intents whose first governed entry is not persisted yet. */
   private pendingStarts = new Map<string, KindleStart>();
-  private janusStartedThisTurn = false;
+  /** Round of the last empty-stack periodic reminder. */
+  private lastEmptyReminderRound = 0;
   private closeProb: Record<string, number> = {};
   private precipJobs: PrecipJob[] = [];
   /** Plans applied to a live request through the `context` hook, to be persisted at the next commit point. */
@@ -218,7 +206,7 @@ export class ContextEngine {
         return null;
       }
     };
-    this.janus = new Janus({ cfg: o.cfg, decision: o.decision, aux, sim: this.memory?.sim ?? null });
+    this.janus = new Janus({ cfg: o.cfg, decision: o.decision });
     this.consolidator = new Consolidator({ aux, maxInputTokens: () => Math.max(8000, Math.floor(this.window() * 0.4)) });
     this.attributor = new Attributor({ cfg: o.cfg, decision: o.decision, graph: this.memory?.graph, delivery: this.memory?.delivery, accounting: this.memory?.accounting, log: this.memory?.evoLog });
     this.harvester = new Harvester({
@@ -288,19 +276,22 @@ export class ContextEngine {
     this.precipJobs = [];
     this.palim.reset();
     this.appliedNow = [];
-    this.janusRun = null;
-    this.lateJanus = null;
+    this.clearDriftTimer();
+    this.janusCheckInFlight = false;
+    this.janusLastEvidenceLeafId = entries.at(-1)?.id ?? null;
+    this.janusPendingUserMessage = undefined;
+    this.pendingDrift = null;
     this.lateCards = [];
-    this.lateKindle = null;
     this.pendingStarts.clear();
     this.janusGen++;
-    this.janusStartedThisTurn = false;
+    this.stackVersion++;
     this.closeProb = {};
     this.actions.clear();
     this.turnPathTokens = 0;
     this.gatedThisTurn.clear();
     this.shownThisTurn.clear();
     this.lastReminderRound.clear();
+    this.lastEmptyReminderRound = this.round;
     this.statsDirty = false;
     this.savedThisStep = 0;
     this.indexedEntries = null;
@@ -408,7 +399,7 @@ export class ContextEngine {
       tokens: estimateTokens(p.text),
       restatedRatio: p.text ? Math.round(ngramOverlap(p.text, this.visibleText()) * 100) / 100 : 0,
       signature,
-      round: this.round,
+      round: where.toolCallId && !(this.units.at(-1)?.round && !this.units.at(-1)!.complete) ? this.round + 1 : this.round,
       full: p.full,
       toolCallId: where.toolCallId,
       subagent: where.subagent || undefined,
@@ -462,165 +453,326 @@ export class ContextEngine {
     return pr.text;
   }
 
-  // ───────────── Janus plumbing
-  private janusInput(mode: "full" | "closure", userMessage?: string, scope?: { entries: EntryView[]; units: Unit[] }): JanusInput {
-    const entries = scope?.entries ?? this.entries;
-    const units = scope?.units ?? this.units;
-    return { state: this.state, entries, units, userMessage, mode, round: roundCount(units), cacheKey: `${this.sessionId}.janus` };
+  // ───────────── Main-model intent tool & advisory Janus (§5.2)
+  private intentToolName(): string {
+    return toolNames(this.cfg).intent;
+  }
+
+  private clearDriftTimer(): void {
+    if (this.janusTimer !== null) {
+      clearTimeout(this.janusTimer);
+      this.janusTimer = null;
+    }
+  }
+
+  private cancelDriftCheck(): void {
+    this.clearDriftTimer();
+    this.pendingDrift = null;
+    this.janusLastEvidenceLeafId = this.entries.at(-1)?.id ?? null;
+    this.janusPendingUserMessage = undefined;
+  }
+
+  /** Whether the cooldown window allows another strong drift reminder (0 disables drift checks). */
+  private canEmitDrift(): boolean {
+    const cd = this.cfg.janus.driftCooldownRounds;
+    if (cd <= 0) return false;
+    const last = this.state.stats.lastDriftReminderRound;
+    return last === undefined || this.round - last >= cd;
   }
 
   /**
-   * Turn a Janus plan into records and at most one guidance message. With a `deadline` (a user
-   * message or `turn_end`), the scribe and the proactive cards get only the time left: a late
-   * scribe opens its intent at the next commit point, late cards follow. `userMessage` marks a
-   * plan for a user message that is not in the transcript yet; when the harness already appended
-   * the user message (steering/follow-up), `closeAt`, `kindleStart`, and `deferredGuidance` keep
-   * closures before it and the new intent starting after it.
+   * Schedule a debounced, nonblocking advisory drift check. When unchecked transcript tokens
+   * reach `janus.maxInputTokens` (even while the debounce timer is still counting down), bypass
+   * the debounce and prefire immediately once so no context is truncated away before inspection.
    */
-  private async applyPlan(
-    plan: JanusPlan,
-    input: JanusInput,
-    opts: { deferPrecip?: boolean; extraPaths?: string; deadline?: number; userMessage?: boolean; closeAt?: string; kindleStart?: KindleStart; deferredGuidance?: boolean } = {},
-  ): Promise<GuidanceMessage | null> {
-    Object.assign(this.closeProb, plan.closeProb);
-    const leaf = opts.closeAt ?? (this.entries[this.entries.length - 1]?.id ?? "");
-    const closedNow: Array<{ intent: Intent; outcome: IntentOutcome }> = [];
-    // closures, innermost first; only intents that are still open on this branch
-    for (const c of plan.closures) {
-      const cur = this.state.intents.get(c.intent.id);
-      if (!cur || cur.status !== "open") continue;
-      this.pendingStarts.delete(cur.id);
-      const closed: Intent = { ...cur, status: c.outcome, closedEntryId: leaf };
-      const level = this.state.stack.findIndex((i) => i.id === cur.id) + 1;
-      this.emit({ type: "realctx2.intent", intent: closed });
-      closedNow.push({ intent: closed, outcome: c.outcome });
-      // falling back: the level its consolidation lands in has to become stable again,
-      // so the frontier drops below it and the climb's clock starts over
-      this.state.stats.frontier = Math.max(0, Math.min(this.state.stats.frontier ?? 0, level - 2));
-      this.state.stats.lastClimbRound = this.round;
-      this.statsDirty = true;
-    }
-    if (closedNow.length) this.queuePrecip(closedNow, opts.deferPrecip === true);
+  private scheduleDriftCheck(opts: { userMessage?: string; extraTokens?: number; onlyIfCountingDown?: boolean } = {}): void {
+    if (this.light || !this.contextEnabled() || !this.janus.available() || !this.canEmitDrift()) return;
+    if (opts.userMessage !== undefined) this.janusPendingUserMessage = opts.userMessage;
+    if (this.janusCheckInFlight) return;
+    const leaf = this.entries.at(-1)?.id ?? null;
+    const hasNewEntries = leaf !== null && leaf !== this.janusLastEvidenceLeafId;
+    if (!hasNewEntries && !this.janusPendingUserMessage) return;
 
-    let k: Kindled | null = null;
-    // a kindle whose scribe is still running: its intent opens at the next commit point
-    let pending = false;
-    const start: KindleStart = opts.kindleStart ?? { afterId: leaf, skipUser: opts.userMessage === true };
-    if (plan.kindle && input.mode === "full") {
-      const scribed = await this.scribeBy(input, plan.kindle, opts.deadline, start);
-      if (scribed) {
-        k = await this.kindle(scribed, plan.kindle, { signal: input.signal, extraPaths: opts.extraPaths, deadline: opts.deadline });
-        if (opts.deferredGuidance) this.pendingStarts.set(k.intent.id, start);
-      } else pending = this.lateKindle?.kindle === plan.kindle;
-    }
-    const pathText = k ? k.pathText : (opts.extraPaths ?? "");
-    if (!closedNow.length && !k) {
-      if (pathText) return this.guidance(pathText, { key: randomId8() });
-      return pending ? null : this.reminder();
-    }
-    // not "back to" the parent when the next commit point says "now working on" something else
-    const backTo = !k && !pending && closedNow.length ? this.state.innermost() : null;
-    return this.kindleGuidance(k, { closed: closedNow, backTo, paths: pathText, focus: plan.focus });
-  }
-
-  /** The guidance message for closures and a kindle; its proactive cards and path memories are deliveries. */
-  private kindleGuidance(k: Kindled | null, o: { closed: Array<{ intent: Intent; outcome: IntentOutcome }>; backTo: Intent | null; paths: string; focus: JanusPlan["focus"] }): GuidanceMessage {
-    const key = randomId8();
-    const kindled = k?.intent ?? null;
-    const parentLabel = kindled?.parentId ? this.state.intents.get(kindled.parentId)?.label : undefined;
-    const text = renderGuidance({ closed: o.closed, kindled, parentLabel, backTo: o.backTo, cards: k?.cards ?? "", paths: o.paths });
-    const msg = this.guidance(text, { key, ...(kindled ? { intentId: kindled.id } : {}) });
-    // recorded against the kindled intent
-    if (k?.shown.length) this.deliverShown(k.shown, "proactive", { guidanceKey: key });
-    if (k?.pathShown.length) this.deliverShown(k.pathShown, "path", { guidanceKey: key });
-    this.telemetry?.step({ kind: "janus", closures: o.closed.length, kindled: !!kindled, focus: o.focus, cards: k?.shown.length ?? 0 });
-    return msg;
-  }
-
-  /**
-   * The scribe for a kindle. Past `deadline` it keeps running and its intent opens at the next
-   * commit point, unless another intent was kindled or the branch changed in the meantime.
-   */
-  private async scribeBy(input: JanusInput, kindle: KindlePlan, deadline: number | undefined, start: KindleStart): Promise<ScribedIntent | null> {
-    const scribing = this.janus.scribe(input, kindle, this.state.stack);
-    if (deadline === undefined) return scribing;
-    const late: LateKindle = { kindle, gen: this.janusGen, intents: this.state.intents.size, done: false, scribed: null, settled: Promise.resolve(), start };
-    late.settled = scribing.then(
-      (s) => {
-        late.scribed = s;
-        late.done = true;
+    const unchecked = this.janus.uncheckedTokens(
+      {
+        state: this.state,
+        entries: this.entries,
+        units: this.units,
+        userMessage: this.janusPendingUserMessage,
+        mode: "full",
+        round: this.round,
+        sinceEntryId: this.janusLastEvidenceLeafId,
       },
-      (e) => {
-        late.done = true;
-        this.telemetry?.event("janus.scribe_failed", { error: errMsg(e) });
-      },
+      opts.extraTokens ?? 0,
     );
-    await raceTimeout(late.settled, timeLeft(deadline), input.signal);
-    if (late.done) return late.scribed;
-    // the user cancelled the prompt: the kindle is dropped, the next commit point decides anew
-    if (input.signal?.aborted) return null;
-    this.lateKindle = late;
-    this.telemetry?.event("janus.kindle_late", {});
+    if (unchecked >= this.janus.maxInputTokens()) {
+      this.clearDriftTimer();
+      this.track(this.runDriftCheck("prefire"));
+      return;
+    }
+    if (opts.onlyIfCountingDown && this.janusTimer === null) return;
+    this.clearDriftTimer();
+    const delay = Math.max(0, this.cfg.janus.debounceMs);
+    this.janusTimer = setTimeout(() => {
+      this.janusTimer = null;
+      this.track(this.runDriftCheck("debounce"));
+    }, delay);
+    (this.janusTimer as { unref?: () => void }).unref?.();
+  }
+
+  private async runDriftCheck(trigger: "debounce" | "prefire"): Promise<void> {
+    if (this.light || !this.contextEnabled() || this.janusCheckInFlight || !this.canEmitDrift()) return;
+    const gen = this.janusGen;
+    const ver = this.stackVersion;
+    this.janusCheckInFlight = true;
+    try {
+      try {
+        await this.refresh();
+      } catch {
+        return;
+      }
+      if (gen !== this.janusGen || ver !== this.stackVersion || !this.canEmitDrift()) return;
+      const leaf = this.entries.at(-1)?.id ?? null;
+      const userMessage = this.janusPendingUserMessage;
+      const sinceEntryId = this.janusLastEvidenceLeafId;
+      if (!this.entries.length && !userMessage) return;
+      // Advance the watermark before awaiting the network call so subsequent turns do not re-prefire the same span.
+      this.janusLastEvidenceLeafId = leaf;
+      this.janusPendingUserMessage = undefined;
+      const input: JanusInput = {
+        state: this.state,
+        entries: this.entries,
+        units: this.units,
+        userMessage,
+        mode: "full",
+        round: this.round,
+        cacheKey: `${this.sessionId}.janus`,
+        sinceEntryId,
+      };
+      const plan = await this.janus.decide(input);
+      if (gen !== this.janusGen || ver !== this.stackVersion) return;
+      Object.assign(this.closeProb, plan.closeProb);
+      const advisory = this.janus.advisory(plan, this.state.stack, this.intentToolName());
+      if (advisory) {
+        this.pendingDrift = { advisory, gen, stackVersion: ver };
+        this.telemetry?.event("janus.drift_detected", { trigger, kind: advisory.kind, closures: advisory.closures.length, focus: advisory.focus });
+      }
+    } finally {
+      this.janusCheckInFlight = false;
+    }
+  }
+
+  /** Consume a ready background drift advisory if still valid and outside cooldown. */
+  private takeDriftReminder(): GuidanceMessage | null {
+    const pending = this.pendingDrift;
+    if (!pending) return null;
+    this.pendingDrift = null;
+    if (pending.gen !== this.janusGen || pending.stackVersion !== this.stackVersion || !this.canEmitDrift()) return null;
+    this.state.stats.lastDriftReminderRound = this.round;
+    this.state.stats.driftReminders = (this.state.stats.driftReminders ?? 0) + 1;
+    this.statsDirty = true;
+    const innermost = this.state.innermost();
+    if (innermost) this.lastReminderRound.set(innermost.id, this.round);
+    else this.lastEmptyReminderRound = this.round;
+    return this.guidance(renderDriftReminder(pending.advisory.summary, this.state.stack), { drift: pending.advisory.kind });
+  }
+
+  private async findDuplicateOpen(label: string, open: Intent[], signal?: AbortSignal): Promise<Intent | null> {
+    const lower = label.toLowerCase();
+    for (const i of open) {
+      if (i.label.toLowerCase() === lower) return i;
+      if (this.memory?.sim) {
+        const pair = await this.memory.sim.textPair(label, i.label, signal);
+        if (pair.sim >= this.memory.sim.threshold("intentDuplicate", pair.mode)) return i;
+      }
+    }
     return null;
   }
 
-  /** Open a scribed intent, with its proactive cards and the path memories it names. */
-  private async kindle(scribed: ScribedIntent, kindle: KindlePlan, o: { signal?: AbortSignal; extraPaths?: string; deadline?: number; startEntryId?: string }): Promise<Kindled> {
-    const parent = kindle.parentId ? this.state.intents.get(kindle.parentId) : undefined;
-    const parentId = parent?.status === "open" ? parent.id : kindle.parentId && this.state.stack.length ? this.state.innermost()!.id : null;
-    const intent = this.janus.newIntent(scribed, parentId, this.round);
-    // a late intent governs from where it was planned, not from its guidance (resolveIds keeps it)
-    if (o.startEntryId) intent.guidanceEntryId = o.startEntryId;
-    if (parentId === null) {
-      // a new root: ordinary folds start again from the root prefix
-      this.state.stats.frontier = 0;
-      this.statsDirty = true;
-    }
-    const k: Kindled = { intent, cards: "", shown: [], pathText: o.extraPaths ?? "", pathShown: [] };
-    if (this.memory) {
-      this.memory.recordPurpose(intent.id, `${intent.label}\n${intent.reason}`);
-      try {
-        const parentLabel = parentId ? this.state.intents.get(parentId)?.label : undefined;
-        const pro = await this.proactiveCards(intent, parentLabel, o.signal, o.deadline === undefined ? undefined : timeLeft(o.deadline));
-        k.cards = pro?.text ?? "";
-        k.shown = pro?.cards ?? [];
-        // path memories for paths named in the intent and touched in the last 2 rounds
-        const mentioned = this.memory.paths.resolveMentions(extractPathTokens(`${intent.label} ${intent.reason} ${intent.success}`));
-        const recent = this.recentPaths(2);
-        const paths = [...new Set([...mentioned, ...recent])].slice(0, 4);
-        if (paths.length && !k.pathText) {
-          const block = this.memory.delivery.block({ action: "read", paths }, { visible: (id) => this.isVisible(id) || k.shown.some((s) => s.ref.node.id === id), turnTokensLeft: Math.max(0, this.cfg.paths.perTurnTokens - this.turnPathTokens) });
-          if (block) {
-            k.pathText = block.text;
-            k.pathShown = block.shown;
-            this.turnPathTokens += block.tokens;
-          }
-        }
-      } catch (e) {
-        this.telemetry?.event("proactive.failed", { error: errMsg(e) });
-      }
-    }
-    this.emit({ type: "realctx2.intent", intent: { ...intent } });
-    return k;
+  private cleanLabel(raw: string): string {
+    return clipWords(sanitize(raw).replace(/\s+/g, " ").trim(), 12).replace(/[."]+$/, "");
   }
 
   /**
-   * An intent whose scribe missed its commit point: it opens now, with its own guidance. It
-   * governs from where it was planned, so the rounds in between consolidate with it. The scribe
-   * gets until `deadline`; one still running then stays pending.
+   * Execute an `intent` tool action from the main model: open, close, shift, or update.
+   * Opening fetches proactive memory cards and path memories; closing queues Precip consolidation.
    */
-  private async takeLateKindle(deadline: number, signal?: AbortSignal): Promise<GuidanceMessage | null> {
-    const late = this.lateKindle;
-    if (!late) return null;
-    if (!late.done) await raceTimeout(late.settled, timeLeft(deadline));
-    if (!late.done || this.lateKindle !== late) return null;
-    this.lateKindle = null;
-    if (!late.scribed || late.gen !== this.janusGen || this.state.intents.size !== late.intents) return null;
-    const k = await this.kindle(late.scribed, late.kindle, { signal, deadline, startEntryId: this.entryAfter(late.start) });
-    return this.kindleGuidance(k, { closed: [], backTo: null, paths: k.pathText, focus: null });
+  async applyIntentAction(input: IntentActionInput, opts: { toolCallId?: string; signal?: AbortSignal } = {}): Promise<IntentActionResult> {
+    const err = (message: string): IntentActionResult => ({
+      ok: false,
+      error: message,
+      action: input.action,
+      closed: [],
+      opened: null,
+      updated: null,
+      stack: this.state.stack,
+      cards: "",
+      paths: "",
+      deliveries: [],
+    });
+    if (this.light) return err("Intent tracking is disabled in light mode (sub-sessions).");
+    if (!this.contextEnabled()) return err("The context engine is disabled for this model (maxWindow = 0).");
+    await this.refresh();
+
+    // Locate the current active assistant round (if already recorded) so closures end before it
+    // and newly opened intents begin cleanly at it without overlapping spans.
+    const lastUnit = this.units.at(-1);
+    const inActiveRound =
+      !!lastUnit &&
+      lastUnit.round &&
+      (!lastUnit.complete || (opts.toolCallId ? this.entries[lastUnit.start]?.toolCalls?.some((c) => c.id === opts.toolCallId) === true : false));
+    const priorLeaf = inActiveRound ? (lastUnit!.start > 0 ? this.entries[lastUnit!.start - 1]!.id : "") : (this.entries.at(-1)?.id ?? "");
+    const openStartId = inActiveRound ? this.entries[lastUnit!.start]!.id : undefined;
+
+    if (input.action === "update") {
+      const cur = this.state.innermost();
+      if (!cur) return err("There is no open intent to update. Use action \"open\" first.");
+      const nextLabel = input.label !== undefined ? this.cleanLabel(input.label) : cur.label;
+      const nextReason = input.reason !== undefined ? sanitize(input.reason).trim() : cur.reason;
+      const nextDone = input.done !== undefined ? sanitize(input.done).trim() : cur.success;
+      const nextGiveUp = input.giveUp !== undefined ? sanitize(input.giveUp).trim() : cur.failure;
+      if (input.label === undefined && input.reason === undefined && input.done === undefined && input.giveUp === undefined) {
+        return err("update requires at least one of label, reason, done, or give_up.");
+      }
+      if (!nextLabel) return err("label must be non-empty.");
+      if (!nextDone) return err("done must be non-empty.");
+      if (nextLabel.toLowerCase() !== cur.label.toLowerCase()) {
+        const dup = await this.findDuplicateOpen(nextLabel, this.state.stack.slice(0, -1), opts.signal);
+        if (dup) return err(`"${nextLabel}" duplicates the open intent "${dup.label}".`);
+      }
+      const updated: Intent = { ...cur, label: nextLabel, reason: nextReason, success: nextDone, failure: nextGiveUp };
+      this.emit({ type: "realctx2.intent", intent: updated });
+      if (this.memory) this.memory.recordPurpose(updated.id, `${updated.label}\n${updated.reason}`);
+      this.stackVersion++;
+      this.cancelDriftCheck();
+      this.lastReminderRound.set(updated.id, this.round);
+      this.telemetry?.step({ kind: "intent.tool", action: "update", closures: 0, opened: false, updated: true, cards: 0 });
+      return { ok: true, action: "update", closed: [], opened: null, updated, stack: this.state.stack, cards: "", paths: "", deliveries: [] };
+    }
+
+    if (input.action === "close" && !this.state.stack.length) {
+      return err("There is no open intent to close.");
+    }
+
+    // Pre-validate open / shift fields before mutating the stack so failures are atomic.
+    let popCount = 0;
+    if (input.action === "close" || input.action === "shift") {
+      if (this.state.stack.length) {
+        popCount = input.all ? this.state.stack.length : Math.min(this.state.stack.length, Math.max(1, Math.floor(input.count ?? 1)));
+      }
+    }
+    const remainingAfterPop = this.state.stack.slice(0, this.state.stack.length - popCount);
+
+    let cleanLbl = "";
+    let cleanReason = "";
+    let cleanDone = "";
+    let cleanGiveUp = "";
+    if (input.action === "open" || input.action === "shift") {
+      cleanLbl = this.cleanLabel(input.label ?? "");
+      cleanReason = sanitize(input.reason ?? "").trim();
+      cleanDone = sanitize(input.done ?? "").trim();
+      cleanGiveUp = sanitize(input.giveUp ?? "").trim();
+      if (!cleanLbl) return err(`${input.action} requires a non-empty label (≤12 words).`);
+      if (!cleanDone) return err(`${input.action} requires a non-empty done condition.`);
+      if (remainingAfterPop.length >= this.cfg.janus.maxDepth) {
+        return err(`Intent stack is at maxDepth (${this.cfg.janus.maxDepth}). Close or shift an intent before opening another.`);
+      }
+      const dup = await this.findDuplicateOpen(cleanLbl, remainingAfterPop, opts.signal);
+      if (dup) return err(`"${cleanLbl}" duplicates the open intent "${dup.label}".`);
+    }
+
+    // 1. Apply closures (innermost first)
+    const closedNow: Array<{ intent: Intent; outcome: IntentOutcome }> = [];
+    if (popCount > 0) {
+      const outcome: IntentOutcome = (input.action === "close" || input.action === "shift" ? input.outcome : undefined) ?? "success";
+      const toClose = this.state.stack.slice(this.state.stack.length - popCount).reverse();
+      const priorIdx = priorLeaf ? (this.index.get(priorLeaf) ?? -1) : -1;
+      for (const cur of toClose) {
+        this.pendingStarts.delete(cur.id);
+        const startIdx = cur.guidanceEntryId ? (this.index.get(cur.guidanceEntryId) ?? -1) : -1;
+        const closeLeaf = priorIdx >= 0 && (startIdx < 0 || priorIdx >= startIdx) ? priorLeaf : (this.entries.at(-1)?.id ?? "");
+        const closed: Intent = { ...cur, status: outcome, closedEntryId: closeLeaf };
+        const level = this.state.stack.findIndex((i) => i.id === cur.id) + 1;
+        this.emit({ type: "realctx2.intent", intent: closed });
+        closedNow.push({ intent: closed, outcome });
+        // Falling back: the level its consolidation lands in has to become stable again.
+        this.state.stats.frontier = Math.max(0, Math.min(this.state.stats.frontier ?? 0, level - 2));
+        this.state.stats.lastClimbRound = this.round;
+        this.statsDirty = true;
+      }
+      this.queuePrecip(closedNow, false);
+    }
+
+    // 2. Apply open (for `open` and `shift`)
+    let opened: Intent | null = null;
+    let cards = "";
+    let paths = "";
+    const deliveries: PendingDelivery[] = [];
+    if (input.action === "open" || input.action === "shift") {
+      const parentId = this.state.innermost()?.id ?? null;
+      const intent: Intent = {
+        id: randomId8(),
+        parentId,
+        label: cleanLbl,
+        reason: cleanReason,
+        success: cleanDone,
+        failure: cleanGiveUp,
+        guidanceEntryId: openStartId ?? "",
+        openedRound: this.round,
+        status: "open",
+      };
+      if (!openStartId) this.pendingStarts.set(intent.id, { afterId: priorLeaf, skipUser: false });
+      if (parentId === null) {
+        this.state.stats.frontier = 0;
+        this.statsDirty = true;
+      }
+      this.emit({ type: "realctx2.intent", intent: { ...intent } });
+      opened = intent;
+      let shown: Shown[] = [];
+      let pathShown: Shown[] = [];
+      if (this.memory) {
+        this.memory.recordPurpose(intent.id, `${intent.label}\n${intent.reason}`);
+        try {
+          const parentLabel = parentId ? this.state.intents.get(parentId)?.label : undefined;
+          const pro = await this.proactiveCards(intent, parentLabel, opts.signal, this.cfg.janus.lateWaitMs);
+          cards = pro?.text ?? "";
+          shown = pro?.cards ?? [];
+          const mentioned = this.memory.paths.resolveMentions(extractPathTokens(`${intent.label} ${intent.reason} ${intent.success}`));
+          const recent = this.recentPaths(2);
+          const allPaths = [...new Set([...mentioned, ...recent])].slice(0, 4);
+          if (allPaths.length) {
+            const block = this.memory.delivery.block(
+              { action: "read", paths: allPaths },
+              { visible: (id) => this.isVisible(id) || shown.some((s) => s.ref.node.id === id), turnTokensLeft: Math.max(0, this.cfg.paths.perTurnTokens - this.turnPathTokens) },
+            );
+            if (block) {
+              paths = block.text;
+              pathShown = block.shown;
+              this.turnPathTokens += block.tokens;
+            }
+          }
+        } catch (e) {
+          this.telemetry?.event("proactive.failed", { error: errMsg(e) });
+        }
+      }
+      for (const s of shown) {
+        deliveries.push({ id: `m:${s.ref.node.id}`, kind: "card", channel: "proactive", nodeIds: [s.ref.node.id], scope: s.ref.scope, text: s.full ? s.ref.node.text : s.ref.node.title, signature: s.ref.node.signature, full: s.full });
+      }
+      for (const s of pathShown) {
+        deliveries.push({ id: `m:${s.ref.node.id}`, kind: "card", channel: "path", nodeIds: [s.ref.node.id], scope: s.ref.scope, text: s.full ? s.ref.node.text : s.ref.node.title, signature: s.ref.node.signature, full: s.full });
+      }
+    }
+
+    this.stackVersion++;
+    this.cancelDriftCheck();
+    const innermost = this.state.innermost();
+    if (innermost) this.lastReminderRound.set(innermost.id, this.round);
+    else this.lastEmptyReminderRound = this.round;
+    this.telemetry?.step({ kind: "intent.tool", action: input.action, closures: closedNow.length, opened: !!opened, updated: false, cards: deliveries.filter((d) => d.channel === "proactive").length });
+    return { ok: true, action: input.action, closed: closedNow, opened, updated: null, stack: this.state.stack, cards, paths, deliveries };
   }
 
-  /** The first entry a late intent governs, if the transcript has it. */
+  /** The first entry a deferred intent governs, if the transcript has it. */
   private entryAfter(s: KindleStart): string | undefined {
     let i = s.afterId ? this.index.get(s.afterId) : -1;
     if (i === undefined) return undefined;
@@ -629,15 +781,10 @@ export class ContextEngine {
     return this.entries[i]?.id;
   }
 
-  /** How long a user message waits for Janus in all: the decision, the scribe and the proactive cards. */
-  private promptBudgetMs(): number {
-    return Math.max(0, this.janus.slow() ? this.cfg.janus.lateWaitMs : this.cfg.janus.timeoutMs);
-  }
-
   /**
-   * Proactive retrieval for a kindled intent (§6.4.1). With a decision model the gate answers
-   * within its own timeout. An aux-emulated gate takes seconds: the kindle does not wait for it,
-   * and the cards follow at the next commit point.
+   * Proactive retrieval for a newly opened intent (§6.4.1). With a decision model the gate answers
+   * within its own timeout. An aux-emulated gate takes seconds: the tool waits at most `waitMs`,
+   * and cards that miss it follow at the next commit point.
    */
   private async proactiveCards(intent: Intent, parentLabel: string | undefined, signal?: AbortSignal, waitMs?: number): Promise<Awaited<ReturnType<Retriever["proactive"]>> | null> {
     const run = this.memory!.retriever.proactive({ label: intent.label, reason: intent.reason, parentLabel }, { signal });
@@ -663,7 +810,7 @@ export class ContextEngine {
     return null;
   }
 
-  /** Cards that arrived after their intent's guidance: one more guidance message per intent that is still open. */
+  /** Cards that arrived after their intent opened: one guidance message per intent that is still open. */
   private takeLateCards(): GuidanceMessage[] {
     const ready = this.lateCards.filter((l) => l.done);
     if (!ready.length) return [];
@@ -689,17 +836,22 @@ export class ContextEngine {
     return { customType: GUIDANCE_TYPE, content, display: true, details };
   }
 
-  /** A compact reminder every `janus.remindEvery` rounds within the same intent (§5.2.4). */
+  /** A compact periodic `[intent]` marker every `janus.remindEvery` rounds (§5.2). */
   private reminder(): GuidanceMessage | null {
-    const intent = this.state.innermost();
-    if (!intent) return null;
     const every = this.cfg.janus.remindEvery;
-    const since = Janus.roundsSince(intent, this.entries, this.units);
+    if (every <= 0) return null;
+    const intent = this.state.innermost();
+    if (!intent) {
+      if (this.round <= 0 || this.round - this.lastEmptyReminderRound < every) return null;
+      this.lastEmptyReminderRound = this.round;
+      return { customType: GUIDANCE_TYPE, content: renderEmptyReminder(this.round, this.intentToolName()), display: false, details: { reminder: "empty" } };
+    }
+    const since = intent.guidanceEntryId && this.index.has(intent.guidanceEntryId) ? Janus.roundsSince(intent, this.entries, this.units) : Math.max(0, this.round - intent.openedRound);
     const last = this.lastReminderRound.get(intent.id) ?? intent.openedRound;
     if (since < every || this.round - last < every) return null;
     this.lastReminderRound.set(intent.id, this.round);
     const parent = intent.parentId ? this.state.intents.get(intent.parentId)?.label : undefined;
-    return { customType: GUIDANCE_TYPE, content: renderReminder(intent, parent), display: false, details: { reminder: intent.id } };
+    return { customType: GUIDANCE_TYPE, content: renderReminder(intent, parent, this.intentToolName()), display: false, details: { reminder: intent.id } };
   }
 
   private recentPaths(rounds: number): string[] {
@@ -716,20 +868,14 @@ export class ContextEngine {
 
   /**
    * A new user message (`before_agent_start`, `UserPromptSubmit`, or pi steering/follow-up):
-   * full Janus, synchronously, with the message included. Returns records to append and at most
-   * one guidance message. When `opts.inTranscript` is set, that many trailing user entries are
-   * already in the transcript (pi persisted steering/follow-up messages before `context`): Janus
-   * sees the prior transcript plus `text`, closures end before them, and any kindled intent starts
-   * at the first entry after them. An abort of `signal` (the user cancelled the prompt) ends every
-   * wait at once: what is not decided by then is dropped, not deferred, and the next commit point
-   * decides anew.
+   * resolves mentioned paths immediately without blocking on the decision model, delivers any
+   * ready drift reminder from the prior break, and schedules a debounced advisory drift check.
    */
-  async onUserMessage(text: string, signal?: AbortSignal, opts?: { inTranscript?: number }): Promise<CommitBatch> {
+  async onUserMessage(text: string, _signal?: AbortSignal, _opts?: { inTranscript?: number }): Promise<CommitBatch> {
     await this.refresh();
     this.turnPathTokens = 0;
     this.gatedThisTurn.clear();
     this.shownThisTurn.clear();
-    this.janusStartedThisTurn = false;
     const batch = emptyBatch();
     // paths the user mentions bring their rules and facts along (§6.8.5)
     let mention = "";
@@ -745,54 +891,22 @@ export class ContextEngine {
         }
       }
     }
-    const inTranscript = opts?.inTranscript ?? 0;
-    let priorEntries = this.entries;
-    let priorUnits = this.units;
-    let priorLeaf = this.entries[this.entries.length - 1]?.id ?? "";
-    let userLeaf = priorLeaf;
-    if (inTranscript > 0) {
-      let cut = this.entries.length;
-      for (let n = 0; n < inTranscript && cut > 0 && this.entries[cut - 1]!.kind === "user"; n++) cut--;
-      if (cut < this.entries.length) {
-        priorEntries = this.entries.slice(0, cut);
-        priorUnits = toUnits(priorEntries);
-        priorLeaf = priorEntries[priorEntries.length - 1]?.id ?? "";
-        userLeaf = this.entries[this.entries.length - 1]!.id;
-      }
-    }
+    const drift = !this.light && this.contextEnabled() ? this.takeDriftReminder() : null;
     let msg: GuidanceMessage | null = null;
-    // a kindle for the previous message that never reached a commit point: this message decides anew
-    this.lateKindle = null;
-    if (!this.light && this.contextEnabled()) {
-      // the prompt waits for all of this, with no Working row in pi until the first turn starts:
-      // one budget for the decision, the scribe and the cards; what misses it applies later
-      const deadline = Date.now() + this.promptBudgetMs();
-      const scope = inTranscript > 0 ? { entries: priorEntries, units: priorUnits } : undefined;
-      const input = { ...this.janusInput("full", text, scope), signal };
-      let plan = await this.janusNow(input, deadline);
-      let from: JanusInput = input;
-      if (signal?.aborted) plan = null;
-      else if (plan?.answered) this.lateJanus = null;
-      else if (!plan && this.lateJanus) {
-        // an answer that was still on its way at the last commit point applies here
-        const late = this.lateJanus;
-        this.lateJanus = null;
-        plan = this.current(late);
-        from = { ...late.input, entries: priorEntries, units: priorUnits, round: roundCount(priorUnits), state: this.state, signal };
-      }
-      if (plan) {
-        msg = await this.applyPlan(
-          plan,
-          from,
-          inTranscript > 0
-            ? { extraPaths: mention, deadline, userMessage: true, closeAt: priorLeaf, kindleStart: { afterId: userLeaf, skipUser: false }, deferredGuidance: true }
-            : { extraPaths: mention, deadline, userMessage: true },
-        );
-      } else if (mention) msg = this.guidance(mention, { key: randomId8() });
-    } else if (mention) msg = this.guidance(mention, { key: randomId8() });
-    if (msg) {
-      if (mention && msg.content.includes(mention)) this.deliverShown(mentionShown, "path", { guidanceKey: String(msg.details?.key ?? "") });
-      batch.messages.push(msg);
+    if (drift && mention) {
+      const key = randomId8();
+      msg = this.guidance(`${drift.content}\n\n${mention}`, { ...(drift.details ?? {}), key });
+      this.deliverShown(mentionShown, "path", { guidanceKey: key });
+    } else if (drift) {
+      msg = drift;
+    } else if (mention) {
+      const key = randomId8();
+      msg = this.guidance(mention, { key });
+      this.deliverShown(mentionShown, "path", { guidanceKey: key });
+    }
+    if (msg) batch.messages.push(msg);
+    if (!this.light && this.contextEnabled() && text) {
+      this.scheduleDriftCheck({ userMessage: text });
     }
     this.savedThisStep = 0;
     if (this.contextEnabled()) {
@@ -809,13 +923,12 @@ export class ContextEngine {
   }
 
   /**
-   * `tool_call` / `PreToolUse`: run the pre-edit gate, and on the turn's first top-level call
-   * start Janus in the background, while the tools run.
+   * `tool_call` / `PreToolUse`: run the pre-edit gate, and delay any pending advisory drift
+   * debounce while the agent is actively invoking tools (unless prefire hits `maxInputTokens`).
    */
   async onToolCall(call: ToolCallInfo): Promise<{ block: string } | null> {
-    if (!this.janusStartedThisTurn && !call.nested && !call.subagent && !this.light && this.contextEnabled()) {
-      this.janusStartedThisTurn = true;
-      void this.startJanus();
+    if (!call.nested && !call.subagent && !call.own && !this.light && this.contextEnabled()) {
+      this.scheduleDriftCheck({ onlyIfCountingDown: true });
     }
     if (!this.memory || !call.event || call.own) return null;
     this.enrich(call.event);
@@ -829,79 +942,14 @@ export class ContextEngine {
     return { block: decision.reason };
   }
 
-  private async startJanus(): Promise<void> {
-    // one run in flight is enough: with slow (emulated) decisions, the next round asks again
-    if (this.janusInFlight > 0) return;
-    try {
-      await this.refresh();
-    } catch {
-      return;
-    }
-    this.janusRun = this.runJanus(this.janusInput("full"));
-  }
-
-  private runJanus(input: JanusInput): JanusRun {
-    const run: JanusRun = { promise: this.janus.decide(input), input, done: false, plan: null, seq: ++this.janusSeq, gen: this.janusGen, intents: this.state.intents.size };
-    this.janusInFlight++;
-    void run.promise.then(
-      (plan) => {
-        run.plan = plan;
-        run.done = true;
-        this.janusInFlight--;
-      },
-      () => {
-        run.done = true;
-        this.janusInFlight--;
-      },
-    );
-    return run;
-  }
-
-  /** A run that missed its commit point: its answer applies at the next one, unless a newer one is waiting. */
-  private deferJanus(run: JanusRun): void {
-    this.state.stats.janusLate++;
-    this.statsDirty = true;
-    void run.promise.then(
-      () => {
-        if (run.gen !== this.janusGen || !run.plan?.answered) return;
-        if (!this.lateJanus || this.lateJanus.seq < run.seq) this.lateJanus = run;
-      },
-      () => undefined,
-    );
-  }
-
-  /**
-   * Janus at a commit point that has no tool calls to hide behind (a user message, settle).
-   * A decision model answers within its own timeout. Aux-emulated answers take seconds: the
-   * prompt does not wait for them, and the answer applies at the next commit point.
-   */
-  private async janusNow(input: JanusInput, deadline?: number): Promise<JanusPlan | null> {
-    // the request gets the signal too; the race only stops waiting for a client that ignores it
-    if (!this.janus.slow()) return (await raceTimeout(this.janus.decide(input), Infinity, input.signal)) ?? null;
-    if (this.janusInFlight > 0) return null;
-    const run = this.runJanus(input);
-    await raceTimeout(run.promise.catch(() => null), deadline === undefined ? this.cfg.janus.lateWaitMs : timeLeft(deadline), input.signal);
-    if (run.done) return run.plan;
-    if (input.signal?.aborted) return null;
-    this.deferJanus(run);
-    return null;
-  }
-
-  /** A plan made before another intent was kindled must not kindle again from what it saw. */
-  private current(run: JanusRun): JanusPlan | null {
-    const plan = run.plan;
-    if (!plan?.answered) return null;
-    return plan.kindle && this.state.intents.size !== run.intents ? { ...plan, kindle: null } : plan;
-  }
-
   /**
    * `tool_result` / `PostToolUse`: record deliveries, track moves and writes, append the path
-   * memories for what was touched, and archive an oversized output. Returns the patched text,
-   * or null to leave the result alone.
+   * memories for what was touched, archive an oversized output, and prefire advisory Janus if
+   * unchecked evidence hits `maxInputTokens` while a debounce is counting down.
    */
   async onToolResult(res: ToolResultInfo): Promise<{ text: string; block?: string; body?: string } | null> {
     const where = { toolCallId: res.toolCallId, subagent: res.subagent };
-    // deliveries reported by search, recall and inspect (top-level calls only create transcript entries)
+    // deliveries reported by search, recall, inspect and intent (top-level calls only create transcript entries)
     if (res.deliveries && !res.nested) for (const d of res.deliveries) this.deliver(d, where);
     let text = res.text;
     let block: string | undefined;
@@ -948,6 +996,12 @@ export class ContextEngine {
       }
     }
     if (block) text = `${text}\n\n${block}`;
+    if (!res.nested && !res.subagent && !res.own && !this.light && this.contextEnabled() && this.janusTimer !== null) {
+      // Mid-turn prefire check: if this result pushes unchecked evidence over maxInputTokens while
+      // the debounce timer is counting down, fire immediately once so info is not truncated.
+      const extra = estimateTokens(headTail(text, 300, 300));
+      this.scheduleDriftCheck({ extraTokens: extra, onlyIfCountingDown: true });
+    }
     // `block` and `body` let harnesses that deliver them through separate channels do so (Claude Code)
     return block || body !== undefined ? { text, block, body } : null;
   }
@@ -978,8 +1032,9 @@ export class ContextEngine {
 
   /**
    * `turn_end` / `PostToolBatch`: the hot loop's commit point.
-   * Applies the Janus answer started at the first tool call, commits finished consolidations,
-   * starts new ones, and relieves pressure before the next request.
+   * Never blocks on Janus: emits any ready drift reminder or periodic `[intent]` marker, schedules
+   * (or prefires) the debounced advisory drift check, commits finished consolidations, starts new
+   * ones, and relieves pressure before the next request.
    */
   async onTurnEnd(signal?: AbortSignal): Promise<CommitBatch> {
     await this.refresh();
@@ -991,50 +1046,18 @@ export class ContextEngine {
     const ctxOn = this.contextEnabled();
     if (!this.light) {
       if (ctxOn) {
-        // one deadline for everything this commit point waits on (§5.2.1): a late intent, the
-        // Janus answer, and a kindle's scribe and cards; what misses it applies at the next one
-        const deadline = Date.now() + this.cfg.janus.lateWaitMs;
-        // an intent whose scribe missed its commit point opens first, so a plan below that was
-        // made before it cannot kindle a second one (`current()`)
-        const kindled = await this.takeLateKindle(deadline, signal);
-        if (kindled) batch.messages.push(kindled);
-        // an answer that came too late last step applies now
-        const late = this.lateJanus;
-        this.lateJanus = null;
-        const run = this.janusRun;
-        this.janusRun = null;
-        this.janusStartedThisTurn = false;
-        let plan: JanusPlan | null = null;
-        let input: JanusInput | null = null;
-        if (run) {
-          if (!run.done) await raceTimeout(run.promise.catch(() => null), timeLeft(deadline));
-          if (run.done) {
-            plan = this.current(run);
-            input = run.input;
-          } else {
-            // the answer applies at the next commit point; a late closure only delays consolidation
-            this.deferJanus(run);
-          }
-        }
-        if (!plan && late) {
-          plan = this.current(late);
-          input = late.input;
-        }
-        if (plan && input) {
-          const fresh = { ...input, entries: this.entries, units: this.units, round: this.round, state: this.state, signal };
-          const msg = await this.applyPlan(plan, fresh, { deadline });
-          if (msg) batch.messages.push(msg);
-        } else if (!this.lateKindle) {
+        const drift = this.takeDriftReminder();
+        if (drift) batch.messages.push(drift);
+        else {
           const r = this.reminder();
           if (r) batch.messages.push(r);
         }
         batch.messages.push(...this.takeLateCards());
+        this.scheduleDriftCheck();
       } else {
-        this.janusRun = null;
-        this.lateJanus = null;
+        this.clearDriftTimer();
+        this.pendingDrift = null;
         this.lateCards = [];
-        this.lateKindle = null;
-        this.janusStartedThisTurn = false;
       }
       await this.windowAttribution(signal);
     }
@@ -1065,8 +1088,8 @@ export class ContextEngine {
     return batch;
   }
 
-  /** `agent_before_settle` / `Stop`: closure-only Janus, and whatever is already ready. */
-  async onBeforeSettle(signal?: AbortSignal): Promise<CommitBatch> {
+  /** `agent_before_settle` / `Stop`: commit ready consolidations and let debounced drift check run on break. */
+  async onBeforeSettle(_signal?: AbortSignal): Promise<CommitBatch> {
     await this.refresh();
     this.savedThisStep = 0;
     const batch = emptyBatch();
@@ -1075,18 +1098,9 @@ export class ContextEngine {
       return batch;
     }
     if (!this.light) {
-      // an intent whose scribe missed the last turn_end opens here, before the next message drops it
-      const kindled = await this.takeLateKindle(Date.now() + this.cfg.janus.lateWaitMs, signal);
-      if (kindled) batch.messages.push(kindled);
+      batch.messages.push(...this.takeLateCards());
+      this.scheduleDriftCheck();
     }
-    if (!this.light && this.cfg.context.settleConsolidation && this.state.stack.length) {
-      const input = { ...this.janusInput("closure"), signal };
-      const plan = await this.janusNow(input);
-      // Precip for these runs during idle time, so the user's prompt never waits on an aux call
-      const msg = plan ? await this.applyPlan(plan, input, { deferPrecip: true }) : null;
-      if (msg) batch.messages.push(msg);
-    }
-    if (!this.light) batch.messages.push(...this.takeLateCards());
     this.commitReady();
     this.flushStats(false);
     await this.palim.refreshOccupancy();
@@ -1232,6 +1246,7 @@ export class ContextEngine {
 
   /** Session end: attribute what is still open with deterministic signals, and hand back the last records. */
   async onShutdown(opts: { reload?: boolean; persistEdits?: boolean } = {}): Promise<CommitBatch> {
+    this.clearDriftTimer();
     try {
       await this.refresh();
     } catch {
@@ -1517,7 +1532,7 @@ export class ContextEngine {
     return this.memory?.graph.get(id) ?? null;
   }
 
-  status(): { round: number; requests: number; stack: Intent[]; records: number; deliveries: number; attributed: number; frontier: number; janusLate: number; foldsSkippedByCost: number; occupancy: number; predictedOccupancy: number; window: number; disabled: boolean; cacheTtlSeconds: number; jobs: { precip: number; folds: number }; problems: string[] } {
+  status(): { round: number; requests: number; stack: Intent[]; records: number; deliveries: number; attributed: number; frontier: number; janusLate: number; driftReminders: number; foldsSkippedByCost: number; occupancy: number; predictedOccupancy: number; window: number; disabled: boolean; cacheTtlSeconds: number; jobs: { precip: number; folds: number }; problems: string[] } {
     const window = this.window();
     return {
       round: this.round,
@@ -1528,6 +1543,7 @@ export class ContextEngine {
       attributed: this.state.attributed.size,
       frontier: this.state.stats.frontier ?? 0,
       janusLate: this.state.stats.janusLate,
+      driftReminders: this.state.stats.driftReminders ?? 0,
       foldsSkippedByCost: this.state.stats.foldsSkippedByCost,
       occupancy: Math.round(this.palim.lastContextTokens),
       predictedOccupancy: Math.round(this.palim.lastOccupancy),

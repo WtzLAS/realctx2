@@ -9,6 +9,7 @@ import {
   type Config,
   DEFAULT_CONFIG,
   diffConfig,
+  effectiveJanusMaxInputTokens,
   Layout,
   loadConfig,
   loadGlobalConfig,
@@ -38,6 +39,7 @@ import {
   SETTINGS_CATEGORIES,
   setConfigPath,
   splitConfigPath,
+  stepSettingValue,
 } from "../src/core/settings-schema.ts";
 import type { CommandIO } from "../src/core/types.ts";
 import { readJson, writeJson } from "../src/util/fs.ts";
@@ -180,12 +182,12 @@ describe("settings schema completeness & descriptions", () => {
   });
 
   it("handles dotted AuxRole keys and array indices in splitConfigPath / getConfigPath / setConfigPath", () => {
-    expect(splitConfigPath("providers.aux.pi.roles.janus.scribe.thinking")).toEqual([
+    expect(splitConfigPath("providers.aux.pi.roles.qemem.planner.thinking")).toEqual([
       "providers",
       "aux",
       "pi",
       "roles",
-      "janus.scribe",
+      "qemem.planner",
       "thinking",
     ]);
     expect(splitConfigPath("providers.aux.claudeCode.roles.ingest.slicer.model")).toEqual([
@@ -199,9 +201,9 @@ describe("settings schema completeness & descriptions", () => {
     expect(splitConfigPath("evolution.hyper.lambda.2")).toEqual(["evolution", "hyper", "lambda", "2"]);
 
     let cfg = structuredClone(DEFAULT_CONFIG);
-    cfg = setConfigPath(cfg, "providers.aux.pi.roles.janus.scribe.thinking", "high");
-    expect(cfg.providers.aux.pi.roles?.["janus.scribe"]?.thinking).toBe("high");
-    expect(getConfigPath(cfg, "providers.aux.pi.roles.janus.scribe.thinking")).toBe("high");
+    cfg = setConfigPath(cfg, "providers.aux.pi.roles.qemem.planner.thinking", "high");
+    expect(cfg.providers.aux.pi.roles?.["qemem.planner"]?.thinking).toBe("high");
+    expect(getConfigPath(cfg, "providers.aux.pi.roles.qemem.planner.thinking")).toBe("high");
 
     cfg = setConfigPath(cfg, "evolution.hyper.lambda.1", 2.5);
     expect(cfg.evolution.hyper.lambda).toEqual([0.001, 2.5, 0.1]);
@@ -228,6 +230,21 @@ describe("settings schema completeness & descriptions", () => {
     // Janus defaults (30s timeout, 10s commit-boundary wait) and expanded settings ranges
     expect(DEFAULT_CONFIG.janus.timeoutMs).toBe(30_000);
     expect(DEFAULT_CONFIG.janus.lateWaitMs).toBe(10_000);
+    expect(DEFAULT_CONFIG.janus.debounceMs).toBe(3_000);
+    expect(DEFAULT_CONFIG.janus.driftCooldownRounds).toBe(32);
+    expect(DEFAULT_CONFIG.janus.maxInputTokens).toBe("auto");
+    expect(effectiveJanusMaxInputTokens(DEFAULT_CONFIG)).toBe(30_000);
+    const withDecision = (maxInputTokens?: number): Config => ({
+      ...structuredClone(DEFAULT_CONFIG),
+      providers: {
+        ...structuredClone(DEFAULT_CONFIG.providers),
+        decision: { format: "systemone", url: "https://example.test/v1/systemone", model: "jev", ...(maxInputTokens !== undefined ? { maxInputTokens } : {}) },
+      },
+    });
+    expect(effectiveJanusMaxInputTokens(withDecision())).toBe(30_000);
+    expect(effectiveJanusMaxInputTokens(withDecision(16_000))).toBe(16_000);
+    expect(effectiveJanusMaxInputTokens(withDecision(128_000))).toBe(64_000);
+    expect(effectiveJanusMaxInputTokens({ ...withDecision(128_000), janus: { ...DEFAULT_CONFIG.janus, maxInputTokens: 8000 } })).toBe(8000);
     const allItems = flattenAllSettings(DEFAULT_CONFIG);
     const janusTimeout = allItems.find((i) => i.entry.path === "janus.timeoutMs")!.entry;
     const janusWait = allItems.find((i) => i.entry.path === "janus.lateWaitMs")!.entry;
@@ -237,6 +254,13 @@ describe("settings schema completeness & descriptions", () => {
     expect(janusWait.kind === "integer" && parseSettingInput(janusWait, "30000")).toEqual({ ok: true, value: 30_000 });
     expect(janusTimeout.kind === "integer" && parseSettingInput(janusTimeout, "300001").ok).toBe(false);
     expect(janusWait.kind === "integer" && parseSettingInput(janusWait, "120001").ok).toBe(false);
+    const janusMaxIn = allItems.find((i) => i.entry.path === "janus.maxInputTokens")!.entry;
+    expect(janusMaxIn.kind).toBe("number-or-auto");
+    expect(janusMaxIn.kind === "number-or-auto" && parseSettingInput(janusMaxIn, "auto")).toEqual({ ok: true, value: "auto" });
+    expect(janusMaxIn.kind === "number-or-auto" && parseSettingInput(janusMaxIn, "16000")).toEqual({ ok: true, value: 16_000 });
+    expect(janusMaxIn.kind === "number-or-auto" && parseSettingInput(janusMaxIn, "64001").ok).toBe(false);
+    expect(janusMaxIn.kind === "number-or-auto" && stepSettingValue(withDecision(16_000), janusMaxIn, 1).next.janus.maxInputTokens).toBe(17_000);
+    expect(janusMaxIn.kind === "number-or-auto" && stepSettingValue(withDecision(128_000), janusMaxIn, -1).next.janus.maxInputTokens).toBe(63_000);
     expect(formatSettingValue({ kind: "secret", path: "providers.decision.apiKey", label: "k", description: "d" }, "sk-12345678")).toBe("••••5678");
   });
 });
@@ -264,7 +288,7 @@ describe("config persistence (diffConfig / saveConfig / loadGlobalConfig)", () =
       registerInPi: true,
       headers: { "X-Team": "core" },
     };
-    next = setConfigPath(next, "providers.aux.pi.roles.janus.scribe.timeoutMs", 25000);
+    next = setConfigPath(next, "providers.aux.pi.roles.qemem.planner.timeoutMs", 25000);
     next = setConfigPath(next, "providers.aux.claudeCode.roles.precip.model", undefined);
 
     const saved = saveConfig(layout, next);
@@ -276,17 +300,17 @@ describe("config persistence (diffConfig / saveConfig / loadGlobalConfig)", () =
     const reloaded = loadGlobalConfig(layout);
     expect(reloaded.context.rho).toBe(0.75);
     expect(reloaded.providers.decision).toEqual(next.providers.decision);
-    expect(reloaded.providers.aux.pi.roles?.["janus.scribe"]?.timeoutMs).toBe(25000);
+    expect(reloaded.providers.aux.pi.roles?.["qemem.planner"]?.timeoutMs).toBe(25000);
     expect(reloaded.providers.aux.claudeCode.roles?.precip?.model ?? null).toBeNull();
 
     // Remove header & disable decision endpoint -> removed cleanly from disk
     next.providers.decision = null;
-    next = setConfigPath(next, "providers.aux.pi.roles.janus.scribe.timeoutMs", undefined);
+    next = setConfigPath(next, "providers.aux.pi.roles.qemem.planner.timeoutMs", undefined);
     saveConfig(layout, next);
     const rawAfter = readJson<Record<string, unknown>>(layout.configFile, {});
     expect((rawAfter.providers as Record<string, unknown> | undefined)?.decision).toBeUndefined();
     expect(loadGlobalConfig(layout).providers.decision).toBeNull();
-    expect(loadGlobalConfig(layout).providers.aux.pi.roles?.["janus.scribe"]).toBeUndefined();
+    expect(loadGlobalConfig(layout).providers.aux.pi.roles?.["qemem.planner"]).toBeUndefined();
 
     // diffConfig directly against DEFAULT_CONFIG produces empty object for defaults
     expect(diffConfig(DEFAULT_CONFIG)).toEqual({});
@@ -507,14 +531,14 @@ describe("Realctx2SettingsComponent TUI interactions", () => {
     sendKeys(comp, [DOWN, ENTER]);
     expect(saved.providers.aux.pi.model).toBe("anthropic/claude-sonnet-4-5");
 
-    // Jump to Per-Role Overrides section, open janus.scribe, edit thinking level via enum picker
+    // Jump to Per-Role Overrides section, open precip, edit thinking level via enum picker
     sendKeys(comp, [TAB, ENTER]);
-    expect(renderText(comp)).toContain("janus.scribe");
+    expect(renderText(comp)).toContain("precip");
     // Move to thinking level (down from model override -> thinking)
     sendKeys(comp, [DOWN, ENTER]);
     // Enum picker: inherit (0), off (1), minimal (2), low (3), medium (4), high (5)...
     sendKeys(comp, [DOWN, DOWN, DOWN, ENTER]); // low
-    expect(saved.providers.aux.pi.roles?.["janus.scribe"]?.thinking).toBe("low");
+    expect(saved.providers.aux.pi.roles?.["precip"]?.thinking).toBe("low");
   });
 
   it("supports Memory multi-enum checklist, enum picker, string-list editor, and global / search", () => {

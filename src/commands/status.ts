@@ -49,7 +49,7 @@ export async function status(host: Host, io: CommandIO): Promise<void> {
   } else lines.push("Open intents: none");
   const recent = [...e.state.records.values()].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)).slice(0, 5);
   if (recent.length) {
-    lines.push(`Consolidations: ${e.state.records.size} (frontier level ${s.frontier}; ${s.foldsSkippedByCost} fold(s) skipped by the cost check; Janus answered late ${s.janusLate}×)`);
+    lines.push(`Consolidations: ${e.state.records.size} (frontier level ${s.frontier}; ${s.foldsSkippedByCost} fold(s) skipped by the cost check; drift reminders ${s.driftReminders}×)`);
     for (const r of recent) lines.push(`  [${r.id}] ${describeRecord(host, r)} · ${num(r.tokensBefore)} → ${num(r.tokensAfter)} tokens`);
   } else lines.push("Consolidations: none yet");
   lines.push(`Deliveries: ${s.deliveries} (${s.attributed} attributed) · background jobs: ${s.jobs.precip} Precip, ${s.jobs.folds} folds`);

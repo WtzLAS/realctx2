@@ -78,6 +78,12 @@ function callSummary(key: string, a: Record<string, unknown>): string {
     if (a.target) parts.push(clean(a.target, 80));
     if (a.reason) parts.push(clean(a.reason, 80));
     if (a.purge) parts.push("purge");
+  } else if (key === "intent") {
+    if (a.action) parts.push(clean(a.action, 16));
+    if (a.label) parts.push(`"${clean(a.label, 80)}"`);
+    if (a.outcome) parts.push(clean(a.outcome, 16));
+    if (a.all) parts.push("all");
+    else if (typeof a.count === "number" && a.count > 1) parts.push(`×${a.count}`);
   }
   return parts.filter(Boolean).join(" · ");
 }
@@ -182,6 +188,27 @@ export function toolRenderers(key: string, displayName?: string): Pick<ToolDefin
         lines = [head];
         if (arr(d.cascade).length) lines.push(muted(`Also retired ${arr(d.cascade).length} dependent memor${arr(d.cascade).length === 1 ? "y" : "ies"}`));
         if (expanded && raw) lines.push(...raw.split("\n").slice(0, 20).map((l) => muted(clean(l, 300))));
+      } else if (key === "intent") {
+        lines = [];
+        const closed = arr(d.closed).map(rec);
+        for (const c of closed) {
+          const outcome = clean(c.outcome, 16);
+          const mark = outcome === "succeeded" ? theme.fg("success", "✓ closed") : outcome === "failed" ? theme.fg("error", "✗ closed") : theme.fg("warning", "• closed");
+          lines.push(`${mark} ${theme.fg("text", `"${clean(c.label, 120)}"`)}${outcome ? muted(` · ${outcome}`) : ""}`);
+        }
+        const opened = d.opened && typeof d.opened === "object" ? rec(d.opened) : null;
+        if (opened) {
+          lines.push(`${theme.fg("accent", "→ opened")} ${theme.fg("text", `"${clean(opened.label, 120)}"`)}`);
+          if (opened.done) lines.push(muted(`  Done when: ${clean(opened.done, expanded ? 400 : 160)}`));
+        }
+        const updated = d.updated && typeof d.updated === "object" ? rec(d.updated) : null;
+        if (updated) {
+          lines.push(`${theme.fg("accent", "✎ updated")} ${theme.fg("text", `"${clean(updated.label, 120)}"`)}`);
+          if (updated.done) lines.push(muted(`  Done when: ${clean(updated.done, expanded ? 400 : 160)}`));
+        }
+        if (typeof d.cards === "number" && d.cards > 0) lines.push(muted(`  +${d.cards} proactive memor${d.cards === 1 ? "y" : "ies"}`));
+        if (!lines.length) lines = [muted(clean(raw, 200) || "Updated intent stack")];
+        if (expanded && raw) lines.push(...raw.split("\n").slice(0, 40).map((l) => muted(clean(l, 300))));
       } else {
         lines = [muted(clean(raw, 200) || "Done")];
       }

@@ -5,7 +5,7 @@
  */
 import { describeEndpointAuth, type EndpointKind, type EndpointTestResult } from "../providers/test-endpoint.ts";
 import { ROLE_DEFAULTS } from "./aux.ts";
-import { type Config, DEFAULT_CONFIG, type DecisionProviderConfig, type EmbeddingProviderConfig } from "./config.ts";
+import { type Config, DEFAULT_CONFIG, type DecisionProviderConfig, type EmbeddingProviderConfig, effectiveJanusMaxInputTokens } from "./config.ts";
 import type { AuxRole, AuxTools, ThinkingLevel } from "./types.ts";
 
 export interface EnumOption {
@@ -151,7 +151,6 @@ export interface SettingsDisplayContext {
 }
 
 export const AUX_ROLES: Array<{ role: AuxRole; label: string; description: string; transcriptOnly: boolean }> = [
-  { role: "janus.scribe", label: "janus.scribe", description: "Names newly kindled intents with a short label, reason, and observable success/failure criteria. Runs single-turn without tools.", transcriptOnly: true },
   { role: "precip", label: "precip", description: "Consolidates closed intents into concise prose memories and structured sidecars. Runs single-turn without tools.", transcriptOnly: true },
   { role: "palim", label: "palim", description: "Folds older prefix consolidations and harvests durable knowledge items into memory. Runs single-turn without tools.", transcriptOnly: true },
   { role: "qemem.planner", label: "qemem.planner", description: "Decomposes thorough memory searches into targeted sub-queries. Runs single-turn without tools.", transcriptOnly: true },
@@ -193,7 +192,7 @@ const ROLE_NAMES = new Set<string>(AUX_ROLES.map((r) => r.role));
 
 /**
  * Split a config path into property segments, keeping dotted AuxRole keys
- * (like `janus.scribe` or `ingest.slicer`) intact as a single segment.
+ * (like `qemem.planner` or `ingest.slicer`) intact as a single segment.
  */
 export function splitConfigPath(path: string): string[] {
   const m = /^(providers\.aux\.(?:pi|claudeCode)\.roles)\.(.+)$/.exec(path);
@@ -473,7 +472,12 @@ export function stepSettingValue(cfg: Config, entry: ScalarSetting, dir: -1 | 1)
   }
   if (entry.kind === "number-or-auto" && entry.step) {
     if (cur === "auto") {
-      const base = entry.path === "context.maxWindow" ? 128000 : (entry.min ?? 0);
+      const base =
+        entry.path === "context.maxWindow"
+          ? 128000
+          : entry.path === "janus.maxInputTokens"
+            ? effectiveJanusMaxInputTokens(cfg)
+            : (entry.min ?? 0);
       let v = Math.round(base + dir * entry.step);
       if (entry.min !== undefined) v = Math.max(entry.min, v);
       if (entry.max !== undefined) v = Math.min(entry.max, v);
@@ -1530,9 +1534,50 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
           items: [
             {
               kind: "integer",
+              path: "janus.debounceMs",
+              label: "Drift-check debounce",
+              description: "Quiet-gap wait (ms) after turn or tool activity before running a nonblocking advisory Janus drift check. Bypassed immediately once unchecked transcript tokens hit janus.maxInputTokens (prefire).",
+              unit: "ms",
+              min: 0,
+              max: 120_000,
+              step: 500,
+            },
+            {
+              kind: "integer",
+              path: "janus.driftCooldownRounds",
+              label: "Drift reminder cooldown",
+              description: "Minimum rounds between strong Janus drift-reminder markers (0 disables advisory drift checks).",
+              unit: "rounds",
+              min: 0,
+              max: 200,
+              step: 4,
+            },
+            {
+              kind: "integer",
+              path: "janus.remindEvery",
+              label: "Intent reminder interval",
+              description: "Append a compact periodic [intent] marker every N rounds while staying inside the same intent or with an empty stack (0 disables reminders).",
+              unit: "rounds",
+              min: 0,
+              max: 100,
+              step: 1,
+            },
+            {
+              kind: "number-or-auto",
+              path: "janus.maxInputTokens",
+              label: "Max evidence tokens (and prefire threshold)",
+              description:
+                'Token cap on the transcript evidence bundle sent to advisory Janus (and prefire threshold). "auto" uses min(decision model maxInputTokens, 64,000) (30,000 when decision maxInputTokens is unset). When unchecked transcript evidence reaches this cap while the debounce timer is counting down, Janus prefires immediately once to avoid losing info.',
+              unit: "tokens",
+              min: 512,
+              max: 64_000,
+              step: 1000,
+            },
+            {
+              kind: "integer",
               path: "janus.timeoutMs",
               label: "Decision timeout",
-              description: "Wall-clock timeout (ms) for Janus decision calls before failing safe (continue without closing). Janus never retries. With a decision model, also the most a user message waits for Janus, the scribe and proactive cards together.",
+              description: "Wall-clock timeout (ms) for background advisory Janus decision calls before failing safe (no reminder). Janus never retries.",
               unit: "ms",
               min: 100,
               max: 300_000,
@@ -1541,8 +1586,8 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
             {
               kind: "integer",
               path: "janus.lateWaitMs",
-              label: "Late-answer wait window",
-              description: "The most a turn boundary waits for Janus, the scribe and proactive cards together; an answer or intent that misses it applies at the next commit point. Without a decision model, also the most a user message waits for them.",
+              label: "Proactive card wait window",
+              description: "The most an `intent` open/shift call waits for proactive memory cards; cards that miss it arrive at the next commit point.",
               unit: "ms",
               min: 0,
               max: 120_000,
@@ -1550,29 +1595,9 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
             },
             {
               kind: "integer",
-              path: "janus.maxInputTokens",
-              label: "Max evidence tokens",
-              description: "Token cap on the transcript evidence bundle sent to Janus on each step.",
-              unit: "tokens",
-              min: 512,
-              max: 64_000,
-              step: 1000,
-            },
-            {
-              kind: "integer",
-              path: "janus.remindEvery",
-              label: "Intent reminder interval",
-              description: "Append a compact reminder of the active intent every N rounds while staying inside the same intent (0 disables reminders).",
-              unit: "rounds",
-              min: 0,
-              max: 100,
-              step: 1,
-            },
-            {
-              kind: "integer",
               path: "janus.maxDepth",
               label: "Max intent nesting depth",
-              description: "Maximum depth of nested intents allowed on the intent stack before deepen requests are ignored.",
+              description: "Maximum depth of nested intents allowed on the intent stack when the model calls `intent` with action `open`.",
               min: 1,
               max: 20,
               step: 1,
@@ -2520,8 +2545,8 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
     aliases: ["tools", "budgets", "privacy", "maintenance", "claude", "claudecode"],
     description: "Enable/disable or rename agent tools, configure daily token budgets, privacy & session indexing, idle maintenance timing, and Claude Code integration.",
     summary: (cfg) => {
-      const enabled = 3 + (cfg.tools.remember ? 1 : 0) + (cfg.tools.forget ? 1 : 0);
-      return `tools: ${enabled}/5 · aux cap: ${cfg.budgets.dailyAuxTokens > 0 ? `${(cfg.budgets.dailyAuxTokens / 1e6).toFixed(1)}M` : "unlimited"} · idle: ${cfg.maintenance.idleMinutes}m`;
+      const enabled = 4 + (cfg.tools.remember ? 1 : 0) + (cfg.tools.forget ? 1 : 0);
+      return `tools: ${enabled}/6 · aux cap: ${cfg.budgets.dailyAuxTokens > 0 ? `${(cfg.budgets.dailyAuxTokens / 1e6).toFixed(1)}M` : "unlimited"} · idle: ${cfg.maintenance.idleMinutes}m`;
     },
     build: () => ({
       id: "system",
@@ -2584,6 +2609,14 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
               label: "Tool name: forget",
               description: "Effective tool name registered for realctx2's `forget` tool.",
               placeholder: "forget",
+              restart: true,
+            },
+            {
+              kind: "string",
+              path: "tools.names.intent",
+              label: "Tool name: intent",
+              description: "Effective tool name registered for realctx2's `intent` tool.",
+              placeholder: "intent",
               restart: true,
             },
           ],

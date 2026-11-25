@@ -1,42 +1,45 @@
 /**
- * Janus (§5.2): intent maintenance. One decision request per step answers "which purposes
- * closed?" and "where does the focus go?"; deterministic rules turn the probabilities into
- * closures and at most one kindle; the scribe (aux LLM) writes the new intent.
+ * Advisory Janus (§5.2): nonblocking drift detection using the decision model. The main model
+ * maintains the intent stack directly through the `intent` tool; Janus runs in the background
+ * after a quiet-gap debounce (or prefires when unchecked evidence hits `janus.maxInputTokens`)
+ * and emits a strong drift reminder when the model appears to have moved on without updating
+ * the stack. Janus never mutates the stack itself.
  */
-import type { Config } from "../core/config.ts";
-import type { AuxSessionRunner, DecisionAnswer, DecisionClient, DecisionQuestion, EntryView, Intent, IntentOutcome } from "../core/types.ts";
+import { type Config, effectiveJanusMaxInputTokens } from "../core/config.ts";
+import type { DecisionAnswer, DecisionClient, DecisionQuestion, EntryView, Intent, IntentOutcome } from "../core/types.ts";
 import { UNCALIBRATED } from "../memory/services.ts";
-import type { Similarity } from "../memory/similarity.ts";
-import { randomId8 } from "../util/ids.ts";
-import { clipTokens, clipWords, estimateTokens, sanitize } from "../util/text.ts";
-import { lastRounds, renderSpan, renderStack } from "./render.ts";
+import { clipTokens, estimateTokens, sanitize } from "../util/text.ts";
+import { lastRounds, outcomeWord, renderSpan, renderStack } from "./render.ts";
 import { roundsBefore, type Unit } from "./rounds.ts";
 import type { SessionState } from "./state.ts";
 
 export type Focus = "continue" | "deepen" | "successor" | "new_root";
+export type DriftKind = "close" | "open" | "shift" | "deepen" | "redirect";
 
 export interface JanusInput {
   state: SessionState;
   entries: EntryView[];
   units: Unit[];
-  /** The new user message, when Janus runs at `before_agent_start`. */
+  /** New user message arrived since the last check, if any. */
   userMessage?: string;
-  /** `closure`: no kindle (agent_before_settle). */
+  /** `closure`: check closures only (skip focus question). */
   mode: "full" | "closure";
   round: number;
   signal?: AbortSignal;
   cacheKey?: string;
+  /** Entry id of the last checked leaf: evidence stretches back to cover everything after it. */
+  sinceEntryId?: string | null;
 }
 
 export interface KindlePlan {
   parentId: string | null;
   focus: Focus;
-  /** Why the focus moved, for the scribe. */
+  /** Why the focus moved. */
   note: string;
 }
 
 export interface JanusPlan {
-  /** False when the decision model gave no answer: treated as `continue`, no closures (§5.2.7). */
+  /** False when the decision model gave no answer: treated as `continue`, no drift (§5.2.7). */
   answered: boolean;
   /** Innermost first. */
   closures: Array<{ intent: Intent; outcome: IntentOutcome; forced?: boolean }>;
@@ -46,48 +49,81 @@ export interface JanusPlan {
   focus: Focus | null;
   focusP: number;
   redirect: number | null;
-  /** Entries the evidence covered (answers that arrive late apply to the state they saw). */
+  /** Latest entry covered by the evidence. */
   evidenceLeafId: string | null;
 }
 
-export interface ScribedIntent {
-  label: string;
-  reason: string;
-  success: string;
-  failure: string;
+export interface DriftAdvisory {
+  kind: DriftKind;
+  /** Innermost-first intents that appear finished or abandoned. */
+  closures: Array<{ intent: Intent; outcome: IntentOutcome; forced?: boolean }>;
+  /** Suggested focus transition, if any. */
+  focus: Focus | null;
+  /** Actionable reminder telling the main model how to update the stack with `intent`. */
+  summary: string;
+  /** Latest entry id covered by the evidence. */
+  evidenceLeafId: string | null;
 }
 
 const CLOSE_TEXT = "Using only evidence in the transcript, has this purpose met its success condition, met its failure condition, or been abandoned by the user? Count only results the agent has examined, not raw unread output. Partial progress is `open`.";
 const FOCUS_TEXT = "Where does the agent's focus go next? `continue`: still serving the innermost remaining purpose. `deepen`: starting a sub-purpose it needs. `successor`: moving to the next purpose under the same parent. `new_root`: the user started unrelated work.";
 
-const SCRIBE_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: ["label", "reason", "success", "failure"],
-  properties: { label: { type: "string" }, reason: { type: "string" }, success: { type: "string" }, failure: { type: "string" } },
-};
-
 export class Janus {
   private readonly cfg: Config;
   private readonly decision: DecisionClient;
-  private readonly aux: () => AuxSessionRunner | null;
-  private readonly sim: Similarity | null;
 
-  constructor(deps: { cfg: Config; decision: DecisionClient; aux: () => AuxSessionRunner | null; sim: Similarity | null }) {
+  constructor(deps: { cfg: Config; decision: DecisionClient }) {
     this.cfg = deps.cfg;
     this.decision = deps.decision;
-    this.aux = deps.aux;
-    this.sim = deps.sim;
+  }
+
+  available(): boolean {
+    return this.decision.available();
+  }
+
+  /**
+   * True when answers come from the aux-emulated fallback (§9.1.4): they take seconds and use
+   * stricter thresholds.
+   */
+  slow(): boolean {
+    return this.decision.available() && !this.decision.calibrated();
+  }
+
+  /** Effective evidence token cap (and prefire threshold): `min(decisionMaxInput, 64K)` on `"auto"`. */
+  maxInputTokens(): number {
+    return effectiveJanusMaxInputTokens(this.cfg);
+  }
+
+  /** First entry index not yet inspected by an earlier advisory check. */
+  private uncheckedStart(entries: EntryView[], sinceEntryId: string | null | undefined): number {
+    if (!sinceEntryId) return 0;
+    const at = entries.findIndex((e) => e.id === sinceEntryId);
+    return at >= 0 ? at + 1 : 0;
+  }
+
+  /**
+   * Estimated evidence tokens accumulated since `sinceEntryId` (used for prefire: when this
+   * reaches `janus.maxInputTokens` while a debounce timer is counting down, Janus fires
+   * immediately once so earlier unchecked context is not truncated away).
+   */
+  uncheckedTokens(input: JanusInput, extraTokens = 0): number {
+    const cap = this.maxInputTokens();
+    const stack = renderStack(input.state.stack, input.round);
+    const user = input.userMessage ? clipTokens(sanitize(input.userMessage), Math.floor(cap / 4)) : "";
+    const from = this.uncheckedStart(input.entries, input.sinceEntryId);
+    const recent = from < input.entries.length ? renderSpan(input.entries, from, input.entries.length, { toolOutputTokens: 300 }) : "";
+    return estimateTokens(stack) + (user ? estimateTokens(user) : 0) + estimateTokens(recent) + 200 + extraTokens;
   }
 
   /** Evidence (§5.2.2): stable parts first, capped at `janus.maxInputTokens`. */
   evidence(input: JanusInput): { intent_stack: string; recent_rounds: string; user_message?: string } {
-    const cap = this.cfg.janus.maxInputTokens;
+    const cap = this.maxInputTokens();
     const stack = renderStack(input.state.stack, input.round);
     const user = input.userMessage ? clipTokens(sanitize(input.userMessage), Math.floor(cap / 4)) : undefined;
-    const span = lastRounds(input.entries, input.units, 2);
+    const recentSpan = lastRounds(input.entries, input.units, 2);
+    const from = input.sinceEntryId !== undefined ? Math.min(recentSpan.from, this.uncheckedStart(input.entries, input.sinceEntryId)) : recentSpan.from;
     const left = Math.max(500, cap - estimateTokens(stack) - (user ? estimateTokens(user) : 0) - 200);
-    const recent = renderSpan(input.entries, span.from, span.to, { toolOutputTokens: 300, maxTokens: left });
+    const recent = renderSpan(input.entries, from, recentSpan.to, { toolOutputTokens: 300, maxTokens: left });
     return { intent_stack: stack, recent_rounds: recent || "(nothing yet)", ...(user ? { user_message: user } : {}) };
   }
 
@@ -99,7 +135,12 @@ export class Janus {
         kind: "choice",
         name: `close.${i.id}`,
         instructions: `Purpose [${i.id}] "${i.label}". ${CLOSE_TEXT}`,
-        options: [{ value: "open" }, { value: "success", description: `met: ${i.success}` }, { value: "failure", description: `met: ${i.failure}` }, { value: "abandoned", description: "the user dropped or replaced it" }],
+        options: [
+          { value: "open" },
+          { value: "success", description: `met: ${i.success}` },
+          { value: "failure", description: i.failure ? `met: ${i.failure}` : "the purpose failed or hit a blocker" },
+          { value: "abandoned", description: "the user dropped or replaced it" },
+        ],
       });
     }
     if (input.mode === "full") {
@@ -107,14 +148,6 @@ export class Janus {
       if (input.userMessage) qs.push({ kind: "binary", name: "redirect", instructions: "Does the user's message cancel or replace the current purpose?" });
     }
     return qs;
-  }
-
-  /**
-   * True when answers come from the aux-emulated fallback (§9.1.4): they take seconds, so no
-   * commit point waits for them, and they apply one step late.
-   */
-  slow(): boolean {
-    return this.decision.available() && !this.decision.calibrated();
   }
 
   /** One decision request and the deterministic rules of §5.2.4. Never throws. */
@@ -128,12 +161,12 @@ export class Janus {
     } catch {
       answers = {};
     }
-    if (!Object.keys(answers).length) return plan; // timeout or error: continue, no closures
+    if (!Object.keys(answers).length) return plan; // timeout or error: continue, no drift
     plan.answered = true;
     return this.rules(input, answers, plan);
   }
 
-  /** §5.2.4, exposed for tests and for answers that arrive late. */
+  /** §5.2.4, exposed for tests and deterministic drift evaluation. */
   rules(input: JanusInput, answers: Record<string, DecisionAnswer>, plan: JanusPlan): JanusPlan {
     const cfg = this.cfg.context;
     const stack = input.state.stack;
@@ -150,8 +183,7 @@ export class Janus {
       plan.closeProb[intent.id] = 1 - pOpen;
       const tau = a!.calibrated === false ? Math.max(cfg.tauClose, UNCALIBRATED.tauClose) : cfg.tauClose;
       if (1 - pOpen < tau) break;
-      // 2. minimum evidence: at least one complete round since its guidance (a late intent's
-      // first entry can be the assistant message of the round it was planned in)
+      // 2. minimum evidence: at least one complete round since its start
       const at = intent.guidanceEntryId ? index.get(intent.guidanceEntryId) : undefined;
       if (at === undefined) break;
       const since = input.units.filter((u) => u.round && u.complete && u.start >= at).length;
@@ -179,7 +211,7 @@ export class Janus {
     const remaining = stack.slice(0, stillOpen);
     const atDepthCap = remaining.length >= this.cfg.janus.maxDepth;
     if (!remaining.length) {
-      // empty stack: a new user task, or any move away from `continue`, kindles a root intent
+      // empty stack: a new user task, or any move away from `continue`, warrants opening a root intent
       const moving = 1 - (fp.continue ?? 0);
       if ((input.userMessage && moving >= 0.5) || (focus !== "continue" && p >= tauOpen)) plan.kindle = { parentId: null, focus: "new_root", note: "No purpose is open; this starts a new one." };
       return plan;
@@ -195,68 +227,71 @@ export class Janus {
       }
     } else if (focus === "new_root" && p >= tauOpen) {
       if (redirect !== null && redirect >= 0.8) {
-        // the user replaced the work: what is still open is abandoned, then a root intent starts
         for (let j = remaining.length - 1; j >= 0; j--) plan.closures.push({ intent: remaining[j]!, outcome: "abandoned", forced: true });
         plan.kindle = { parentId: null, focus, note: "The user started unrelated work that replaces the current purpose." };
       } else if (!atDepthCap) {
-        // an interruption: a child that returns focus to the parent when it closes
         plan.kindle = { parentId: innermost.id, focus: "deepen", note: `An interruption arrived while working on "${innermost.label}"; it is handled as a sub-purpose.` };
       }
     }
     return plan;
   }
 
-  /**
-   * The scribe (§5.2.5): `{ label, reason, success, failure }`, validated, with the duplicate
-   * guard and one retry. Returns null when the kindle is skipped.
-   */
-  async scribe(input: JanusInput, kindle: KindlePlan, openAfter: Intent[]): Promise<ScribedIntent | null> {
-    const aux = this.aux();
-    if (!aux?.available()) return null;
-    const span = lastRounds(input.entries, input.units, 2);
-    const data = [
-      { label: "OPEN PURPOSES", text: renderStack(openAfter, input.round) },
-      { label: "LAST ROUNDS", text: renderSpan(input.entries, span.from, span.to, { toolOutputTokens: 300, maxTokens: 5000 }) || "(nothing yet)" },
-      ...(input.userMessage ? [{ label: "NEW USER MESSAGE", text: clipTokens(input.userMessage, 1500) }] : []),
-      { label: "FOCUS DECISION", text: kindle.note },
-    ];
-    let problem = "";
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const res = await aux.run<ScribedIntent>({
-        role: "janus.scribe",
-        instructions: `Name the purpose the coding agent is starting now, as an intent record. Name a purpose, not an action ("Find why login is flaky", not "Run the tests"). label: at most 12 words. reason: why this purpose now, one sentence. success: a condition observable in the transcript that means it is done. failure: an observable condition that means giving up. Do not repeat a purpose that is already open.${problem ? `\nYour previous answer was rejected: ${problem}` : ""}`,
-        data,
-        schema: SCRIBE_SCHEMA,
-        tools: "none",
-        signal: input.signal,
-      });
-      const out = res.output;
-      if (!out || [out.label, out.reason, out.success, out.failure].some((x) => typeof x !== "string" || !x.trim())) {
-        problem = "every field must be a non-empty string";
-        continue;
+  /** Turn a decision plan into an actionable drift advisory for the main model, or null when aligned. */
+  advisory(plan: JanusPlan, stack: Intent[], toolName = "intent"): DriftAdvisory | null {
+    if (!plan.answered || (!plan.closures.length && !plan.kindle)) return null;
+    const closedCount = plan.closures.length;
+    const closedList = plan.closures.map((c) => `"${c.intent.label}" (${outcomeWord(c.outcome)})`).join(", ");
+    const primaryOutcome = plan.closures[0]?.outcome ?? "success";
+    const popArg = stack.length > 0 && closedCount >= stack.length ? "all: true" : `count: ${closedCount}`;
+
+    if (closedCount > 0 && plan.kindle) {
+      if (plan.closures.some((c) => c.forced)) {
+        return {
+          kind: "redirect",
+          closures: plan.closures,
+          focus: plan.focus,
+          summary: `Work appears to have shifted to a new goal while ${stack.length} intent(s) remain open. Call \`${toolName}\` with action "shift" (all: true, outcome: "abandoned") or "close" (all: true, outcome: "abandoned") to realign the stack.`,
+          evidenceLeafId: plan.evidenceLeafId,
+        };
       }
-      const intent: ScribedIntent = { label: clipWords(sanitize(out.label).replace(/\s+/g, " ").trim(), 12).replace(/[."]+$/, ""), reason: sanitize(out.reason).trim(), success: sanitize(out.success).trim(), failure: sanitize(out.failure).trim() };
-      // duplicate guard: never kindle a purpose already on the stack
-      let duplicate: Intent | null = null;
-      for (const open of openAfter) {
-        if (open.label.toLowerCase() === intent.label.toLowerCase()) duplicate = open;
-        else if (this.sim) {
-          const pair = await this.sim.textPair(intent.label, open.label, input.signal);
-          if (pair.sim >= this.sim.threshold("intentDuplicate", pair.mode)) duplicate = open;
-        }
-        if (duplicate) break;
-      }
-      if (!duplicate) return intent;
-      problem = `"${intent.label}" duplicates the open purpose "${duplicate.label}"`;
+      return {
+        kind: "shift",
+        closures: plan.closures,
+        focus: plan.focus,
+        summary: `${closedList} appears finished and focus is moving to the next purpose. Call \`${toolName}\` with action "shift" (${popArg}, outcome: "${primaryOutcome}") to close it and open the next intent.`,
+        evidenceLeafId: plan.evidenceLeafId,
+      };
     }
-    return null;
+    if (closedCount > 0) {
+      return {
+        kind: "close",
+        closures: plan.closures,
+        focus: plan.focus,
+        summary: `${closedList} appears finished. Call \`${toolName}\` with action "close" (${popArg}, outcome: "${primaryOutcome}") so completed work can consolidate.`,
+        evidenceLeafId: plan.evidenceLeafId,
+      };
+    }
+    // kindle only (no closures)
+    if (!stack.length) {
+      return {
+        kind: "open",
+        closures: [],
+        focus: plan.focus,
+        summary: `No intent is currently open on the stack for this work. Call \`${toolName}\` with action "open" to record your current purpose and completion condition.`,
+        evidenceLeafId: plan.evidenceLeafId,
+      };
+    }
+    const innermost = stack[stack.length - 1]!;
+    return {
+      kind: "deepen",
+      closures: [],
+      focus: plan.focus,
+      summary: `Your focus appears to have moved into a distinct sub-purpose inside "${innermost.label}". Call \`${toolName}\` with action "open" to push a sub-intent, or "shift" if "${innermost.label}" is already done.`,
+      evidenceLeafId: plan.evidenceLeafId,
+    };
   }
 
-  newIntent(s: ScribedIntent, parentId: string | null, round: number): Intent {
-    return { id: randomId8(), parentId, label: s.label, reason: s.reason, success: s.success, failure: s.failure, guidanceEntryId: "", openedRound: round, status: "open" };
-  }
-
-  /** Rounds an intent has been open, counted on the transcript (for reminders). */
+  /** Rounds an intent has been open, counted on the transcript (for reminders and climb stability). */
   static roundsSince(intent: Intent, entries: EntryView[], units: Unit[]): number {
     const at = entries.findIndex((e) => e.id === intent.guidanceEntryId);
     if (at < 0) return 0;

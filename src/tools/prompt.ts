@@ -14,7 +14,9 @@ export function promptSection(cfg: Config, opts: { prefix?: string; available?: 
   lines.push(
     `- Messages that start with [t:…] are my own earlier work, consolidated. The details are archived;${has("recall") ? `\n  ${n.recall}(id) opens one layer. Before recalling, I say what I am missing, and I recall only gaps that matter.` : ""}`,
     "- Knowledge labels: [good] worked. [bad] was tried and failed; I don't repeat it without a new reason.\n  [neutral] is an observation.",
-    "- [intent] messages record my current purpose and when it counts as done. They are bookkeeping, not user requests.",
+    has("intent")
+      ? `- Intent stack (${n.intent}): I maintain my intent stack whenever possible—this organizes my work and lets realctx2\n  consolidate finished sub-tasks instead of letting context grow unbounded. I call ${n.intent}(action: "open", label,\n  done, …) when starting a goal or sub-goal, "close" when it finishes or is dropped, "shift" to close and move to\n  the next purpose in one step, and "update" to refine conditions in place.\n- [intent] messages are periodic reminders or drift checks about my intent stack. They are bookkeeping, not user\n  requests; when a drift check says my focus moved, I update the stack with ${n.intent}.`
+      : "- [intent] messages record my current purpose and when it counts as done. They are bookkeeping, not user requests.",
   );
   if (memory) {
     lines.push(

@@ -110,7 +110,7 @@ export interface Config {
     /** Claude Code post-compaction injection budget (§4.6.3). */
     reinjectTokens: number;
   };
-  janus: { timeoutMs: number; lateWaitMs: number; maxInputTokens: number; remindEvery: number; maxDepth: number };
+  janus: { timeoutMs: number; lateWaitMs: number; debounceMs: number; maxInputTokens: "auto" | number; remindEvery: number; driftCooldownRounds: number; maxDepth: number };
   attribution: { rootWindowRounds: number };
   memory: {
     kappaShortToLong: number;
@@ -259,7 +259,7 @@ export const DEFAULT_CONFIG: Config = {
     prepareFraction: 0.7,
     reinjectTokens: 8000,
   },
-  janus: { timeoutMs: 30_000, lateWaitMs: 10_000, maxInputTokens: 8000, remindEvery: 8, maxDepth: 6 },
+  janus: { timeoutMs: 30_000, lateWaitMs: 10_000, debounceMs: 3_000, maxInputTokens: "auto", remindEvery: 8, driftCooldownRounds: 32, maxDepth: 6 },
   attribution: { rootWindowRounds: 6 },
   memory: {
     kappaShortToLong: 0.25,
@@ -321,7 +321,7 @@ export const DEFAULT_CONFIG: Config = {
   },
   shared: { review: false, ignoreActors: [], compactOn: "any", defaultBranch: null, counterFlushThreshold: 50 },
   tools: {
-    names: { search: "search", recall: "recall", inspect: "inspect", remember: "remember", forget: "forget" },
+    names: { search: "search", recall: "recall", inspect: "inspect", remember: "remember", forget: "forget", intent: "intent" },
     remember: true,
     forget: true,
   },
@@ -911,4 +911,27 @@ export function scaledContext(cfg: Config, modelWindow: number, modelName?: stri
   const deltaMin = Math.max(4096, Math.round(cfg.context.deltaMin * f));
   const innermostMin = cfg.context.climb.innermostMinTokens != null ? Math.max(2 * 8192, Math.round(cfg.context.climb.innermostMinTokens * f)) : 2 * Tmin;
   return { W, Bmin, Tmin, deltaMin, innermostMin, maxToolResult: Math.round(cfg.context.maxToolResultFraction * W) };
+}
+
+export const DEFAULT_DECISION_MAX_INPUT_TOKENS = 30_000;
+export const JANUS_AUTO_MAX_INPUT_CAP = 64_000;
+
+/**
+ * Resolve the effective Janus evidence token cap (and prefire threshold).
+ * When `janus.maxInputTokens` is `"auto"` (default), uses `min(decisionMaxInput, 64_000)`,
+ * where `decisionMaxInput` is `providers.decision.maxInputTokens` (default `30_000`).
+ * Explicit positive numeric overrides are returned as-is.
+ */
+export function effectiveJanusMaxInputTokens(cfg: Config): number {
+  const explicit = cfg.janus.maxInputTokens;
+  if (typeof explicit === "number" && Number.isFinite(explicit) && explicit > 0) {
+    return Math.round(explicit);
+  }
+  const decisionMax =
+    typeof cfg.providers.decision?.maxInputTokens === "number" &&
+    Number.isFinite(cfg.providers.decision.maxInputTokens) &&
+    cfg.providers.decision.maxInputTokens > 0
+      ? Math.round(cfg.providers.decision.maxInputTokens)
+      : DEFAULT_DECISION_MAX_INPUT_TOKENS;
+  return Math.min(decisionMax, JANUS_AUTO_MAX_INPUT_CAP);
 }

@@ -45,7 +45,7 @@ not compete, and tells you. `/realctx2:uninstall` restores the setting.
 
 ## What it adds
 
-- **Tools** for Claude: `search`, `recall`, `inspect`, `remember`, `forget`
+- **Tools** for Claude: `search`, `recall`, `inspect`, `remember`, `forget`, `intent`
   (`mcp__plugin_realctx2_realctx2__<tool>`).
 - **Commands**: `/realctx2:<command>`. `/realctx2:realctx2` lists them; start with
   `/realctx2:status` and `/realctx2:doctor`.

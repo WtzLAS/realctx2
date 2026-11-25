@@ -12,7 +12,9 @@ import { clean, SummaryComponent } from "./tool-renderers.ts";
 type Theme = Parameters<MessageRenderer>[2];
 
 export interface ParsedGuidance {
-  kind: "intent" | "cards" | "reminder" | "note";
+  kind: "intent" | "cards" | "reminder" | "drift" | "note";
+  drift?: string;
+  emptyReminder?: string;
   closed: Array<{ label: string; outcome: string }>;
   now?: { label: string; inside?: string };
   backTo?: string;
@@ -31,7 +33,9 @@ export interface ParsedGuidance {
 const CLOSED = /I finished "(.*?)": (succeeded|failed|set aside)\./g;
 const NOW = /^I'm now working on "(.*)"(?: \(inside: (.*)\))?\.$/;
 const BACK = /^I'm back to "(.*?)"\.(?: Done when: (.*))?$/;
-const STILL = /^Still working on "(.*?)"(?: \(inside: (.*?)\))?\. Done when: (.*?)(?: Give up when: (.*))?$/;
+const STILL = /^Still working on "(.*?)"(?: \(inside: (.*?)\))?\. Done when: (.*?)(?: Give up when: (.*?))?(?: Update with `[^`]+` if finished or shifting\.)?$/;
+const EMPTY_REM = /^No active intent on the stack after \d+ rounds\..*$/;
+const DRIFT = /^Drift check: (.*)$/;
 const CARDS_FOR = /^Memory that may help with "(.*)":$/;
 
 export function parseGuidance(content: string): ParsedGuidance {
@@ -60,6 +64,14 @@ export function parseGuidance(content: string): ParsedGuidance {
         g.now = { label: m[1]!, inside: m[2] };
         g.done = m[3];
         if (m[4]) g.giveUp = m[4];
+      } else if (EMPTY_REM.test(line)) {
+        g.kind = "reminder";
+        g.emptyReminder = line;
+      } else if ((m = DRIFT.exec(line))) {
+        g.kind = "drift";
+        g.drift = m[1]!;
+        i++;
+        break;
       } else if ((m = CARDS_FOR.exec(line))) {
         g.kind = "cards";
         g.cardsFor = m[1]!;
@@ -81,7 +93,7 @@ export function parseGuidance(content: string): ParsedGuidance {
   return g;
 }
 
-const TITLES: Record<ParsedGuidance["kind"], string> = { intent: "realctx2 intent", cards: "realctx2 memory", reminder: "realctx2 reminder", note: "realctx2" };
+const TITLES: Record<ParsedGuidance["kind"], string> = { intent: "realctx2 intent", cards: "realctx2 memory", reminder: "realctx2 reminder", drift: "realctx2 drift", note: "realctx2" };
 
 function outcomeStyle(theme: Theme, outcome: string): string {
   if (outcome === "succeeded") return theme.fg("success", `✓ finished`);
@@ -107,6 +119,8 @@ export function guidanceLines(content: string, expanded: boolean, theme: Theme, 
   }
   if (g.backTo) lines.push(`${theme.fg("accent", "↩ back to")} ${theme.fg("text", `"${clean(g.backTo, 120)}"`)}`);
   if (g.cardsFor) lines.push(`${theme.fg("accent", "for")} ${theme.fg("text", `"${clean(g.cardsFor, 120)}"`)}`);
+  if (g.emptyReminder) lines.push(muted(clean(g.emptyReminder, expanded ? 400 : 160)));
+  if (g.drift) lines.push(theme.fg("warning", `⚠ ${clean(g.drift, expanded ? 400 : 180)}`));
   if (expanded && g.why) lines.push(muted(`  Why: ${clean(g.why, 400)}`));
   if (g.done) lines.push(muted(`  Done when: ${clean(g.done, expanded ? 400 : 160)}`));
   if (expanded && g.giveUp) lines.push(muted(`  Give up when: ${clean(g.giveUp, 400)}`));

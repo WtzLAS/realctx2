@@ -3,7 +3,7 @@
  * request splitting, reliability, and the aux-emulated fallback.
  */
 import type { DecisionProviderConfig } from "../core/config.ts";
-import { buildAuthHeaders } from "../core/config.ts";
+import { buildAuthHeaders, DEFAULT_DECISION_MAX_INPUT_TOKENS } from "../core/config.ts";
 import { budgetReached, type Telemetry } from "../core/telemetry.ts";
 import type { AuxSessionRunner, DecideOptions, DecisionAnswer, DecisionClient, DecisionQuestion } from "../core/types.ts";
 import { sleep } from "../util/async.ts";
@@ -336,7 +336,7 @@ export class HttpDecisionClient implements DecisionClient {
       this.telemetry.call({ callSite: opts.callSite, kind: "decision", latencyMs: 0, outcome: "skipped", detail: "daily budget" });
       throw new DecisionUnavailable("daily decision budget exhausted");
     }
-    const capped = capEvidence(evidence, this.config.maxInputTokens ?? 30_000);
+    const capped = capEvidence(evidence, this.config.maxInputTokens ?? DEFAULT_DECISION_MAX_INPUT_TOKENS);
     const chunks: DecisionQuestion[][] = [];
     for (let i = 0; i < questions.length; i += this.maxQuestions) chunks.push(questions.slice(i, i + this.maxQuestions));
     const results = await Promise.all(chunks.map((chunk) => this.request(capped, chunk, opts)));
