@@ -1208,4 +1208,23 @@ describe("main-model intent tracking, steering, debounced drift reminders, and i
     expect(b.filter((e) => e.type === "context_edit").length).toBeGreaterThanOrEqual(4);
     await r.shutdown();
   }, 60_000);
+
+  it("aborts idle maintenance on terminal keypresses without consuming keys and cleans up on shutdown", async () => {
+    const cwd = repo();
+    // idleMinutes: 0.002 ≈ 120ms; pressing a key during the idle wait cancels maintenance
+    const r = await piRig({ cwd, mode: "tui", config: { maintenance: { idleMinutes: 0.002 }, evolution: { policy: "rules", attemptsPerPass: 1 } } });
+    expect(r.errors).toEqual([]);
+    // TUI session registered a terminal input listener
+    expect(r.ui.input.size).toBe(1);
+    r.main.push({ text: "Done." });
+    await r.prompt("hello");
+    // Pressing a key right after agent_settled calls host.noteInput() without consuming the key
+    const results = [...r.ui.input].map((h) => h("a"));
+    expect(results).toEqual([undefined]);
+    // Wait past the 120ms idle window: no maintenance/aux work should have started
+    await new Promise((res) => setTimeout(res, 250));
+    expect(r.auxCalls).toHaveLength(0);
+    await r.shutdown();
+    expect(r.ui.input.size).toBe(0);
+  });
 });

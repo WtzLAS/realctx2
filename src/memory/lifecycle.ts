@@ -3,6 +3,7 @@
  * and explicit forgetting (retire, purge, restore).
  */
 import type { MemoryNode, ScopedNode, ScopeName } from "../core/types.ts";
+import { createTimeSlicer } from "../util/async.ts";
 import { randomId8 } from "../util/ids.ts";
 import { daysBetween } from "../util/text.ts";
 import type { MemoryGraph } from "./graph.ts";
@@ -62,39 +63,42 @@ export class Lifecycle {
    * One hygiene pass over a scope: fold old strength events, refresh importance, move layers,
    * and run the forgetting pass when it is due (every `intervalTurns` scope turns, or daily).
    */
-  hygiene(scope: ScopeName, opts: { forceForgetting?: boolean } = {}): HygieneReport {
+  private applyNodeHygiene(
+    scope: ScopeName,
+    h: ReturnType<MemoryGraph["handle"]>,
+    node: MemoryNode,
+    now: Date,
+    nowIso: string,
+    preparedPurposes: ReturnType<MemoryServices["sim"]["preparePurposes"]>,
+    report: HygieneReport,
+  ): void {
+    const sd = h.store.sd;
+    if (node.status === "purged") return;
+    // strength bookkeeping: fold events past the safety window (§7.3)
+    const plan = foldPlan(node, now);
+    if (plan && sd.foldStrength(node.id, plan.base, plan.remove)) report.folded++;
+    if (node.status !== "active") return;
+    // importance (cached on the node; λ depends on it)
+    const rel = this.s.sim.relevanceToPurposes(h, node.id, node.text, preparedPurposes);
+    const I = importance(node, rel, now);
+    if (node.importance === undefined || Math.abs(node.importance - I) >= 0.02) sd.patchNode(node.id, { importance: Math.round(I * 1000) / 1000 }, "counters");
+    // layer moves, with hysteresis between the two thresholds
+    const { mw, evidence } = memoryWorth(node.counters);
+    const highValue = mw >= 0.6 && evidence >= 3;
+    const fastTrack = node.counters.useSessions >= 3 && mw >= 0.6;
+    if (node.layer === "short" && (I >= THETA_PROMOTE || fastTrack)) {
+      this.moveLayer(scope, node, "long", nowIso);
+      report.promoted.push(node.id);
+    } else if (node.layer === "long" && I < THETA_DEMOTE && !node.pinned && !highValue) {
+      this.moveLayer(scope, node, "short", nowIso);
+      report.demoted.push(node.id);
+    }
+  }
+
+  private finishHygiene(scope: ScopeName, h: ReturnType<MemoryGraph["handle"]>, now: Date, nowIso: string, opts: { forceForgetting?: boolean }, report: HygieneReport): void {
     const g = this.s.graph;
     const cfg = this.s.cfg.memory;
-    const report: HygieneReport = { scope, folded: 0, promoted: [], demoted: [], dormant: [], archived: [], lowValue: [], forgettingRan: false, threshold: cfg.forgetting.threshold, overCap: { short: false, long: false }, revivalRate: 0 };
-    if (!g.has(scope) || !g.writable(scope)) return report;
-    const h = g.handle(scope);
     const sd = h.store.sd;
-    const now = this.s.clock();
-    const nowIso = now.toISOString();
-
-    for (const node of sd.allNodes()) {
-      if (node.status === "purged") continue;
-      // strength bookkeeping: fold events past the safety window (§7.3)
-      const plan = foldPlan(node, now);
-      if (plan && sd.foldStrength(node.id, plan.base, plan.remove)) report.folded++;
-      if (node.status !== "active") continue;
-      // importance (cached on the node; λ depends on it)
-      const rel = this.s.sim.relevanceToPurposes(h, node.id, node.text);
-      const I = importance(node, rel, now);
-      if (node.importance === undefined || Math.abs(node.importance - I) >= 0.02) sd.patchNode(node.id, { importance: Math.round(I * 1000) / 1000 }, "counters");
-      // layer moves, with hysteresis between the two thresholds
-      const { mw, evidence } = memoryWorth(node.counters);
-      const highValue = mw >= 0.6 && evidence >= 3;
-      const fastTrack = node.counters.useSessions >= 3 && mw >= 0.6;
-      if (node.layer === "short" && (I >= THETA_PROMOTE || fastTrack)) {
-        this.moveLayer(scope, node, "long", nowIso);
-        report.promoted.push(node.id);
-      } else if (node.layer === "long" && I < THETA_DEMOTE && !node.pinned && !highValue) {
-        this.moveLayer(scope, node, "short", nowIso);
-        report.demoted.push(node.id);
-      }
-    }
-
     // dormant → archived after `dormantDays` unrevived
     for (const node of sd.allNodes()) {
       if (node.status !== "dormant" || !node.statusAt) continue;
@@ -116,9 +120,53 @@ export class Lifecycle {
     }
     g.commit(scope, "hygiene");
     g.syncIndex(scope);
+  }
+
+  hygiene(scope: ScopeName, opts: { forceForgetting?: boolean } = {}): HygieneReport {
+    const g = this.s.graph;
+    const cfg = this.s.cfg.memory;
+    const report: HygieneReport = { scope, folded: 0, promoted: [], demoted: [], dormant: [], archived: [], lowValue: [], forgettingRan: false, threshold: cfg.forgetting.threshold, overCap: { short: false, long: false }, revivalRate: 0 };
+    if (!g.has(scope) || !g.writable(scope)) return report;
+    const h = g.handle(scope);
+    const now = this.s.clock();
+    const nowIso = now.toISOString();
+    const preparedPurposes = this.s.sim.preparePurposes(h);
+
+    for (const node of h.store.sd.allNodes()) {
+      this.applyNodeHygiene(scope, h, node, now, nowIso, preparedPurposes, report);
+    }
+    this.finishHygiene(scope, h, now, nowIso, opts, report);
     return report;
   }
 
+  /** Cooperative, abortable hygiene pass for in-session idle maintenance. */
+  async hygieneAsync(scope: ScopeName, opts: { forceForgetting?: boolean; signal?: AbortSignal } = {}): Promise<HygieneReport> {
+    const g = this.s.graph;
+    const cfg = this.s.cfg.memory;
+    const report: HygieneReport = { scope, folded: 0, promoted: [], demoted: [], dormant: [], archived: [], lowValue: [], forgettingRan: false, threshold: cfg.forgetting.threshold, overCap: { short: false, long: false }, revivalRate: 0 };
+    if (!g.has(scope) || !g.writable(scope) || opts.signal?.aborted) return report;
+    const h = g.handle(scope);
+    const now = this.s.clock();
+    const nowIso = now.toISOString();
+    const preparedPurposes = this.s.sim.preparePurposes(h);
+    const slicer = createTimeSlicer(12, opts.signal);
+
+    for (const node of h.store.sd.allNodes()) {
+      if (!(await slicer.check())) {
+        g.commit(scope, "hygiene");
+        g.syncIndex(scope);
+        return report;
+      }
+      this.applyNodeHygiene(scope, h, node, now, nowIso, preparedPurposes, report);
+    }
+    if (opts.signal?.aborted) {
+      g.commit(scope, "hygiene");
+      g.syncIndex(scope);
+      return report;
+    }
+    this.finishHygiene(scope, h, now, nowIso, opts, report);
+    return report;
+  }
   private moveLayer(scope: ScopeName, node: MemoryNode, layer: "short" | "long", nowIso: string): void {
     const sd = this.s.graph.sd(scope);
     // the transition snapshots (v_now, t_now), so switching β never distorts earlier decay (§6.5.1)

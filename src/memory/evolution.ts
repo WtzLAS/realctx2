@@ -8,6 +8,7 @@ import { budgetReached } from "../core/telemetry.ts";
 import type { DecisionQuestion, MemoryEdge, MemoryNode, Relation, ScopeName } from "../core/types.ts";
 import { RELATIONS } from "../core/types.ts";
 import { binaryP, choiceProbs } from "../providers/decision.ts";
+import { createTimeSlicer } from "../util/async.ts";
 import { errMsg } from "../util/errors.ts";
 import { appendJsonl, readJsonl, writeFileAtomic } from "../util/fs.ts";
 import { clamp, daysBetween, sanitize, trigramJaccard } from "../util/text.ts";
@@ -167,8 +168,9 @@ export class Evolution {
     const seen = new Set<string>();
     let slots = 0;
     const t0 = Date.now();
+    const slicer = createTimeSlicer(12, signal);
     for (const q of queries) {
-      if (signal?.aborted) break;
+      if (!(await slicer.check())) break;
       const act = [...(await this.retriever.spread(q, { scopes: [scope], signal })).values()].sort((a, b) => b.a - a.a).slice(0, 3);
       if (!act.length) continue;
       hits++;
@@ -346,8 +348,7 @@ export class Evolution {
     const mode = sim.thresholdMode();
     if (h.index) {
       if (mode === "late" && sim.lateKey()) {
-        const m = h.index.vectors.getMatrix(a.id, sim.lateKey()!);
-        const v = m ? h.index.vectors.symmetricWith(m, b.id, sim.lateKey()!) : null;
+        const v = h.index.vectors.symmetricBetween(a.id, b.id, sim.lateKey()!);
         if (v !== null) return { sim: v, unit: sim.toUnit(v, "late"), mode: "late" };
       }
       if (mode !== "lexical" && sim.denseKey()) {
@@ -380,8 +381,9 @@ export class Evolution {
     const ok = (id: string) => id !== node.id && sd.getNode(id)?.status === "active";
     let ids: string[] = [];
     if (sim.lateKey() && sim.searchMode() === "late") {
+      const li = this.s.cfg.index.lateInteraction;
       const m = h.index.vectors.getMatrix(node.id, sim.lateKey()!);
-      if (m) ids = h.index.vectors.lateSearch(m, sim.lateKey()!, { limit, exactMax: this.s.cfg.index.lateInteraction.exactMax, candidates: this.s.cfg.index.lateInteraction.candidates, filter: ok }).map((x) => x.id);
+      if (m) ids = h.index.vectors.lateSearch(m, sim.lateKey()!, { limit, exactMax: Math.min(li.exactMax, 64), candidates: Math.min(li.candidates, Math.max(limit * 4, 32)), filter: ok }).map((x) => x.id);
     }
     if (!ids.length && sim.denseKey()) {
       const v = h.index.vectors.getDense(node.id, sim.denseKey()!);
@@ -435,16 +437,20 @@ export class Evolution {
       .slice(0, MAX_CANDIDATES);
     // Bridge: non-adjacent pairs, ranked by similarity
     const pairs = new Map<string, { a: MemoryNode; b: MemoryNode; sim: number; unit: number; mode: SimMode }>();
+    const evaluated = new Set<string>();
     let nearDuplicates = 0;
     const pool = [...nodes].sort((a, b) => (a.lastAccessAt < b.lastAccessAt ? 1 : -1)).slice(0, 60);
     for (const a of pool) {
       for (const b of this.nearest(scope, a, 4)) {
         const key = [a.id, b.id].sort().join("|");
-        if (pairs.has(key)) continue;
-        const t = this.threshold("floor", scope, a, b);
-        if (this.threshold("fusion", scope, a, b).ok && a.kind === b.kind) nearDuplicates++;
-        if (adj.get(a.id)!.has(b.id) || !t.ok) continue;
-        pairs.set(key, { a, b, sim: t.sim, unit: t.unit, mode: t.mode });
+        if (evaluated.has(key)) continue;
+        evaluated.add(key);
+        const p = this.pairSim(scope, a, b);
+        const floorT = p.mode === "lexical" ? 0.2 : this.s.sim.threshold("floor", p.mode);
+        const fusionT = this.s.sim.threshold("fusion", p.mode);
+        if (p.sim >= fusionT && a.kind === b.kind) nearDuplicates++;
+        if (adj.get(a.id)!.has(b.id) || p.sim < floorT) continue;
+        pairs.set(key, { a, b, sim: p.sim, unit: p.unit, mode: p.mode });
       }
     }
     let bridge = [...pairs.values()].sort((x, y) => y.sim - x.sim).slice(0, MAX_CANDIDATES);
@@ -453,6 +459,101 @@ export class Evolution {
       if (split && !adj.get(split.a.id)!.has(split.b.id)) bridge = [{ ...split, ...this.pairSim(scope, split.a, split.b) }];
     }
     // Reframe: existing paths of causes/precedes edges
+    const chainEdges = edges.filter((e) => e.rel === "causes" || e.rel === "precedes");
+    const out = new Map<string, MemoryEdge[]>();
+    const hasIn = new Set<string>();
+    for (const e of chainEdges) {
+      out.set(e.src, [...(out.get(e.src) ?? []), e]);
+      hasIn.add(e.dst);
+    }
+    const reframe: Candidates["reframe"] = [];
+    for (const start of out.keys()) {
+      if (hasIn.has(start) && out.size > 1) continue;
+      const path = [byId.get(start)!];
+      const used: MemoryEdge[] = [];
+      const seen = new Set([start]);
+      let cur = start;
+      for (;;) {
+        const e = (out.get(cur) ?? []).find((x) => !seen.has(x.dst));
+        if (!e) break;
+        used.push(e);
+        path.push(byId.get(e.dst)!);
+        seen.add(e.dst);
+        cur = e.dst;
+      }
+      if (used.length >= 1) reframe.push({ path, edges: used });
+    }
+    reframe.sort((a, b) => b.edges.length - a.edges.length);
+    return { abstract, refine, bridge, reframe: reframe.slice(0, MAX_CANDIDATES), nearDuplicates };
+  }
+
+  /** Cooperative, abortable candidate selection for in-session evolution attempts. */
+  async candidatesAsync(scope: ScopeName, signal?: AbortSignal): Promise<Candidates | null> {
+    if (signal?.aborted) return null;
+    const g = this.s.graph;
+    const nodes = this.active(scope);
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const edges = this.localEdges(scope).filter((e) => byId.has(e.src) && byId.has(e.dst));
+    const adj = new Map<string, Set<string>>();
+    for (const n of nodes) adj.set(n.id, new Set());
+    for (const e of edges) {
+      adj.get(e.src)!.add(e.dst);
+      adj.get(e.dst)!.add(e.src);
+    }
+    const hood = (id: string, hops: number): MemoryNode[] => {
+      const seen = new Set([id]);
+      let frontier = [id];
+      for (let h = 0; h < hops; h++) {
+        const next: string[] = [];
+        for (const cur of frontier) for (const o of adj.get(cur) ?? []) if (!seen.has(o)) {
+          seen.add(o);
+          next.push(o);
+        }
+        frontier = next;
+      }
+      seen.delete(id);
+      return [...seen].map((x) => byId.get(x)!);
+    };
+    const generalized = new Set(edges.filter((e) => e.rel === "generalizes").map((e) => e.dst));
+    const concepts = new Set(edges.filter((e) => e.rel === "generalizes").map((e) => e.src));
+    const abstract = nodes
+      .filter((n) => !concepts.has(n.id) && !generalized.has(n.id) && n.kind !== "rule")
+      .map((seed) => ({ seed, neighborhood: hood(seed.id, 2).filter((m) => !concepts.has(m.id)) }))
+      .filter((c) => c.neighborhood.length >= 2)
+      .sort((a, b) => b.neighborhood.length + Math.log1p(b.seed.counters.retrieved) + b.seed.counters.used - (a.neighborhood.length + Math.log1p(a.seed.counters.retrieved) + a.seed.counters.used))
+      .slice(0, MAX_CANDIDATES);
+    const degree = g.weightedDegree(scope);
+    const parents = new Set(edges.filter((e) => e.rel === "part-of").map((e) => e.dst));
+    const refine = nodes
+      .filter((n) => !parents.has(n.id) && (adj.get(n.id)?.size ?? 0) >= 2 && n.text.split(/\s+/).length >= 12 && n.origin !== "instructions")
+      .map((hub) => ({ hub, degree: degree.get(hub.id) ?? 0 }))
+      .sort((a, b) => b.degree - a.degree)
+      .slice(0, MAX_CANDIDATES);
+    const pairs = new Map<string, { a: MemoryNode; b: MemoryNode; sim: number; unit: number; mode: SimMode }>();
+    const evaluated = new Set<string>();
+    let nearDuplicates = 0;
+    const pool = [...nodes].sort((a, b) => (a.lastAccessAt < b.lastAccessAt ? 1 : -1)).slice(0, 60);
+    const slicer = createTimeSlicer(12, signal);
+    for (const a of pool) {
+      if (!(await slicer.check())) return null;
+      for (const b of this.nearest(scope, a, 4)) {
+        const key = [a.id, b.id].sort().join("|");
+        if (evaluated.has(key)) continue;
+        evaluated.add(key);
+        const p = this.pairSim(scope, a, b);
+        const floorT = p.mode === "lexical" ? 0.2 : this.s.sim.threshold("floor", p.mode);
+        const fusionT = this.s.sim.threshold("fusion", p.mode);
+        if (p.sim >= fusionT && a.kind === b.kind) nearDuplicates++;
+        if (adj.get(a.id)!.has(b.id) || p.sim < floorT) continue;
+        pairs.set(key, { a, b, sim: p.sim, unit: p.unit, mode: p.mode });
+      }
+    }
+    if (signal?.aborted) return null;
+    let bridge = [...pairs.values()].sort((x, y) => y.sim - x.sim).slice(0, MAX_CANDIDATES);
+    if (!bridge.length && nodes.length >= 6) {
+      const split = this.twoMeans(scope, nodes);
+      if (split && !adj.get(split.a.id)!.has(split.b.id)) bridge = [{ ...split, ...this.pairSim(scope, split.a, split.b) }];
+    }
     const chainEdges = edges.filter((e) => e.rel === "causes" || e.rel === "precedes");
     const out = new Map<string, MemoryEdge[]>();
     const hasIn = new Set<string>();
@@ -746,11 +847,13 @@ export class Evolution {
   async attempt(scope: ScopeName, ctx: { round: number; used: Record<Operator, number>; recent: Attempt[]; propose?: boolean }, signal?: AbortSignal): Promise<Attempt | null> {
     const g = this.s.graph;
     const hyper = this.s.cfg.evolution.hyper;
-    const cands = this.candidates(scope);
+    const cands = await this.candidatesAsync(scope, signal);
+    if (!cands || signal?.aborted) return null;
     const masks = this.masks(cands);
     if (!masks.operators.some(Boolean)) return null;
     const stBefore = this.stats(scope);
     const qBefore = await this.quality(scope, signal);
+    if (signal?.aborted) return null;
     const s = this.features(scope, stBefore, qBefore, cands, ctx.recent);
     const mode = this.s.cfg.evolution.policy;
     let action: Action | null = null;
@@ -831,15 +934,22 @@ export class Evolution {
     };
     for (const n of nodes) parent.set(n.id, n.id);
     const minSim = new Map<string, number>();
+    const checkedPairs = new Set<string>();
+    const slicer = createTimeSlicer(12, opts.signal);
     for (const a of nodes) {
+      if (!(await slicer.check())) return report;
       for (const b of this.nearest(scope, a, 6)) {
         if (!byId.has(b.id) || a.kind !== b.kind || a.layer !== b.layer) continue;
         if (Math.abs(daysBetween(a.createdAt, b.createdAt)) > FUSION_WINDOW_DAYS) continue;
-        const t = this.threshold("fusion", scope, a, b);
-        if (!t.ok) continue;
+        const pairKey = a.id < b.id ? `${a.id}|${b.id}` : `${b.id}|${a.id}`;
+        if (checkedPairs.has(pairKey)) continue;
+        checkedPairs.add(pairKey);
         const ra = find(a.id);
         const rb = find(b.id);
-        if (ra !== rb) parent.set(ra, rb);
+        if (ra === rb) continue;
+        const t = this.threshold("fusion", scope, a, b);
+        if (!t.ok) continue;
+        parent.set(ra, rb);
         const root = find(a.id);
         minSim.set(root, Math.min(minSim.get(root) ?? 1, minSim.get(ra) ?? 1, minSim.get(rb) ?? 1, t.sim));
       }
@@ -944,7 +1054,10 @@ export class Evolution {
     const report: PassReport = { scope, hygiene: null, rechecked: 0, fusion: { clusters: 0, fused: [], rejected: 0 }, attempts: [] };
     if (!g.has(scope) || !g.writable(scope)) return report;
     const stop = () => (opts.signal?.aborted ? "aborted" : this.overBudget());
-    if (opts.hygiene !== false) report.hygiene = this.lifecycle.hygiene(scope);
+    if (opts.hygiene !== false) {
+      report.hygiene = await this.lifecycle.hygieneAsync(scope, { signal: opts.signal });
+      if ((report.stopped = stop() ?? undefined)) return report;
+    }
     // conflict re-checks left by a judge that was unavailable at write time
     for (const node of this.active(scope).filter((n) => n.flags?.includes("conflict-recheck")).slice(0, 5)) {
       if ((report.stopped = stop() ?? undefined)) return report;

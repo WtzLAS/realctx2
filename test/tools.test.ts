@@ -1128,4 +1128,27 @@ describe("the host across sessions", () => {
     expect(maintain).toHaveBeenCalledTimes(1);
     await r.host.shutdown({ spawnWorker: false });
   });
+
+  it("backs off an aborted idle maintenance pass instead of restarting immediately, while force still runs", async () => {
+    const r = await rig({ cfg: { maintenance: { idleMinutes: 0 } } });
+    const mem = r.host.memory!;
+    const ac = new AbortController();
+    let calls = 0;
+    const passSpy = vi.spyOn(mem.evolution, "pass").mockImplementation(async (scope) => {
+      calls++;
+      return { scope, hygiene: null, rechecked: 0, fusion: { clusters: 0, fused: [], rejected: 0 }, attempts: [], stopped: calls === 1 ? "aborted" : undefined };
+    });
+    const first = await mem.idle({ scopes: ["personal"], signal: ac.signal });
+    expect(first.passes).toHaveLength(1);
+    expect(first.passes[0]!.stopped).toBe("aborted");
+    // Second non-forced idle tick within the backoff window skips the aborted scope
+    const second = await mem.idle({ scopes: ["personal"] });
+    expect(second.passes).toHaveLength(0);
+    expect(passSpy).toHaveBeenCalledTimes(1);
+    // Forced maintenance (/realctx2 maintain) still runs immediately
+    const forced = await mem.idle({ scopes: ["personal"], force: true });
+    expect(forced.passes).toHaveLength(1);
+    expect(passSpy).toHaveBeenCalledTimes(2);
+    await r.host.shutdown({ spawnWorker: false });
+  });
 });

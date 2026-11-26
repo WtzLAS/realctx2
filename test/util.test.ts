@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { BlobStore, paginate } from "../src/context/archive.ts";
 import { catalogContextWindow, warmModelCatalog } from "../src/core/catalog.ts";
 import { applyProjectOverrides, DEFAULT_CONFIG, deepMerge, diffConfig, effectiveCacheTtlSeconds, effectiveMaxWindow, isContextEngineEnabled, scaledContext } from "../src/core/config.ts";
-import { raceTimeout, sleep } from "../src/util/async.ts";
+import { createTimeSlicer, raceTimeout, sleep, yieldToEventLoop } from "../src/util/async.ts";
 import { errMsg } from "../src/util/errors.ts";
 import { takeOverStale, tryLock, writeFileAtomic } from "../src/util/fs.ts";
 import { applyIgnoreFix, checkSharedIgnored, describeIgnoreProblem } from "../src/util/gitignore.ts";
@@ -393,6 +393,22 @@ describe("async and error helpers", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("yieldToEventLoop and createTimeSlicer yield cooperatively and stop on abort", async () => {
+    let ioRan = false;
+    setTimeout(() => {
+      ioRan = true;
+    }, 0);
+    await yieldToEventLoop();
+    await new Promise((r) => setTimeout(r, 5));
+    expect(ioRan).toBe(true);
+
+    const ac = new AbortController();
+    const slicer = createTimeSlicer(0, ac.signal);
+    expect(await slicer.check()).toBe(true);
+    ac.abort();
+    expect(await slicer.check()).toBe(false);
   });
 
   it("porcelainV2Path preserves filenames containing spaces and renames", () => {

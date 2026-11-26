@@ -10,7 +10,8 @@
 import type { Config, Layout } from "../core/config.ts";
 import type { Telemetry } from "../core/telemetry.ts";
 import type { Clock, DenseVector, EmbeddingClient, TokenMatrix } from "../core/types.ts";
-import { symmetricMaxSim } from "../providers/late.ts";
+import { type PackedMatrix, symmetricMaxSim, symmetricMaxSimPacked } from "../providers/late.ts";
+import { createTimeSlicer } from "../util/async.ts";
 import { embedHash, embedText } from "../storage/index.ts";
 import type { TurnIndex } from "../storage/turnindex.ts";
 import type { Scored, VectorTables } from "../storage/vectors.ts";
@@ -418,12 +419,26 @@ export class Similarity {
           const texts = nodes.map(embedText);
           if (kind === "tokens") {
             const out = await this.late!.embed(texts, "document", opts.signal);
-            h.index.db.transaction(() => nodes.forEach((n, i) => h.index!.vectors.putTokens(n.id, client.key, embedHash(n), out[i]!, li.quantize.memories, li.pool.memories)));
+            const slicer = createTimeSlicer(12, opts.signal);
+            const prepared: Array<{ id: string; hash: string; data: NonNullable<ReturnType<VectorTables["prepareTokens"]>> }> = [];
+            for (let i = 0; i < nodes.length; i++) {
+              if (!(await slicer.check())) break;
+              const n = nodes[i]!;
+              const data = h.index.vectors.prepareTokens(out[i]!, li.quantize.memories, li.pool.memories);
+              if (data) prepared.push({ id: n.id, hash: embedHash(n), data });
+            }
+            if (prepared.length) {
+              h.index.db.transaction(() => {
+                for (const item of prepared) h.index!.vectors.putPreparedTokens(item.id, client.key, item.hash, item.data);
+              });
+            }
+            done += prepared.length;
+            if (opts.signal?.aborted) break;
           } else {
             const out = await this.dense!.embed(texts, "document", opts.signal);
             h.index.db.transaction(() => nodes.forEach((n, i) => h.index!.vectors.putDense(n.id, client.key, embedHash(n), out[i]!)));
+            done += nodes.length;
           }
-          done += nodes.length;
         } catch (e) {
           this.telemetry?.event("embed.nodes_failed", { scope, kind, error: errMsg(e) });
         }
@@ -456,34 +471,58 @@ export class Similarity {
     }
   }
 
-  /** rel_i (§6.5.2): max similarity between a node and the scope's recent intent purposes, in [0, 1]. */
-  relevanceToPurposes(h: ScopeHandle, nodeId: string, nodeText: string): number {
-    if (!h.index) return 0;
+  /** Preload a scope's recent intent purposes once for batch importance scoring (e.g. hygiene). */
+  preparePurposes(h: ScopeHandle): { mode: SimMode; texts: string[]; packed: PackedMatrix[]; dense: Float32Array[] } | null {
+    if (!h.index) return null;
     const purposes = h.index.purposes();
-    if (!purposes.length) return 0;
+    if (!purposes.length) return null;
     const mode = this.thresholdMode();
-    let best = 0;
+    const packed: PackedMatrix[] = [];
+    const dense: Float32Array[] = [];
     if (mode === "late" && this.lateKey()) {
-      const m = h.index.vectors.getMatrix(nodeId, this.lateKey()!);
-      if (m) {
-        for (const p of purposes) {
-          const s = h.index.purposeVectors.symmetricWith(m, p.id, this.lateKey()!);
-          if (s !== null) best = Math.max(best, this.toUnit(s, "late"));
-        }
-        return best;
+      const key = this.lateKey()!;
+      for (const p of purposes) {
+        const tok = h.index.purposeVectors.getTokens(p.id, key);
+        if (tok && tok.rows > 0) packed.push(tok);
       }
     }
     if (mode !== "lexical" && this.denseKey()) {
-      const v = h.index.vectors.getDense(nodeId, this.denseKey()!);
-      if (v) {
-        for (const p of purposes) {
-          const pv = h.index.purposeVectors.getDense(p.id, this.denseKey()!);
-          if (pv && pv.length === v.length) best = Math.max(best, clamp(cosine(v, pv), 0, 1));
+      const key = this.denseKey()!;
+      for (const p of purposes) {
+        const pv = h.index.purposeVectors.getDense(p.id, key);
+        if (pv) dense.push(pv);
+      }
+    }
+    return { mode, texts: purposes.map((p) => p.text), packed, dense };
+  }
+
+  /** rel_i (§6.5.2): max similarity between a node and the scope's recent intent purposes, in [0, 1]. */
+  relevanceToPurposes(h: ScopeHandle, nodeId: string, nodeText: string, prepared?: ReturnType<Similarity["preparePurposes"]>): number {
+    if (!h.index) return 0;
+    const prep = prepared === undefined ? this.preparePurposes(h) : prepared;
+    if (!prep || !prep.texts.length) return 0;
+    let best = 0;
+    if (prep.mode === "late" && this.lateKey() && prep.packed.length) {
+      const m = h.index.vectors.getTokens(nodeId, this.lateKey()!);
+      if (m && m.rows > 0) {
+        for (const p of prep.packed) {
+          if (p.dims !== m.dims) continue;
+          const s = symmetricMaxSimPacked(m, p);
+          best = Math.max(best, this.toUnit(s, "late"));
         }
         return best;
       }
     }
-    for (const p of purposes) best = Math.max(best, trigramJaccard(nodeText, p.text));
+    if (prep.mode !== "lexical" && this.denseKey() && prep.dense.length) {
+      const v = h.index.vectors.getDense(nodeId, this.denseKey()!);
+      if (v) {
+        for (const pv of prep.dense) {
+          if (pv.length === v.length) best = Math.max(best, clamp(cosine(v, pv), 0, 1));
+        }
+        return best;
+      }
+    }
+    for (const text of prep.texts) best = Math.max(best, trigramJaccard(nodeText, text));
     return best;
   }
 
@@ -504,17 +543,27 @@ export class Similarity {
       try {
         if (kind === "tokens") {
           const out = await this.late!.embed(rows.map((r) => r.text), "document", opts.signal);
-          turns.db.transaction(() =>
-            rows.forEach((r, i) => {
-              const quant = r.kind !== "raw" || r.at >= cutoff ? li.quantize.recentTurns : li.quantize.olderTurns;
-              turns.vectors.putTokens(r.id, client.key, r.contentHash, out[i]!, quant, li.pool.turns);
-            }),
-          );
+          const slicer = createTimeSlicer(12, opts.signal);
+          const prepared: Array<{ id: string; hash: string; data: NonNullable<ReturnType<VectorTables["prepareTokens"]>> }> = [];
+          for (let i = 0; i < rows.length; i++) {
+            if (!(await slicer.check())) break;
+            const r = rows[i]!;
+            const quant = r.kind !== "raw" || r.at >= cutoff ? li.quantize.recentTurns : li.quantize.olderTurns;
+            const data = turns.vectors.prepareTokens(out[i]!, quant, li.pool.turns);
+            if (data) prepared.push({ id: r.id, hash: r.contentHash, data });
+          }
+          if (prepared.length) {
+            turns.db.transaction(() => {
+              for (const item of prepared) turns.vectors.putPreparedTokens(item.id, client.key, item.hash, item.data);
+            });
+          }
+          done += prepared.length;
+          if (opts.signal?.aborted) break;
         } else {
           const out = await this.dense!.embed(rows.map((r) => r.text), "document", opts.signal);
           turns.db.transaction(() => rows.forEach((r, i) => turns.vectors.putDense(r.id, client.key, r.contentHash, out[i]!)));
+          done += rows.length;
         }
-        done += rows.length;
       } catch (e) {
         this.telemetry?.event("embed.turns_failed", { kind, error: errMsg(e) });
         break;

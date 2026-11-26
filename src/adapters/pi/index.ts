@@ -242,6 +242,7 @@ class PiExtension {
   private rechecked = false;
   private providerRegistered = false;
   private notified = new Set<string>();
+  private terminalInputOff: (() => void) | undefined;
   /** `agent_start` events seen: tells the Working row whether pi started the run it waited for. */
 
   constructor(pi: ExtensionAPI) {
@@ -356,6 +357,33 @@ class PiExtension {
     this.adapter.clearDeferred();
   }
 
+  private disposeTerminalWatch(): void {
+    try {
+      this.terminalInputOff?.();
+    } catch {
+      // UI may already be torn down
+    }
+    this.terminalInputOff = undefined;
+  }
+
+  private watchTerminalInput(ctx: ExtensionContext): void {
+    this.disposeTerminalWatch();
+    const ui = (ctx.hasUI && ctx.mode === "tui" ? ctx.ui : undefined) as Partial<Pick<ExtensionContext["ui"], "onTerminalInput">> | undefined;
+    if (typeof ui?.onTerminalInput !== "function") return;
+    try {
+      this.terminalInputOff = ui.onTerminalInput(() => {
+        try {
+          this.host?.noteInput();
+        } catch {
+          // never break terminal input
+        }
+        return undefined;
+      });
+    } catch {
+      this.terminalInputOff = undefined;
+    }
+  }
+
   private async onSessionStart(_event: { reason?: string; previousSessionFile?: string }, ctx: ExtensionContext): Promise<void> {
     const sm = ctx.sessionManager;
     const sessionFile = sm.getSessionFile();
@@ -380,6 +408,7 @@ class PiExtension {
       onDecisionConfig: (cfg) => this.syncProvider(cfg),
     });
     this.host = host;
+    this.watchTerminalInput(ctx);
     // tools: each name is checked against every other tool first (§8.1.3)
     for (const def of host.tools()) this.adapter.registerTool(def);
     host.registered = new Set([...this.adapter.registered.keys()] as ToolKey[]);
@@ -576,6 +605,7 @@ class PiExtension {
     // pi persists context_edit only through boundary returns, not at session_shutdown
     const batch = await host.shutdown({ spawnWorker, reload: isReload, persistEdits: false });
     await this.adapter.commit({ records: [...this.adapter.deferred.records, ...batch.records], edits: [], messages: [] }).catch(() => undefined);
+    this.disposeTerminalWatch();
     this.resetEphemeral();
     this.rechecked = false;
     this.notified.clear();

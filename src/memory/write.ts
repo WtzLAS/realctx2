@@ -7,6 +7,7 @@ import { KINDS, zeroCounters } from "../core/types.ts";
 import { binaryP, choiceProbs } from "../providers/decision.ts";
 import { embedHash, embedText } from "../storage/index.ts";
 import { rrf } from "../storage/vectors.ts";
+import { createTimeSlicer } from "../util/async.ts";
 import { errMsg } from "../util/errors.ts";
 import { randomId8 } from "../util/ids.ts";
 import { scanSecrets } from "../util/secrets.ts";
@@ -117,7 +118,9 @@ export class MemoryWriter {
     await this.route(prepared, opts.signal);
     const results: WriteResult[] = [];
     let any = false;
+    const slicer = createTimeSlicer(12, opts.signal);
     for (const p of prepared) {
+      if (!(await slicer.check())) break;
       let r: WriteResult;
       const touched = new Set<ScopeName>();
       this.inserted = null;

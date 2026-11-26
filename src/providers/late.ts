@@ -101,14 +101,20 @@ export function unpackMatrix(p: PackedMatrix): TokenMatrix {
 export function maxSimPacked(query: TokenMatrix, p: PackedMatrix): number {
   const { rows, dims } = p;
   if (!query.length || !rows) return 0;
+  const dims4 = dims & ~3;
   let total = 0;
   if (p.quant === "int8") {
     const d = new Int8Array(p.data.buffer, p.data.byteOffset, rows * dims);
-    for (const q of query) {
+    for (let qi = 0; qi < query.length; qi++) {
+      const q = query[qi]!;
       let best = -Infinity;
       for (let i = 0, off = 0; i < rows; i++, off += dims) {
         let s = 0;
-        for (let j = 0; j < dims; j++) s += q[j]! * d[off + j]!;
+        let j = 0;
+        for (; j < dims4; j += 4) {
+          s += q[j]! * d[off + j]! + q[j + 1]! * d[off + j + 1]! + q[j + 2]! * d[off + j + 2]! + q[j + 3]! * d[off + j + 3]!;
+        }
+        for (; j < dims; j++) s += q[j]! * d[off + j]!;
         if (s > best) best = s;
       }
       total += best / 127;
@@ -117,11 +123,16 @@ export function maxSimPacked(query: TokenMatrix, p: PackedMatrix): number {
   }
   if (p.quant === "float32") {
     const aligned = p.data.byteOffset % 4 === 0 ? new Float32Array(p.data.buffer, p.data.byteOffset, rows * dims) : new Float32Array(p.data.buffer.slice(p.data.byteOffset, p.data.byteOffset + rows * dims * 4));
-    for (const q of query) {
+    for (let qi = 0; qi < query.length; qi++) {
+      const q = query[qi]!;
       let best = -Infinity;
       for (let i = 0, off = 0; i < rows; i++, off += dims) {
         let s = 0;
-        for (let j = 0; j < dims; j++) s += q[j]! * aligned[off + j]!;
+        let j = 0;
+        for (; j < dims4; j += 4) {
+          s += q[j]! * aligned[off + j]! + q[j + 1]! * aligned[off + j + 1]! + q[j + 2]! * aligned[off + j + 2]! + q[j + 3]! * aligned[off + j + 3]!;
+        }
+        for (; j < dims; j++) s += q[j]! * aligned[off + j]!;
         if (s > best) best = s;
       }
       total += best;
@@ -130,7 +141,8 @@ export function maxSimPacked(query: TokenMatrix, p: PackedMatrix): number {
   }
   const bytes = Math.ceil(dims / 8);
   const mag = 1 / Math.sqrt(dims || 1);
-  for (const q of query) {
+  for (let qi = 0; qi < query.length; qi++) {
+    const q = query[qi]!;
     let sum = 0;
     for (let j = 0; j < dims; j++) sum += q[j]!;
     let best = -Infinity;
@@ -147,6 +159,119 @@ export function maxSimPacked(query: TokenMatrix, p: PackedMatrix): number {
   return total / query.length;
 }
 
+/**
+ * Single-pass symmetric normalized MaxSim between a float TokenMatrix and a PackedMatrix.
+ * Computes both directions in one dot-product pass with zero unpacking or repacking.
+ */
+export function symmetricMaxSimWithPacked(query: TokenMatrix, p: PackedMatrix): number {
+  const qRows = query.length;
+  const { rows, dims } = p;
+  if (!qRows || !rows) return 0;
+  const dims4 = dims & ~3;
+  const colBest = new Float64Array(rows);
+  colBest.fill(-Infinity);
+  let rowSum = 0;
+  if (p.quant === "int8") {
+    const d = new Int8Array(p.data.buffer, p.data.byteOffset, rows * dims);
+    for (let qi = 0; qi < qRows; qi++) {
+      const q = query[qi]!;
+      let best = -Infinity;
+      for (let i = 0, off = 0; i < rows; i++, off += dims) {
+        let s = 0;
+        let j = 0;
+        for (; j < dims4; j += 4) {
+          s += q[j]! * d[off + j]! + q[j + 1]! * d[off + j + 1]! + q[j + 2]! * d[off + j + 2]! + q[j + 3]! * d[off + j + 3]!;
+        }
+        for (; j < dims; j++) s += q[j]! * d[off + j]!;
+        if (s > best) best = s;
+        if (s > colBest[i]!) colBest[i] = s;
+      }
+      rowSum += best;
+    }
+    let colSum = 0;
+    for (let i = 0; i < rows; i++) colSum += colBest[i]!;
+    return (rowSum / (qRows * 127) + colSum / (rows * 127)) / 2;
+  }
+  if (p.quant === "float32") {
+    const aligned = p.data.byteOffset % 4 === 0 ? new Float32Array(p.data.buffer, p.data.byteOffset, rows * dims) : new Float32Array(p.data.buffer.slice(p.data.byteOffset, p.data.byteOffset + rows * dims * 4));
+    for (let qi = 0; qi < qRows; qi++) {
+      const q = query[qi]!;
+      let best = -Infinity;
+      for (let i = 0, off = 0; i < rows; i++, off += dims) {
+        let s = 0;
+        let j = 0;
+        for (; j < dims4; j += 4) {
+          s += q[j]! * aligned[off + j]! + q[j + 1]! * aligned[off + j + 1]! + q[j + 2]! * aligned[off + j + 2]! + q[j + 3]! * aligned[off + j + 3]!;
+        }
+        for (; j < dims; j++) s += q[j]! * aligned[off + j]!;
+        if (s > best) best = s;
+        if (s > colBest[i]!) colBest[i] = s;
+      }
+      rowSum += best;
+    }
+    let colSum = 0;
+    for (let i = 0; i < rows; i++) colSum += colBest[i]!;
+    return (rowSum / qRows + colSum / rows) / 2;
+  }
+  const bytes = Math.ceil(dims / 8);
+  const mag = 1 / Math.sqrt(dims || 1);
+  for (let qi = 0; qi < qRows; qi++) {
+    const q = query[qi]!;
+    let sum = 0;
+    for (let j = 0; j < dims; j++) sum += q[j]!;
+    let best = -Infinity;
+    for (let i = 0; i < rows; i++) {
+      let pos = 0;
+      const off = i * bytes;
+      for (let j = 0; j < dims; j++) if (p.data[off + (j >> 3)]! & (1 << (j & 7))) pos += q[j]!;
+      const s = (2 * pos - sum) * mag;
+      if (s > best) best = s;
+      if (s > colBest[i]!) colBest[i] = s;
+    }
+    rowSum += best;
+  }
+  let colSum = 0;
+  for (let i = 0; i < rows; i++) colSum += colBest[i]!;
+  return (rowSum / qRows + colSum / rows) / 2;
+}
+
+/**
+ * Single-pass symmetric normalized MaxSim between two PackedMatrix values.
+ * Fast integer dot-product path when both are int8 (the common stored-memory format).
+ */
+export function symmetricMaxSimPacked(a: PackedMatrix, b: PackedMatrix): number {
+  const aRows = a.rows;
+  const bRows = b.rows;
+  const dims = a.dims;
+  if (!aRows || !bRows || dims !== b.dims) return 0;
+  if (a.quant === "int8" && b.quant === "int8") {
+    const da = new Int8Array(a.data.buffer, a.data.byteOffset, aRows * dims);
+    const db = new Int8Array(b.data.buffer, b.data.byteOffset, bRows * dims);
+    const dims4 = dims & ~3;
+    const colBest = new Int32Array(bRows);
+    colBest.fill(-2147483648);
+    let rowSum = 0;
+    for (let i = 0, offA = 0; i < aRows; i++, offA += dims) {
+      let best = -2147483648;
+      for (let k = 0, offB = 0; k < bRows; k++, offB += dims) {
+        let s = 0;
+        let j = 0;
+        for (; j < dims4; j += 4) {
+          s += da[offA + j]! * db[offB + j]! + da[offA + j + 1]! * db[offB + j + 1]! + da[offA + j + 2]! * db[offB + j + 2]! + da[offA + j + 3]! * db[offB + j + 3]!;
+        }
+        for (; j < dims; j++) s += da[offA + j]! * db[offB + j]!;
+        if (s > best) best = s;
+        if (s > colBest[k]!) colBest[k] = s;
+      }
+      rowSum += best;
+    }
+    let colSum = 0;
+    for (let k = 0; k < bRows; k++) colSum += colBest[k]!;
+    return (rowSum / (aRows * 16129) + colSum / (bRows * 16129)) / 2;
+  }
+  return symmetricMaxSimWithPacked(unpackMatrix(a), b);
+}
+
 /** Re-quantize a packed matrix (int8 → 1-bit when raw turns age out of the recent tier). */
 export function requantize(p: PackedMatrix, quant: Quant): PackedMatrix {
   return p.quant === quant ? p : packMatrix(unpackMatrix(p), quant);
@@ -154,15 +279,9 @@ export function requantize(p: PackedMatrix, quant: Quant): PackedMatrix {
 
 // ───────────────────────────── Token pooling
 
-/**
- * Token pooling (Clavié et al. 2024): merge similar token vectors and mean-pool them, keeping
- * about n / factor rows. This uses size-capped agglomeration over the similarity-sorted pair
- * list rather than Ward linkage, which is close enough at factor 2 and much cheaper.
- */
-export function poolTokens(m: TokenMatrix, factor: number): TokenMatrix {
+function poolBlock(m: TokenMatrix, target: number, cap: number): TokenMatrix {
   const n = m.length;
-  if (factor <= 1 || n <= 2) return m;
-  const target = Math.max(1, Math.ceil(n / factor));
+  if (n <= target || n <= 1) return m;
   const parent = Int32Array.from({ length: n }, (_, i) => i);
   const size = new Int32Array(n).fill(1);
   const find = (x: number): number => {
@@ -190,7 +309,6 @@ export function poolTokens(m: TokenMatrix, factor: number): TokenMatrix {
   }
   order.sort((a, b) => scores[b]! - scores[a]!);
   let clusters = n;
-  const cap = Math.max(2, Math.ceil(factor * 2));
   for (let k = 0; k < pairCount; k++) {
     if (clusters <= target) break;
     const p = order[k]!;
@@ -216,6 +334,70 @@ export function poolTokens(m: TokenMatrix, factor: number): TokenMatrix {
     norm = Math.sqrt(norm) || 1;
     for (let j = 0; j < dims; j++) s[j] = s[j]! / norm;
     out.push(s);
+  }
+  return out;
+}
+
+const POOL_EXACT_MAX = 192;
+const POOL_BUCKET_CAP = 160;
+const POOL_SUBBLOCK = 128;
+
+/**
+ * Token pooling (Clavié et al. 2024): merge similar token vectors and mean-pool them, keeping
+ * about n / factor rows. Uses size-capped agglomeration directly for small matrices (≤ 192 rows),
+ * and partitions larger matrices by deterministic SimHash buckets (bounded to ≤ 160 rows each)
+ * so pooling stays O(n) instead of O(n² log n) on long chunks.
+ */
+export function poolTokens(m: TokenMatrix, factor: number): TokenMatrix {
+  const n = m.length;
+  if (factor <= 1 || n <= 2) return m;
+  const target = Math.max(1, Math.ceil(n / factor));
+  const cap = Math.max(2, Math.ceil(factor * 2));
+  if (n <= POOL_EXACT_MAX) return poolBlock(m, target, cap);
+
+  const dims = m[0]!.length;
+  const bits = Math.max(1, Math.min(6, Math.ceil(Math.log2(n / 96))));
+  const rand = mulberry32(0x706f6f6c ^ (dims * 2654435761) ^ bits);
+  const planes: Float32Array[] = [];
+  for (let b = 0; b < bits; b++) {
+    const h = new Float32Array(dims);
+    for (let j = 0; j < dims; j++) h[j] = gaussian(rand);
+    planes.push(h);
+  }
+  const buckets: TokenMatrix[] = Array.from({ length: 1 << bits }, () => []);
+  for (let i = 0; i < n; i++) {
+    const v = m[i]!;
+    let bid = 0;
+    for (let b = 0; b < bits; b++) if (dot(planes[b]!, v) > 0) bid |= 1 << b;
+    buckets[bid]!.push(v);
+  }
+  const blocks: TokenMatrix[] = [];
+  for (const b of buckets) {
+    if (!b.length) continue;
+    if (b.length <= POOL_BUCKET_CAP) {
+      blocks.push(b);
+    } else {
+      for (let i = 0; i < b.length; i += POOL_SUBBLOCK) blocks.push(b.slice(i, i + POOL_SUBBLOCK));
+    }
+  }
+  const targets = blocks.map((b) => Math.max(1, Math.min(b.length, Math.round((b.length / n) * target))));
+  let sumTargets = targets.reduce((a, b) => a + b, 0);
+  if (sumTargets !== target) {
+    const bySize = blocks.map((b, i) => ({ i, len: b.length })).sort((a, b) => b.len - a.len);
+    for (const { i, len } of bySize) {
+      if (sumTargets === target) break;
+      if (sumTargets > target && targets[i]! > 1) {
+        targets[i]!--;
+        sumTargets--;
+      } else if (sumTargets < target && targets[i]! < len) {
+        targets[i]!++;
+        sumTargets++;
+      }
+    }
+  }
+  const out: Float32Array[] = [];
+  for (let i = 0; i < blocks.length; i++) {
+    for (const v of poolBlock(blocks[i]!, targets[i]!, cap)) out.push(v);
   }
   return out;
 }
@@ -364,18 +546,39 @@ export function packFde(v: Float32Array, quant: "int8" | "float32"): Uint8Array 
   return out;
 }
 
-/** Dot product of a float query FDE with a packed document FDE. */
-export function fdeScore(query: Float32Array, packed: Uint8Array, quant: "int8" | "float32"): number {
+export type DecodedFde =
+  | { quant: "float32"; vec: Float32Array }
+  | { quant: "int8"; scale: number; q: Int8Array };
+
+/** Decode a stored FDE blob once so repeated FDE scans do zero DataView/TypedArray allocations. */
+export function decodeFde(packed: Uint8Array, quant: "int8" | "float32"): DecodedFde {
   if (quant === "float32") {
-    const f = new Float32Array(packed.buffer.slice(packed.byteOffset, packed.byteOffset + packed.byteLength));
-    return dot(query, f);
+    const vec = packed.byteOffset % 4 === 0 ? new Float32Array(packed.buffer, packed.byteOffset, packed.byteLength >> 2) : new Float32Array(packed.buffer.slice(packed.byteOffset, packed.byteOffset + packed.byteLength));
+    return { quant: "float32", vec };
   }
   const maxAbs = new DataView(packed.buffer, packed.byteOffset, 4).getFloat32(0, true);
   const q = new Int8Array(packed.buffer, packed.byteOffset + 4, packed.length - 4);
-  let s = 0;
+  return { quant: "int8", scale: maxAbs / 127, q };
+}
+
+/** Dot product of a float query FDE with a pre-decoded document FDE (unrolled hot loop). */
+export function fdeScoreDecoded(query: Float32Array, d: DecodedFde): number {
+  if (d.quant === "float32") return dot(query, d.vec);
+  const q = d.q;
   const n = Math.min(query.length, q.length);
-  for (let i = 0; i < n; i++) s += query[i]! * q[i]!;
-  return (s * maxAbs) / 127;
+  const n4 = n & ~3;
+  let s = 0;
+  let i = 0;
+  for (; i < n4; i += 4) {
+    s += query[i]! * q[i]! + query[i + 1]! * q[i + 1]! + query[i + 2]! * q[i + 2]! + query[i + 3]! * q[i + 3]!;
+  }
+  for (; i < n; i++) s += query[i]! * q[i]!;
+  return s * d.scale;
+}
+
+/** Dot product of a float query FDE with a packed document FDE. */
+export function fdeScore(query: Float32Array, packed: Uint8Array, quant: "int8" | "float32"): number {
+  return fdeScoreDecoded(query, decodeFde(packed, quant));
 }
 
 export function packDense(v: Float32Array): Uint8Array {

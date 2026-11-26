@@ -42,3 +42,34 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
+
+/**
+ * Yield to the macrotask queue so terminal I/O, timers and abort signals can run.
+ * Uses `setImmediate` when available (runs after the poll phase with minimal overhead)
+ * and falls back to `setTimeout(0)`. Fast-returns when already aborted.
+ */
+export function yieldToEventLoop(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    if (typeof setImmediate === "function") setImmediate(resolve);
+    else setTimeout(resolve, 0);
+  });
+}
+
+/**
+ * Cooperative time slicer for CPU-bound async loops: yields to the event loop once
+ * `sliceMs` have elapsed since the last yield, and returns `false` when `signal` aborts.
+ */
+export function createTimeSlicer(sliceMs = 12, signal?: AbortSignal): { check(): Promise<boolean> } {
+  const now = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
+  let last = now();
+  return {
+    async check(): Promise<boolean> {
+      if (signal?.aborted) return false;
+      if (now() - last < sliceMs) return true;
+      await yieldToEventLoop(signal);
+      last = now();
+      return !signal?.aborted;
+    },
+  };
+}

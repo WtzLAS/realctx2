@@ -331,7 +331,7 @@ export class TurnIndex {
   ageTokens(model: string, recentDays: number, now: Date, olderQuant: "binary" | "int8"): number {
     if (olderQuant === "int8") return 0;
     const cutoff = new Date(now.getTime() - recentDays * 86_400_000).toISOString();
-    const rows = this.db.prepare("SELECT t.id AS id FROM turns t JOIN turn_tokens v ON v.id = t.id WHERE t.kind = 'raw' AND t.at < ? AND v.model = ? AND v.quant != 'binary' LIMIT 2000").all(cutoff, model);
+    const rows = this.db.prepare("SELECT t.id AS id FROM turns t JOIN turn_tokens v ON v.id = t.id WHERE t.kind = 'raw' AND t.at < ? AND v.model = ? AND v.quant != 'binary' LIMIT 200").all(cutoff, model);
     let n = 0;
     if (rows.length) {
       this.db.transaction(() => {

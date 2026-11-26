@@ -282,8 +282,8 @@ export const DEFAULT_CONFIG: Config = {
   },
   index: {
     lateInteraction: {
-      exactMax: 2000,
-      candidates: 200,
+      exactMax: 128,
+      candidates: 64,
       recentDays: 30,
       fdeDims: 512,
       fdeQuant: "int8",

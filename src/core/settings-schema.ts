@@ -2311,7 +2311,7 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
               unit: "items",
               min: 50,
               max: 50_000,
-              step: 500,
+              step: 64,
             },
             {
               kind: "integer",
@@ -2320,7 +2320,7 @@ export const SETTINGS_CATEGORIES: SettingCategory[] = [
               description: "Number of top FDE candidates re-ranked with exact MaxSim during two-stage late-interaction search.",
               min: 10,
               max: 5000,
-              step: 50,
+              step: 16,
             },
             {
               kind: "integer",

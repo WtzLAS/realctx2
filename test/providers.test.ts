@@ -3,7 +3,7 @@ import { budgetReached, Telemetry } from "../src/core/telemetry.ts";
 import type { AuxResult, AuxSessionRunner, AuxTask, DecisionQuestion } from "../src/core/types.ts";
 import { buildDecisionsRequest, buildSystemOneRequest, CircuitBreaker, EmulatedDecisionClient, type FetchLike, HttpDecisionClient, parseDecisionsResponse, parseSystemOneResponse, ResilientDecisionClient } from "../src/providers/decision.ts";
 import { DenseEmbeddingClient, MultiVectorEmbeddingClient } from "../src/providers/embedding.ts";
-import { FdeEncoder, fdeParams, fdeScore, maxSim, normalizedMaxSim, packFde, packMatrix, poolTokens, symmetricMaxSim, unpackMatrix } from "../src/providers/late.ts";
+import { decodeFde, FdeEncoder, fdeParams, fdeScore, fdeScoreDecoded, maxSim, normalizedMaxSim, packFde, packMatrix, poolTokens, symmetricMaxSim, symmetricMaxSimPacked, symmetricMaxSimWithPacked, unpackMatrix } from "../src/providers/late.ts";
 
 const QUESTIONS: DecisionQuestion[] = [
   { kind: "binary", name: "redirect", instructions: "Does the user cancel?", yes: "cancels", no: "continues" },
@@ -323,5 +323,27 @@ describe("late interaction math", () => {
     expect(packFde(enc.document(docs[1]!), "int8").length).toBe(516);
     // same seed → same encoding (stored FDEs stay comparable across runs)
     expect(Array.from(new FdeEncoder(fdeParams(dims, 512)).query(q))).toEqual(Array.from(qf));
+  });
+  it("computes single-pass symmetricMaxSimPacked/WithPacked and bucketed poolTokens accurately", () => {
+    const a = randMatrix(24, 64, 31);
+    const b = randMatrix(36, 64, 37);
+    for (const quant of ["int8", "float32", "binary"] as const) {
+      const pa = packMatrix(a, quant);
+      const pb = packMatrix(b, quant);
+      expect(symmetricMaxSimWithPacked(a, pb)).toBeCloseTo(symmetricMaxSim(a, unpackMatrix(pb)), 5);
+      expect(symmetricMaxSimPacked(pa, pb)).toBeCloseTo(symmetricMaxSim(unpackMatrix(pa), unpackMatrix(pb)), 5);
+    }
+    // Large-matrix SimHash-bucketed pooling (> 192 rows) keeps target count and unit norms
+    const big = randMatrix(512, 64, 41);
+    const pooled = poolTokens(big, 2);
+    expect(pooled.length).toBe(256);
+    for (const r of pooled) expect(Math.hypot(...r)).toBeCloseTo(1, 4);
+    // Pre-decoded FDE scoring matches fdeScore
+    const enc = new FdeEncoder(fdeParams(64, 512));
+    const qf = enc.query(a);
+    const fdeInt8 = packFde(enc.document(b), "int8");
+    const fdeF32 = packFde(enc.document(b), "float32");
+    expect(fdeScoreDecoded(qf, decodeFde(fdeInt8, "int8"))).toBeCloseTo(fdeScore(qf, fdeInt8, "int8"), 6);
+    expect(fdeScoreDecoded(qf, decodeFde(fdeF32, "float32"))).toBeCloseTo(fdeScore(qf, fdeF32, "float32"), 6);
   });
 });

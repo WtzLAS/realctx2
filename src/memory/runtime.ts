@@ -112,6 +112,7 @@ export class MemoryRuntime implements MemoryServices {
   readonly auxBlocked: Array<{ at: string; role: string; call: string; reason: string }> = [];
   private closed = false;
   private lastPeriodicFlush = 0;
+  private maintainBackoffUntil = new Map<ScopeName, number>();
 
   constructor(o: RuntimeOptions) {
     this.cfg = o.cfg;
@@ -355,7 +356,13 @@ export class MemoryRuntime implements MemoryServices {
         const pass = await step(`pass-${scope}`, () => this.evolution.pass(scope, { signal: opts.signal }));
         if (pass) {
           report.passes.push(pass);
-          if (!pass.stopped) this.markMaintained(scope);
+          if (!pass.stopped) {
+            this.maintainBackoffUntil.delete(scope);
+            this.markMaintained(scope);
+          } else if (pass.stopped === "aborted") {
+            // Avoid restarting an aborted pass from scratch every `idleMinutes`; `/realctx2 maintain` (`force`) bypasses this.
+            this.maintainBackoffUntil.set(scope, this.clock().getTime() + 15 * 60_000);
+          }
         }
       } finally {
         lock.release();
@@ -368,8 +375,10 @@ export class MemoryRuntime implements MemoryServices {
   }
 
   private maintenanceDue(scope: ScopeName): boolean {
+    const now = this.clock().getTime();
+    if (now < (this.maintainBackoffUntil.get(scope) ?? 0)) return false;
     const last = this.graph.handle(scope).index?.getMeta("maintain.lastAt");
-    return !last || this.clock().getTime() - Date.parse(last) >= 6 * 3_600_000;
+    return !last || now - Date.parse(last) >= 6 * 3_600_000;
   }
 
   private markMaintained(scope: ScopeName): void {

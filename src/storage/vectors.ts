@@ -3,7 +3,7 @@
  * dense vectors, quantized token matrices and fixed-dimensional encodings, all local-only.
  */
 import type { DenseVector, TokenMatrix } from "../core/types.ts";
-import { dot, FdeEncoder, fdeParams, fdeScore, maxSimPacked, packDense, packFde, type PackedMatrix, packMatrix, poolTokens, type Quant, requantize, unpackDense, unpackMatrix } from "../providers/late.ts";
+import { type DecodedFde, decodeFde, dot, FdeEncoder, fdeParams, fdeScoreDecoded, maxSimPacked, packDense, packFde, type PackedMatrix, packMatrix, poolTokens, type Quant, requantize, symmetricMaxSimPacked, symmetricMaxSimWithPacked, unpackDense, unpackMatrix } from "../providers/late.ts";
 import type { Db } from "./sqlite.ts";
 
 export interface Scored {
@@ -43,7 +43,7 @@ export class VectorTables {
   private readonly db: Db;
   private readonly t: string;
   private denseCache = new Map<string, Map<string, Float32Array>>();
-  private fdeCache = new Map<string, Map<string, Uint8Array>>();
+  private fdeCache = new Map<string, Map<string, DecodedFde>>();
   private tokenCache = new Map<string, Map<string, PackedMatrix>>();
   private tokenCacheSize = new Map<string, number>();
   /** Token matrices are cached in memory only below this many bytes per model. */
@@ -119,19 +119,32 @@ export class VectorTables {
     this.denseCache.get(model)?.set(id, vec);
   }
 
-  /** Store a token matrix (pooled and quantized) together with its fixed-dimensional encoding. */
-  putTokens(id: string, model: string, hash: string, matrix: TokenMatrix, quant: Quant, pool: number): void {
-    if (!matrix.length) return;
+  /** Prepare pooled/quantized token matrix and FDE outside a SQLite transaction (allows yielding). */
+  prepareTokens(matrix: TokenMatrix, quant: Quant, pool: number): { packed: PackedMatrix; fde: Uint8Array; pool: number } | null {
+    if (!matrix.length) return null;
     const pooled = poolTokens(matrix, pool);
     const packed = packMatrix(pooled, quant);
-    this.db
-      .prepare(`INSERT OR REPLACE INTO ${this.t}_tokens (id, model, hash, quant, pool, rows, dims, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(id, model, hash, quant, pool, packed.rows, packed.dims, packed.data);
     // the encoding is computed from the unquantized vectors
     const fde = packFde(encoder(packed.dims, this.fdeDims).document(matrix), this.fdeQuant);
+    return { packed, fde, pool };
+  }
+
+  /** Store a previously prepared token matrix and FDE blob. */
+  putPreparedTokens(id: string, model: string, hash: string, prepared: { packed: PackedMatrix; fde: Uint8Array; pool: number }): void {
+    const { packed, fde, pool } = prepared;
+    this.db
+      .prepare(`INSERT OR REPLACE INTO ${this.t}_tokens (id, model, hash, quant, pool, rows, dims, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(id, model, hash, packed.quant, pool, packed.rows, packed.dims, packed.data);
     this.db.prepare(`INSERT OR REPLACE INTO ${this.t}_fde (id, model, vec) VALUES (?, ?, ?)`).run(id, model, fde);
-    this.fdeCache.get(model)?.set(id, fde);
+    this.fdeCache.get(model)?.set(id, decodeFde(fde, this.fdeQuant));
     this.cacheToken(model, id, packed);
+  }
+
+  /** Store a token matrix (pooled and quantized) together with its fixed-dimensional encoding. */
+  putTokens(id: string, model: string, hash: string, matrix: TokenMatrix, quant: Quant, pool: number): void {
+    const prepared = this.prepareTokens(matrix, quant, pool);
+    if (!prepared) return;
+    this.putPreparedTokens(id, model, hash, prepared);
   }
 
   /** Move a stored matrix to a smaller tier (int8 → 1-bit as raw turns age, §9.2.2). */
@@ -227,11 +240,11 @@ export class VectorTables {
     return m;
   }
 
-  private allFde(model: string): Map<string, Uint8Array> {
+  private allFde(model: string): Map<string, DecodedFde> {
     let m = this.fdeCache.get(model);
     if (!m) {
       m = new Map();
-      for (const r of this.db.prepare(`SELECT id, vec FROM ${this.t}_fde WHERE model = ?`).all(model)) m.set(String(r.id), blob(r.vec));
+      for (const r of this.db.prepare(`SELECT id, vec FROM ${this.t}_fde WHERE model = ?`).all(model)) m.set(String(r.id), decodeFde(blob(r.vec), this.fdeQuant));
       this.fdeCache.set(model, m);
     }
     return m;
@@ -287,7 +300,7 @@ export class VectorTables {
       for (const [id, vec] of this.allFde(model)) {
         if (opts.only && !opts.only.has(id)) continue;
         if (opts.filter && !opts.filter(id)) continue;
-        first.push({ id, score: fdeScore(qf, vec, this.fdeQuant) });
+        first.push({ id, score: fdeScoreDecoded(qf, vec) });
       }
       first.sort((a, b) => b.score - a.score);
       candidates = first.slice(0, opts.candidates).map((s) => s.id);
@@ -302,14 +315,19 @@ export class VectorTables {
     return out.slice(0, opts.limit);
   }
 
-  /** Symmetric normalized MaxSim between a fresh matrix and a stored item (de-dup, conflicts). */
+  /** Single-pass symmetric normalized MaxSim between a fresh matrix and a stored item (de-dup, conflicts). */
   symmetricWith(matrix: TokenMatrix, id: string, model: string): number | null {
     const p = this.getTokens(id, model);
     if (!p || !matrix.length || p.dims !== matrix[0]!.length) return null;
-    const stored = unpackMatrix(p);
-    const ab = maxSimPacked(matrix, p);
-    const ba = maxSimPacked(stored, packMatrix(matrix, "float32"));
-    return (ab + ba) / 2;
+    return symmetricMaxSimWithPacked(matrix, p);
+  }
+
+  /** Single-pass symmetric normalized MaxSim between two stored packed items (zero unpacking). */
+  symmetricBetween(idA: string, idB: string, model: string): number | null {
+    const a = this.getTokens(idA, model);
+    const b = this.getTokens(idB, model);
+    if (!a || !b || !a.rows || !b.rows || a.dims !== b.dims) return null;
+    return symmetricMaxSimPacked(a, b);
   }
 
   ids(kind: "dense" | "tokens", model: string): string[] {
